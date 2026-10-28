@@ -286,6 +286,21 @@ if(NOT WIN32 AND NOT CMAKE_SYSTEM_NAME STREQUAL "WASI" AND NOT EMSCRIPTEN)
     message(STATUS "  libev: vendored (static)")
 endif()
 
+# Static zlib for the zlib module. scripts/fetch-static-libs.sh downloads the
+# Alpine static archives; a system libz.a is used as a fallback.
+find_library(QNODE_ZLIB_LIBRARY NAMES z
+    PATHS ${CMAKE_CURRENT_SOURCE_DIR}/vendor/static/usr/lib
+    NO_DEFAULT_PATH)
+if(NOT QNODE_ZLIB_LIBRARY)
+    find_library(QNODE_ZLIB_LIBRARY NAMES z)
+endif()
+if(QNODE_ZLIB_LIBRARY)
+    add_definitions(-DQNODE_HAVE_ZLIB)
+    message(STATUS "  zlib: ${QNODE_ZLIB_LIBRARY}")
+else()
+    message(STATUS "  zlib: not found (zlib module disabled)")
+endif()
+
 if(QJS_BUILD_LIBC)
     list(APPEND qjs_sources quickjs-libc.c)
     # The definition must be added to the entire project.
@@ -349,7 +364,7 @@ endif()
 if(NOT QJS_BUILD_LIBC)
     add_library(qjs-libc STATIC quickjs-libc.c node.c)
     target_compile_definitions(qjs-libc PRIVATE ${qjs_defines})
-    target_link_libraries(qjs-libc PRIVATE ${qjs_libs} qjs)
+    target_link_libraries(qjs-libc PRIVATE ${qjs_libs} qjs ${QNODE_ZLIB_LIBRARY})
     add_dependencies(qjs-libc node_bootstrap_header)
     target_include_directories(qjs-libc PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 else()

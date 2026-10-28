@@ -31,6 +31,10 @@
 #include <netdb.h>
 #include <pwd.h>
 
+#ifdef QNODE_HAVE_ZLIB
+#include <zlib.h>
+#endif
+
 #include "cutils.h"
 #include "quickjs.h"
 #include "quickjs-libc.h"
@@ -1433,6 +1437,167 @@ static JSValue js_node_waitpid(JSContext *ctx, JSValueConst this_val,
     return node_ok(ctx, arr);
 }
 
+#ifdef QNODE_HAVE_ZLIB
+
+/* compress(data, windowBits, level, memLevel, strategy) */
+static JSValue js_node_zlib_compress(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv)
+{
+    NodeBytes in;
+    int32_t windowBits = 15, level = -1, memLevel = 8, strategy = 0;
+    z_stream zs;
+    int r;
+
+    if (node_get_bytes(ctx, argv[0], &in))
+        return JS_EXCEPTION;
+    if (argc > 1 && !JS_IsUndefined(argv[1]) &&
+        JS_ToInt32(ctx, &windowBits, argv[1])) {
+        node_free_bytes(ctx, &in);
+        return JS_EXCEPTION;
+    }
+    if (argc > 2 && !JS_IsUndefined(argv[2]) &&
+        JS_ToInt32(ctx, &level, argv[2])) {
+        node_free_bytes(ctx, &in);
+        return JS_EXCEPTION;
+    }
+    if (argc > 3 && !JS_IsUndefined(argv[3]) &&
+        JS_ToInt32(ctx, &memLevel, argv[3])) {
+        node_free_bytes(ctx, &in);
+        return JS_EXCEPTION;
+    }
+    if (argc > 4 && !JS_IsUndefined(argv[4]) &&
+        JS_ToInt32(ctx, &strategy, argv[4])) {
+        node_free_bytes(ctx, &in);
+        return JS_EXCEPTION;
+    }
+
+    memset(&zs, 0, sizeof(zs));
+    r = deflateInit2(&zs, level, Z_DEFLATED, windowBits, memLevel, strategy);
+    if (r != Z_OK) {
+        node_free_bytes(ctx, &in);
+        return JS_ThrowInternalError(ctx, "zlib: deflateInit2 failed (%d)", r);
+    }
+
+    uLong bound = deflateBound(&zs, (uLong)in.len);
+    uint8_t *out = js_malloc(ctx, bound ? bound : 1);
+    if (!out) {
+        deflateEnd(&zs);
+        node_free_bytes(ctx, &in);
+        return JS_EXCEPTION;
+    }
+    zs.next_in = (Bytef *)in.data;
+    zs.avail_in = (uInt)in.len;
+    zs.next_out = out;
+    zs.avail_out = (uInt)bound;
+    r = deflate(&zs, Z_FINISH);
+    size_t produced = bound - zs.avail_out;
+    deflateEnd(&zs);
+    node_free_bytes(ctx, &in);
+    if (r != Z_STREAM_END) {
+        js_free(ctx, out);
+        return JS_ThrowInternalError(ctx, "zlib: deflate failed (%d)", r);
+    }
+    JSValue val = JS_NewUint8ArrayCopy(ctx, out, produced);
+    js_free(ctx, out);
+    return val;
+}
+
+/* decompress(data, windowBits) */
+static JSValue js_node_zlib_decompress(JSContext *ctx, JSValueConst this_val,
+                                       int argc, JSValueConst *argv)
+{
+    NodeBytes in;
+    int32_t windowBits = 15;
+    z_stream zs;
+    int r;
+    size_t cap = 0, len = 0;
+    uint8_t *out = NULL;
+
+    if (node_get_bytes(ctx, argv[0], &in))
+        return JS_EXCEPTION;
+    if (argc > 1 && !JS_IsUndefined(argv[1]) &&
+        JS_ToInt32(ctx, &windowBits, argv[1])) {
+        node_free_bytes(ctx, &in);
+        return JS_EXCEPTION;
+    }
+
+    memset(&zs, 0, sizeof(zs));
+    r = inflateInit2(&zs, windowBits);
+    if (r != Z_OK) {
+        node_free_bytes(ctx, &in);
+        return JS_ThrowInternalError(ctx, "zlib: inflateInit2 failed (%d)", r);
+    }
+
+    cap = in.len ? in.len * 4 : 256;
+    if (cap < 256)
+        cap = 256;
+    out = js_malloc(ctx, cap);
+    if (!out) {
+        inflateEnd(&zs);
+        node_free_bytes(ctx, &in);
+        return JS_EXCEPTION;
+    }
+    zs.next_in = (Bytef *)in.data;
+    zs.avail_in = (uInt)in.len;
+
+    for (;;) {
+        zs.next_out = out + len;
+        zs.avail_out = (uInt)(cap - len);
+        r = inflate(&zs, Z_FINISH);
+        len = cap - zs.avail_out;
+        if (r == Z_STREAM_END)
+            break;
+        if (r != Z_OK && r != Z_BUF_ERROR) {
+            js_free(ctx, out);
+            inflateEnd(&zs);
+            node_free_bytes(ctx, &in);
+            return JS_ThrowInternalError(ctx, "zlib: inflate failed (%d)", r);
+        }
+        if (zs.avail_out == 0) {
+            size_t ncap = cap * 2;
+            uint8_t *nb = js_realloc(ctx, out, ncap);
+            if (!nb) {
+                js_free(ctx, out);
+                inflateEnd(&zs);
+                node_free_bytes(ctx, &in);
+                return JS_EXCEPTION;
+            }
+            out = nb;
+            cap = ncap;
+            continue;
+        }
+        /* No progress possible: truncated input. */
+        js_free(ctx, out);
+        inflateEnd(&zs);
+        node_free_bytes(ctx, &in);
+        return JS_ThrowInternalError(ctx, "zlib: unexpected end of file");
+    }
+    inflateEnd(&zs);
+    node_free_bytes(ctx, &in);
+
+    JSValue val = JS_NewUint8ArrayCopy(ctx, out, len);
+    js_free(ctx, out);
+    return val;
+}
+
+static JSValue js_node_crc32(JSContext *ctx, JSValueConst this_val,
+                             int argc, JSValueConst *argv)
+{
+    NodeBytes in;
+    uint32_t seed = 0;
+    if (node_get_bytes(ctx, argv[0], &in))
+        return JS_EXCEPTION;
+    if (argc > 1 && !JS_IsUndefined(argv[1]) && JS_ToUint32(ctx, &seed, argv[1])) {
+        node_free_bytes(ctx, &in);
+        return JS_EXCEPTION;
+    }
+    uLong crc = crc32(seed, in.data, (uInt)in.len);
+    node_free_bytes(ctx, &in);
+    return JS_NewUint32(ctx, (uint32_t)crc);
+}
+
+#endif /* QNODE_HAVE_ZLIB */
+
 /* ---------------- native object ---------------- */
 
 static const JSCFunctionListEntry js_node_funcs[] = {
@@ -1500,6 +1665,11 @@ static const JSCFunctionListEntry js_node_funcs[] = {
     JS_CFUNC_DEF("spawn", 6, js_node_spawn),
     JS_CFUNC_DEF("waitpid", 2, js_node_waitpid),
     JS_CFUNC_DEF("requireEsm", 1, js_node_require_esm),
+#ifdef QNODE_HAVE_ZLIB
+    JS_CFUNC_DEF("zlibCompress", 5, js_node_zlib_compress),
+    JS_CFUNC_DEF("zlibDecompress", 2, js_node_zlib_decompress),
+    JS_CFUNC_DEF("crc32", 2, js_node_crc32),
+#endif
 };
 
 /* ---------------- module loading ---------------- */

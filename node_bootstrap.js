@@ -5923,24 +5923,153 @@ const punycode = {
 
 function zlibUnsupported(name) {
   return function() {
-    throw new Error("zlib." + name + " is not supported (no zlib linked)");
+    const e = new Error("zlib." + name + " is not supported");
+    e.code = "ERR_ZLIB_UNSUPPORTED";
+    throw e;
   };
 }
 
+const ZLIB_CONSTANTS = {
+  Z_NO_FLUSH: 0, Z_PARTIAL_FLUSH: 1, Z_SYNC_FLUSH: 2, Z_FULL_FLUSH: 3,
+  Z_FINISH: 4, Z_BLOCK: 5, Z_TREES: 6,
+  Z_OK: 0, Z_STREAM_END: 1, Z_NEED_DICT: 2, Z_ERRNO: -1,
+  Z_STREAM_ERROR: -2, Z_DATA_ERROR: -3, Z_MEM_ERROR: -4,
+  Z_BUF_ERROR: -5, Z_VERSION_ERROR: -6,
+  Z_NO_COMPRESSION: 0, Z_BEST_SPEED: 1, Z_BEST_COMPRESSION: 9,
+  Z_DEFAULT_COMPRESSION: -1,
+  Z_FILTERED: 1, Z_HUFFMAN_ONLY: 2, Z_RLE: 3, Z_FIXED: 4,
+  Z_DEFAULT_STRATEGY: 0,
+  Z_DEFLATED: 8,
+  Z_MIN_WINDOWBITS: 8, Z_MAX_WINDOWBITS: 15, Z_DEFAULT_WINDOWBITS: 15,
+  Z_MIN_CHUNK: 64, Z_DEFAULT_CHUNK: 16384,
+  Z_MIN_MEMLEVEL: 1, Z_MAX_MEMLEVEL: 9, Z_DEFAULT_MEMLEVEL: 8,
+  Z_MIN_LEVEL: -1, Z_MAX_LEVEL: 9, Z_DEFAULT_LEVEL: -1,
+};
+
+function hasZlib() { return typeof native.zlibCompress === "function"; }
+
+function zlibOptions(options, kind) {
+  options = options || {};
+  let windowBits = options.windowBits;
+  if (windowBits === undefined || windowBits === null) {
+    if (kind === "raw")
+      windowBits = -15;
+    else if (kind === "gzip")
+      windowBits = 31;
+    else
+      windowBits = 15;
+  } else if (kind === "gzip" && windowBits >= 8 && windowBits < 16) {
+    windowBits += 16;
+  } else if (kind === "raw" && windowBits > 0) {
+    windowBits = -windowBits;
+  }
+  return {
+    windowBits,
+    level: options.level === undefined ? -1 : options.level,
+    memLevel: options.memLevel === undefined ? 8 : options.memLevel,
+    strategy: options.strategy === undefined ? 0 : options.strategy,
+  };
+}
+
+function zlibCompressSync(data, options, kind) {
+  if (!hasZlib())
+    throw new Error("zlib is not available in this build");
+  const o = zlibOptions(options, kind);
+  const out = native.zlibCompress(Buffer.from(data), o.windowBits, o.level,
+                                  o.memLevel, o.strategy);
+  return Buffer.from(out);
+}
+
+function zlibDecompressSync(data, options, kind) {
+  if (!hasZlib())
+    throw new Error("zlib is not available in this build");
+  let windowBits = options && options.windowBits;
+  if (windowBits === undefined || windowBits === null)
+    windowBits = kind === "raw" ? -15 : kind === "auto" ? 47 : 15;
+  else if (kind === "raw" && windowBits > 0)
+    windowBits = -windowBits;
+  else if (kind === "auto")
+    windowBits = Math.abs(windowBits) + 32;
+  try {
+    return Buffer.from(native.zlibDecompress(Buffer.from(data), windowBits));
+  } catch (e) {
+    if (kind === "auto") {
+      /* gzip and zlib share the auto-detecting window; nothing else to try */
+    }
+    e.code = e.code || "Z_DATA_ERROR";
+    throw e;
+  }
+}
+
+function zlibCallback(fn) {
+  return function(data, options, cb) {
+    if (typeof options === "function") { cb = options; options = undefined; }
+    queueMicrotask(() => {
+      try { cb(null, fn(data, options)); } catch (e) { cb(e); }
+    });
+  };
+}
+
+class ZlibTransform extends Transform {
+  constructor(opts, kind, compress) {
+    super(opts);
+    this._chunks = [];
+    this._kind = kind;
+    this._compress = compress;
+    this._opts = opts;
+  }
+  _transform(chunk, enc, cb) {
+    this._chunks.push(Buffer.from(chunk));
+    cb();
+  }
+  _flush(cb) {
+    try {
+      const input = Buffer.concat(this._chunks);
+      const out = this._compress
+        ? zlibCompressSync(input, this._opts, this._kind)
+        : zlibDecompressSync(input, this._opts, this._kind);
+      if (out.length)
+        this.push(out);
+      cb();
+    } catch (e) {
+      cb(e);
+    }
+  }
+}
+
 const zlib = {
-  createGzip: zlibUnsupported("createGzip"),
-  createGunzip: zlibUnsupported("createGunzip"),
-  createDeflate: zlibUnsupported("createDeflate"),
-  createInflate: zlibUnsupported("createInflate"),
-  createDeflateRaw: zlibUnsupported("createDeflateRaw"),
-  createInflateRaw: zlibUnsupported("createInflateRaw"),
+  constants: ZLIB_CONSTANTS,
+  codes: {},
+  createGzip: (o) => new ZlibTransform(o, "gzip", true),
+  createGunzip: (o) => new ZlibTransform(o, "auto", false),
+  createDeflate: (o) => new ZlibTransform(o, "zlib", true),
+  createInflate: (o) => new ZlibTransform(o, "zlib", false),
+  createDeflateRaw: (o) => new ZlibTransform(o, "raw", true),
+  createInflateRaw: (o) => new ZlibTransform(o, "raw", false),
+  createUnzip: (o) => new ZlibTransform(o, "auto", false),
   createBrotliCompress: zlibUnsupported("createBrotliCompress"),
   createBrotliDecompress: zlibUnsupported("createBrotliDecompress"),
-  gzipSync: zlibUnsupported("gzipSync"),
-  gunzipSync: zlibUnsupported("gunzipSync"),
-  deflateSync: zlibUnsupported("deflateSync"),
-  inflateSync: zlibUnsupported("inflateSync"),
-  constants: {},
+  gzipSync: (d, o) => zlibCompressSync(d, o, "gzip"),
+  gunzipSync: (d, o) => zlibDecompressSync(d, o, "auto"),
+  deflateSync: (d, o) => zlibCompressSync(d, o, "zlib"),
+  inflateSync: (d, o) => zlibDecompressSync(d, o, "zlib"),
+  deflateRawSync: (d, o) => zlibCompressSync(d, o, "raw"),
+  inflateRawSync: (d, o) => zlibDecompressSync(d, o, "raw"),
+  unzipSync: (d, o) => zlibDecompressSync(d, o, "auto"),
+  gzip: zlibCallback((d, o) => zlibCompressSync(d, o, "gzip")),
+  gunzip: zlibCallback((d, o) => zlibDecompressSync(d, o, "auto")),
+  deflate: zlibCallback((d, o) => zlibCompressSync(d, o, "zlib")),
+  inflate: zlibCallback((d, o) => zlibDecompressSync(d, o, "zlib")),
+  deflateRaw: zlibCallback((d, o) => zlibCompressSync(d, o, "raw")),
+  inflateRaw: zlibCallback((d, o) => zlibDecompressSync(d, o, "raw")),
+  unzip: zlibCallback((d, o) => zlibDecompressSync(d, o, "auto")),
+  crc32: (data, value) => {
+    if (!hasZlib())
+      throw new Error("zlib is not available in this build");
+    return native.crc32(Buffer.from(data), value || 0) >>> 0;
+  },
+  brotliCompressSync: zlibUnsupported("brotliCompressSync"),
+  brotliDecompressSync: zlibUnsupported("brotliDecompressSync"),
 };
 
 const dns = {
