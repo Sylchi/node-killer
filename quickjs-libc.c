@@ -5138,6 +5138,34 @@ done:
     return JS_HasException(ctx);
 }
 
+/* Returns non-zero when there is work that would keep the event loop
+   alive: pending jobs, timers or io/worker handlers. */
+int js_std_has_pending(JSContext *ctx)
+{
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    JSThreadState *ts = js_get_thread_state(rt);
+    JSOSRWHandler *rh;
+    struct list_head *el;
+
+    if (JS_IsJobPending(rt))
+        return 1;
+    if (!list_empty(&ts->os_timers))
+        return 1;
+    list_for_each(el, &ts->os_rw_handlers) {
+        rh = list_entry(el, JSOSRWHandler, link);
+        if (!JS_IsNull(rh->rw_func[0]) || !JS_IsNull(rh->rw_func[1]))
+            return 1;
+    }
+#ifdef USE_WORKER
+    list_for_each(el, &ts->port_list) {
+        JSWorkerMessageHandler *port = list_entry(el, JSWorkerMessageHandler, link);
+        if (!JS_IsNull(port->on_message_func))
+            return 1;
+    }
+#endif
+    return 0;
+}
+
 int js_std_loop_once(JSContext *ctx)
 {
     JSRuntime *rt = JS_GetRuntime(ctx);

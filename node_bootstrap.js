@@ -2299,11 +2299,7 @@ const fsSync = {
   },
   closeSync: (fd) => { native.close(fd); },
   readSync: (fd, buffer, offset, length, position) => {
-    if (position !== undefined && position !== null) {
-      /* pread is not exposed; fall back to a positioned read not supported
-         for now -- most callers pass null */
-    }
-    const tmp = fsError(native.read(fd, length), "read", undefined);
+    const tmp = fsError(native.read(fd, length, position), "read", undefined);
     const b = Buffer.from(tmp);
     b.copy(buffer, offset, 0, b.length);
     return b.length;
@@ -2472,11 +2468,15 @@ class FileHandle {
   }
   read(buffer, offset, length, position) {
     return promisifyMulti(fsAsync.read.bind(null, this.fd,
-      buffer, offset, length, position))();
+      buffer, offset, length, position))().then(([bytesRead]) => ({
+      bytesRead, buffer,
+    }));
   }
   write(buffer, offset, length, position) {
     return promisifyMulti(fsAsync.write.bind(null, this.fd,
-      buffer, offset, length, position))();
+      buffer, offset, length, position))().then(([bytesWritten]) => ({
+      bytesWritten, buffer,
+    }));
   }
   stat() { return fsPromise(() => fsSync.fstatSync(this.fd))(); }
   truncate(len) {
@@ -5309,7 +5309,8 @@ function spawnSync(command, args, options) {
     }
     if (!exited) {
       const w = native.waitpid(pid, C.WNOHANG);
-      if (!w[1] && w[0] !== 0) {
+      /* w is [[pid, status], errno]; a zero pid means "still running". */
+      if (!w[1] && w[0] !== null && w[0][0] !== 0) {
         exited = true;
         status = w[0][1];
       }
@@ -5352,7 +5353,13 @@ function execFileSync(file, args, options) {
 }
 
 function execSync(command, options) {
-  return execFileSync("/bin/sh", ["-c", String(command)], options);
+  try {
+    return execFileSync("/bin/sh", ["-c", String(command)], options);
+  } catch (e) {
+    e.message = "Command failed: " + command +
+      (e.stderr ? "\n" + String(e.stderr) : "");
+    throw e;
+  }
 }
 
 const child_process = {
@@ -6244,7 +6251,7 @@ class ReadlineInterface extends EventEmitter {
       this.output.write(query);
     const onLine = (line) => {
       this.removeListener("line", onLine);
-      cb(null, line);
+      cb(line);
     };
     this.once("line", onLine);
     if (this.input && this.input.resume)
@@ -6333,10 +6340,23 @@ const readline = {
   emitKeypressEvents() {},
 };
 
+class ReadlinePromisesInterface extends ReadlineInterface {
+  question(query, options) {
+    return new Promise((resolve) => {
+      super.question(query, options, resolve);
+    });
+  }
+}
+
 const readlinePromises = {
-  Interface: ReadlineInterface,
+  Interface: ReadlinePromisesInterface,
   createInterface(options, output) {
-    return readline.createInterface(options, output);
+    if (typeof options === "object" && options !== null) {
+      const input = options.input || stdin;
+      const out = options.output || (options.terminal ? stdout : undefined);
+      return new ReadlinePromisesInterface(input, out, options);
+    }
+    return new ReadlinePromisesInterface(stdin, stdout, { terminal: false });
   },
 };
 
@@ -6669,15 +6689,23 @@ function fetch(input, init) {
 /* globals                                                            */
 /* ------------------------------------------------------------------ */
 
+function formatError(err) {
+  if (err && typeof err === "object" && err.stack) {
+    const name = err.name || "Error";
+    const head = err.message ? name + ": " + err.message : name;
+    const stack = String(err.stack).replace(/^\n+/, "");
+    return stack ? head + "\n" + stack : head;
+  }
+  return String(err);
+}
+
 function reportError(err) {
   if (process.listenerCount("uncaughtException")) {
     process.emit("uncaughtException", err);
     return;
   }
   try {
-    const text = err && err.stack ? err.stack : String(err);
-    writeFdSync(2, "Uncaught " + (err && err.name ? err.name : "Error") +
-                 ": " + text + "\n");
+    writeFdSync(2, "Uncaught " + formatError(err) + "\n");
   } catch (e) { /* ignore */ }
   qjsstd.exit(1);
 }

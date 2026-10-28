@@ -1,0 +1,1 @@
+/usr/bin/cc -O3 -DNDEBUG -static -Wl,--dependency-file=CMakeFiles/qnode_exe.dir/link.d CMakeFiles/qnode_exe.dir/qnode.c.o -o qnode  libqjs-libc.a libqjs.a -lm -ldl

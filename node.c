@@ -792,12 +792,16 @@ static JSValue js_node_read(JSContext *ctx, JSValueConst this_val,
             return JS_EXCEPTION;
     if (len < 0 || len > 16 * 1024 * 1024)
         return JS_ThrowRangeError(ctx, "invalid read length");
+    int64_t position = -1;
+    if (argc > 2 && !JS_IsUndefined(argv[2]) && !JS_IsNull(argv[2]))
+        if (JS_ToInt64(ctx, &position, argv[2]))
+            return JS_EXCEPTION;
     uint8_t *buf = js_malloc(ctx, len ? len : 1);
     if (!buf)
         return JS_EXCEPTION;
     ssize_t n;
     do {
-        n = read(fd, buf, len);
+        n = position >= 0 ? pread(fd, buf, len, position) : read(fd, buf, len);
     } while (n < 0 && errno == EINTR);
     if (n < 0) {
         int err = errno;
@@ -818,9 +822,14 @@ static JSValue js_node_write(JSContext *ctx, JSValueConst this_val,
         return JS_EXCEPTION;
     if (node_get_bytes(ctx, argv[1], &b))
         return JS_EXCEPTION;
+    int64_t position = -1;
+    if (argc > 2 && !JS_IsUndefined(argv[2]) && !JS_IsNull(argv[2]))
+        if (JS_ToInt64(ctx, &position, argv[2]))
+            return JS_EXCEPTION;
     ssize_t n;
     do {
-        n = write(fd, b.data, b.len);
+        n = position >= 0 ? pwrite(fd, b.data, b.len, position)
+                          : write(fd, b.data, b.len);
     } while (n < 0 && errno == EINTR);
     int err = n < 0 ? errno : 0;
     node_free_bytes(ctx, &b);
@@ -1414,7 +1423,7 @@ static JSValue js_node_waitpid(JSContext *ctx, JSValueConst this_val,
         if (JS_ToInt32(ctx, &pid, argv[0])) return JS_EXCEPTION;
     if (argc > 1 && !JS_IsUndefined(argv[1]))
         if (JS_ToInt32(ctx, &options, argv[1])) return JS_EXCEPTION;
-    int status;
+    int status = 0;
     pid_t r = waitpid(pid, &status, options);
     if (r < 0)
         return node_err(ctx, JS_NULL, errno);
@@ -1727,11 +1736,28 @@ static JSValue js_node_set_argv(JSContext *ctx, JSValueConst this_val,
     return JS_UNDEFINED;
 }
 
+/* The embedded byte array has no trailing NUL, and the lexer may read one
+   byte past the end of its input. Keep a NUL-terminated copy around. */
+static const char *node_bootstrap_source(void)
+{
+    static char *src;
+    if (!src) {
+        src = malloc((size_t)node_bootstrap_js_len + 1);
+        if (!src)
+            return NULL;
+        memcpy(src, node_bootstrap_js, node_bootstrap_js_len);
+        src[node_bootstrap_js_len] = '\0';
+    }
+    return src;
+}
+
 static JSValue js_node_init_js(JSContext *ctx, JSValueConst this_val,
                                int argc, JSValueConst *argv)
 {
-    JSValue ret = JS_Eval(ctx, (const char *)node_bootstrap_js,
-                          node_bootstrap_js_len, "<qnode:bootstrap>",
+    const char *src = node_bootstrap_source();
+    if (!src)
+        return JS_ThrowOutOfMemory(ctx);
+    JSValue ret = JS_Eval(ctx, src, node_bootstrap_js_len, "<qnode:bootstrap>",
                           JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
     if (JS_IsException(ret))
         return ret;

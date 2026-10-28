@@ -1,0 +1,1 @@
+/usr/bin/cc -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/unicode_gen.dir/link.d CMakeFiles/unicode_gen.dir/unicode_gen.c.o -o unicode_gen

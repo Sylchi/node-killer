@@ -174,6 +174,29 @@ static void report_exception(JSContext *ctx, QNode *q)
         q->exit_code = 1;
 }
 
+static void emit_process_event(JSContext *ctx, const char *name, int code)
+{
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue proc = JS_GetPropertyStr(ctx, global, "process");
+    if (JS_IsObject(proc)) {
+        JSValue fn = JS_GetPropertyStr(ctx, proc, "emit");
+        if (JS_IsFunction(ctx, fn)) {
+            JSValue args[2];
+            args[0] = JS_NewString(ctx, name);
+            args[1] = JS_NewInt32(ctx, code);
+            JSValue r = JS_Call(ctx, fn, proc, 2, args);
+            if (JS_IsException(r))
+                JS_FreeValue(ctx, JS_GetException(ctx));
+            JS_FreeValue(ctx, r);
+            JS_FreeValue(ctx, args[0]);
+            JS_FreeValue(ctx, args[1]);
+        }
+        JS_FreeValue(ctx, fn);
+    }
+    JS_FreeValue(ctx, proc);
+    JS_FreeValue(ctx, global);
+}
+
 int main(int argc, char **argv)
 {
     QNode q;
@@ -366,9 +389,17 @@ int main(int argc, char **argv)
         }
 
         if (!failed) {
-            if (js_std_loop(ctx) < 0) {
-                if (JS_IsException(JS_GetException(ctx)))
-                    report_exception(ctx, &q);
+            /* Drain the loop, emitting beforeExit whenever it runs dry.
+               If a handler schedules more work, run the loop again. */
+            for (;;) {
+                if (js_std_loop(ctx) < 0) {
+                    if (JS_IsException(JS_GetException(ctx)))
+                        report_exception(ctx, &q);
+                    break;
+                }
+                emit_process_event(ctx, "beforeExit", q.exit_code);
+                if (!js_std_has_pending(ctx))
+                    break;
             }
         }
         free(script_path);
@@ -388,35 +419,10 @@ done:
                     q.exit_code = c;
             }
             JS_FreeValue(ctx, code);
-            JSValue listeners = JS_GetPropertyStr(ctx, proc, "listeners");
-            if (JS_IsFunction(ctx, listeners)) {
-                JSValue name = JS_NewString(ctx, "exit");
-                JSValue list = JS_Call(ctx, listeners, proc, 1, &name);
-                JS_FreeValue(ctx, name);
-                if (JS_IsArray(list)) {
-                    JSValue lenv = JS_GetPropertyStr(ctx, list, "length");
-                    int32_t len = 0;
-                    JS_ToInt32(ctx, &len, lenv);
-                    JS_FreeValue(ctx, lenv);
-                    for (int32_t i = 0; i < len; i++) {
-                        JSValue fn = JS_GetPropertyUint32(ctx, list, i);
-                        if (JS_IsFunction(ctx, fn)) {
-                            JSValue c = JS_NewInt32(ctx, q.exit_code);
-                            JSValue r = JS_Call(ctx, fn, proc, 1, &c);
-                            JS_FreeValue(ctx, c);
-                            if (JS_IsException(r))
-                                JS_FreeValue(ctx, JS_GetException(ctx));
-                            JS_FreeValue(ctx, r);
-                        }
-                        JS_FreeValue(ctx, fn);
-                    }
-                }
-                JS_FreeValue(ctx, list);
-            }
-            JS_FreeValue(ctx, listeners);
         }
         JS_FreeValue(ctx, proc);
         JS_FreeValue(ctx, global);
+        emit_process_event(ctx, "exit", q.exit_code);
     }
 
     free(requires);
