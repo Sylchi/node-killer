@@ -4485,6 +4485,10 @@ class Server extends EventEmitter {
       throw sysError(r[1], "socket");
     const fd = this._fd = r[0];
     native.setsockopt(fd, C.SOL_SOCKET, C.SO_REUSEADDR, 1);
+    /* reusePort lets several processes share one listening port; the kernel
+       spreads incoming connections between them. */
+    if (options.reusePort)
+      native.setsockopt(fd, C.SOL_SOCKET, C.SO_REUSEPORT, 1);
     if (options.port !== undefined) {
       const err = native.bind(fd, options.host || "0.0.0.0",
                               Number(options.port));
