@@ -125,6 +125,9 @@ static void print_usage(FILE *out)
         "      --version         print the qnode version\n"
         "  -h, --help            print this help\n"
         "\n"
+        "Commands:\n"
+        "  install [pkg...]      install npm packages into node_modules\n"
+        "\n"
         "Documentation: https://github.com/quickjs-ng/quickjs\n");
 }
 
@@ -208,6 +211,7 @@ int main(int argc, char **argv)
     char **requires = NULL;
     int nrequires = 0;
     int first_arg = 0;
+    int install_mode = 0;
 
     memset(&q, 0, sizeof(q));
 
@@ -249,6 +253,11 @@ int main(int argc, char **argv)
             fprintf(stderr, "qnode: bad option: %s\n", a);
             print_usage(stderr);
             return 9;
+        } else if (!strcmp(a, "install") || !strcmp(a, "i") ||
+                   !strcmp(a, "add")) {
+            install_mode = 1;
+            first_arg = i + 1;
+            break;
         } else {
             script = a;
             first_arg = i + 1;
@@ -293,7 +302,9 @@ int main(int argc, char **argv)
         JSValue *jsargs = malloc(sizeof(JSValue) * capacity);
 
         jsargs[nargs++] = JS_NewString(ctx, "/proc/self/exe");
-        if (script) {
+        if (install_mode) {
+            jsargs[nargs++] = JS_NewString(ctx, "install");
+        } else if (script) {
             script_path = resolve_entry(script);
             if (!script_path) {
                 fprintf(stderr,
@@ -345,7 +356,33 @@ int main(int argc, char **argv)
                 break;
         }
 
-        if (eval_src && !failed) {
+        if (install_mode && !failed) {
+            JSValue global = JS_GetGlobalObject(ctx);
+            JSValue fn = JS_GetPropertyStr(ctx, global, "__qnode_npm_install");
+            JSValue arr = JS_NewArray(ctx);
+            int32_t n = 0;
+            for (int i = first_arg; i < argc; i++)
+                JS_SetPropertyUint32(ctx, arr, n++,
+                                     JS_NewString(ctx, argv[i]));
+            if (JS_IsFunction(ctx, fn)) {
+                JSValue r = JS_Call(ctx, fn, JS_UNDEFINED, 1, &arr);
+                if (JS_IsException(r)) {
+                    report_exception(ctx, &q);
+                    failed = 1;
+                } else {
+                    /* js_std_await consumes its argument */
+                    JSValue awaited = js_std_await(ctx, r);
+                    if (JS_IsException(awaited)) {
+                        report_exception(ctx, &q);
+                        failed = 1;
+                    }
+                    JS_FreeValue(ctx, awaited);
+                }
+            }
+            JS_FreeValue(ctx, arr);
+            JS_FreeValue(ctx, fn);
+            JS_FreeValue(ctx, global);
+        } else if (eval_src && !failed) {
             JSValue ret = JS_Eval(ctx, eval_src, strlen(eval_src),
                                   "<eval>", JS_EVAL_TYPE_GLOBAL);
             if (JS_IsException(ret)) {
@@ -375,8 +412,8 @@ int main(int argc, char **argv)
                 report_exception(ctx, &q);
                 failed = 1;
             } else {
+                /* js_std_await consumes its argument */
                 JSValue awaited = js_std_await(ctx, ret);
-                JS_FreeValue(ctx, ret);
                 if (JS_IsException(awaited)) {
                     report_exception(ctx, &q);
                     failed = 1;

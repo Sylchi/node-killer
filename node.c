@@ -1637,6 +1637,27 @@ static void node_tls_init(void)
     }
 }
 
+/* Default client contexts are shared: creating one parses the system CA
+   bundle, which is far too slow to repeat for every connection. */
+static SSL_CTX *node_tls_client_default_ctx(int verify)
+{
+    static SSL_CTX *verify_ctx, *plain_ctx;
+    SSL_CTX **slot = verify ? &verify_ctx : &plain_ctx;
+    SSL_CTX *c;
+
+    if (*slot)
+        return *slot;
+    c = SSL_CTX_new(TLS_client_method());
+    if (!c)
+        return NULL;
+    SSL_CTX_set_min_proto_version(c, TLS1_2_VERSION);
+    SSL_CTX_set_verify(c, verify ? SSL_VERIFY_PEER : SSL_VERIFY_NONE, NULL);
+    if (verify)
+        SSL_CTX_set_default_verify_paths(c);
+    *slot = c;
+    return c;
+}
+
 static void node_tls_raise(JSContext *ctx, SSL *ssl, const char *what)
 {
     unsigned long e = ERR_get_error();
@@ -1689,6 +1710,7 @@ static JSValue js_node_tls_client_init(JSContext *ctx, JSValueConst this_val,
     const char *host = NULL;
     const char *ca = NULL;
     NodeBytes alpn = { 0 };
+    int own_ctx = 0;
 
     node_tls_init();
     if (JS_ToInt32(ctx, &fd, argv[0]))
@@ -1715,25 +1737,25 @@ static JSValue js_node_tls_client_init(JSContext *ctx, JSValueConst this_val,
         }
     }
 
-    if (verify)
+    if (ca && ca[0]) {
         c = SSL_CTX_new(TLS_client_method());
-    else
-        c = SSL_CTX_new(TLS_client_method());
-    if (!c)
-        goto oom;
-
-    SSL_CTX_set_min_proto_version(c, TLS1_2_VERSION);
-    SSL_CTX_set_verify(c, verify ? SSL_VERIFY_PEER : SSL_VERIFY_NONE, NULL);
-    if (verify) {
-        if (ca && ca[0])
+        if (!c)
+            goto oom;
+        SSL_CTX_set_min_proto_version(c, TLS1_2_VERSION);
+        SSL_CTX_set_verify(c, verify ? SSL_VERIFY_PEER : SSL_VERIFY_NONE, NULL);
+        if (verify)
             node_tls_add_ca(c, ca);
-        else
-            SSL_CTX_set_default_verify_paths(c);
+        own_ctx = 1;
+    } else {
+        c = node_tls_client_default_ctx(verify);
+        if (!c)
+            goto oom;
     }
 
     ssl = SSL_new(c);
     if (!ssl) {
-        SSL_CTX_free(c);
+        if (own_ctx)
+            SSL_CTX_free(c);
         goto oom;
     }
     SSL_set_fd(ssl, fd);
@@ -1753,13 +1775,14 @@ static JSValue js_node_tls_client_init(JSContext *ctx, JSValueConst this_val,
     for (int i = 0; i < NODE_TLS_MAX_CONN; i++) {
         if (!node_tls_conns[i].used) {
             node_tls_conns[i].ssl = ssl;
-            node_tls_conns[i].own_ctx = c;
+            node_tls_conns[i].own_ctx = own_ctx ? c : NULL;
             node_tls_conns[i].used = 1;
             return node_ok(ctx, JS_NewInt32(ctx, i));
         }
     }
     SSL_free(ssl);
-    SSL_CTX_free(c);
+    if (own_ctx)
+        SSL_CTX_free(c);
     return node_err(ctx, JS_NULL, ENOMEM);
 
 oom:
@@ -2194,6 +2217,51 @@ static JSValue js_node_tls_info(JSContext *ctx, JSValueConst this_val,
     return obj;
 }
 
+/* digest(name, data) -> Uint8Array. Used by crypto for algorithms that are
+   not implemented in JS (sha384/sha512). */
+static JSValue js_node_digest(JSContext *ctx, JSValueConst this_val,
+                              int argc, JSValueConst *argv)
+{
+    const char *name;
+    NodeBytes in;
+    NodeBytes out;
+    unsigned int outlen = 0;
+    const EVP_MD *md;
+    JSValue val;
+
+    name = node_cstr(ctx, argv[0]);
+    if (!name)
+        return JS_EXCEPTION;
+    if (node_get_bytes(ctx, argv[1], &in)) {
+        JS_FreeCString(ctx, name);
+        return JS_EXCEPTION;
+    }
+    md = EVP_get_digestbyname(name);
+    if (!md) {
+        JS_FreeCString(ctx, name);
+        node_free_bytes(ctx, &in);
+        return JS_ThrowTypeError(ctx, "Digest method not supported: %s", name);
+    }
+    out.data = js_malloc(ctx, EVP_MAX_MD_SIZE);
+    if (!out.data) {
+        JS_FreeCString(ctx, name);
+        node_free_bytes(ctx, &in);
+        return JS_EXCEPTION;
+    }
+    if (!EVP_Digest(in.data, in.len, out.data, &outlen, md, NULL)) {
+        ERR_clear_error();
+        js_free(ctx, out.data);
+        JS_FreeCString(ctx, name);
+        node_free_bytes(ctx, &in);
+        return JS_ThrowPlainError(ctx, "digest failed: %s", name);
+    }
+    JS_FreeCString(ctx, name);
+    node_free_bytes(ctx, &in);
+    val = JS_NewUint8ArrayCopy(ctx, out.data, outlen);
+    js_free(ctx, out.data);
+    return val;
+}
+
 #endif /* QNODE_HAVE_OPENSSL */
 
 /* ---------------- native object ---------------- */
@@ -2280,6 +2348,7 @@ static const JSCFunctionListEntry js_node_funcs[] = {
     JS_CFUNC_DEF("tlsFreeContext", 1, js_node_tls_free_context),
     JS_CFUNC_DEF("tlsPeerCert", 1, js_node_tls_peer_cert),
     JS_CFUNC_DEF("tlsInfo", 1, js_node_tls_info),
+    JS_CFUNC_DEF("digest", 2, js_node_digest),
 #endif
 };
 

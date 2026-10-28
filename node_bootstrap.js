@@ -1240,6 +1240,18 @@ class EventEmitter {
     this.captureRejections = false;
   }
 
+  _eventsRef() {
+    let events = this._events;
+    if (!events)
+      events = this._events = Object.create(null);
+    return events;
+  }
+
+  _eventList(name) {
+    const events = this._events;
+    return events ? events[name] : undefined;
+  }
+
   static get defaultMaxListeners() { return 10; }
   static set defaultMaxListeners(n) { /* accepted, unused */ }
 
@@ -1304,11 +1316,12 @@ class EventEmitter {
   on(name, fn) {
     if (typeof fn !== "function")
       throw new TypeError("The listener must be a function");
-    let list = this._events[name];
+    const events = this._eventsRef();
+    let list = events[name];
     if (!list)
-      list = this._events[name] = [];
+      list = events[name] = [];
     else if (!Array.isArray(list))
-      list = this._events[name] = [list];
+      list = events[name] = [list];
     list.push(fn);
     if (name !== "newListener")
       this.emit("newListener", name, fn.listener || fn);
@@ -1318,11 +1331,12 @@ class EventEmitter {
   prependListener(name, fn) {
     if (typeof fn !== "function")
       throw new TypeError("The listener must be a function");
-    let list = this._events[name];
+    const events = this._eventsRef();
+    let list = events[name];
     if (!list)
-      list = this._events[name] = [];
+      list = events[name] = [];
     else if (!Array.isArray(list))
-      list = this._events[name] = [list];
+      list = events[name] = [list];
     list.unshift(fn);
     return this;
   }
@@ -1350,21 +1364,22 @@ class EventEmitter {
   }
 
   removeListener(name, fn) {
-    const list = this._events[name];
+    const events = this._eventsRef();
+    const list = events[name];
     if (!list)
       return this;
     if (!Array.isArray(list)) {
       if (list === fn || list.listener === fn)
-        delete this._events[name];
+        delete events[name];
       return this;
     }
     for (let i = list.length - 1; i >= 0; i--) {
       if (list[i] === fn || list[i].listener === fn) {
         list.splice(i, 1);
         if (list.length === 1)
-          this._events[name] = list[0];
+          events[name] = list[0];
         else if (list.length === 0)
-          delete this._events[name];
+          delete events[name];
         break;
       }
     }
@@ -1383,7 +1398,7 @@ class EventEmitter {
   }
 
   emit(name, ...args) {
-    const list = this._events[name];
+    const list = this._eventList(name);
     if (!list) {
       if (name === "error") {
         const err = args[0];
@@ -1408,7 +1423,7 @@ class EventEmitter {
   }
 
   listeners(name) {
-    const list = this._events[name];
+    const list = this._eventList(name);
     if (!list)
       return [];
     if (!Array.isArray(list))
@@ -1417,19 +1432,19 @@ class EventEmitter {
   }
 
   rawListeners(name) {
-    const list = this._events[name];
+    const list = this._eventList(name);
     if (!list)
       return [];
     return Array.isArray(list) ? list.slice() : [list];
   }
 
   listenerCount(name) {
-    const list = this._events[name];
+    const list = this._eventList(name);
     return !list ? 0 : (Array.isArray(list) ? list.length : 1);
   }
 
   eventNames() {
-    return Object.keys(this._events);
+    return this._events ? Object.keys(this._events) : [];
   }
 
   setMaxListeners(n) { this._maxListeners = n; return this; }
@@ -1995,19 +2010,20 @@ function finished(stream, options, cb) {
   stream.once("error", (err) => done(err));
 }
 
-const stream = {
-  Stream,
-  Readable,
-  Writable,
-  Duplex,
-  Transform,
-  PassThrough,
-  pipeline,
-  finished,
-  addAbortSignal: (signal, s) => s,
-  isReadable: (s) => s instanceof Readable,
-  isWritable: (s) => s instanceof Writable,
-};
+/* `require('stream')` is the Stream constructor in Node, with the other
+   classes hanging off it. Some packages (send, for one) inherit from it. */
+Stream.Stream = Stream;
+Stream.Readable = Readable;
+Stream.Writable = Writable;
+Stream.Duplex = Duplex;
+Stream.Transform = Transform;
+Stream.PassThrough = PassThrough;
+Stream.pipeline = pipeline;
+Stream.finished = finished;
+Stream.addAbortSignal = (signal, s) => s;
+Stream.isReadable = (s) => s instanceof Readable;
+Stream.isWritable = (s) => s instanceof Writable;
+const stream = Stream;
 Readable.from = Readable.from;
 
 /* ------------------------------------------------------------------ */
@@ -3702,6 +3718,29 @@ function resolvePackageExports(pkg, subpath, kind) {
   return undefined;
 }
 
+function resolvePackageImports(pkg, spec, kind) {
+  const map = pkg.imports;
+  if (!map || typeof map !== "object")
+    return undefined;
+  if (Object.prototype.hasOwnProperty.call(map, spec))
+    return resolveConditional(map[spec], kind);
+  for (const pattern of Object.keys(map)) {
+    const star = pattern.indexOf("*");
+    if (star < 0)
+      continue;
+    const prefix = pattern.slice(0, star);
+    const suffix = pattern.slice(star + 1);
+    if (spec.startsWith(prefix) && spec.endsWith(suffix) &&
+        spec.length >= prefix.length + suffix.length) {
+      const matched = spec.slice(prefix.length, spec.length - suffix.length);
+      const target = resolveConditional(map[pattern], kind);
+      if (target !== null)
+        return target.replace(/\*/g, matched);
+    }
+  }
+  return undefined;
+}
+
 function resolveFile(p) {
   if (isFile(p))
     return realpathSafe(p);
@@ -3831,6 +3870,25 @@ function resolveRequest(request, base, kind) {
     return "qnode:" + stripNodePrefix(request);
 
   const baseDir = baseDirectory(base);
+  if (request.startsWith("#")) {
+    const pkg = findPackage(baseDir);
+    const target = pkg ? resolvePackageImports(pkg, request, kind) : undefined;
+    if (target === undefined) {
+      const e = new Error("Package import specifier \"" + request +
+        "\" is not defined" + (pkg ? " in " + pkg.__dir : ""));
+      e.code = "ERR_PACKAGE_IMPORT_NOT_DEFINED";
+      throw e;
+    }
+    if (target === null)
+      throw moduleNotFound(request, base);
+    if (target.startsWith("./")) {
+      const r = resolveFileOrDir(pathJoin(pkg.__dir, target), kind);
+      if (r)
+        return r;
+      throw moduleNotFound(request, base);
+    }
+    return resolveRequest(target, pathJoin(pkg.__dir, "index.js"), kind);
+  }
   if (request.startsWith("./") || request.startsWith("../") ||
       request === "." || request === ".." || request.startsWith("/")) {
     const target = request.startsWith("/") ? request
@@ -4096,7 +4154,23 @@ class Socket extends Duplex {
     if (cb)
       this.once("connect", cb);
     queueMicrotask(() => {
-      const r = native.socket(options.family === 6 ? C.AF_INET6 : C.AF_INET,
+      /* Resolve host names ourselves so repeated connects reuse the DNS
+         cache instead of paying for getaddrinfo on every socket. */
+      let host = options.host || "127.0.0.1";
+      let family = options.family === 6 ? 6 : 4;
+      if (!/^[0-9.]+$/.test(host) && host.indexOf(":") < 0) {
+        const r = dnsCached(host);
+        const list = (r && !r[1] && r[0]) || [];
+        const addr = list.find((a) => (family === 6
+          ? a.family === C.AF_INET6 : a.family === C.AF_INET)) || list[0];
+        if (!addr) {
+          self.destroy(sysError(C.EADDRNOTAVAIL, "connect", host));
+          return;
+        }
+        host = addr.address;
+        family = addr.family === C.AF_INET6 ? 6 : 4;
+      }
+      const r = native.socket(family === 6 ? C.AF_INET6 : C.AF_INET,
                               C.SOCK_STREAM, 0);
       if (r[1]) {
         self.destroy(sysError(r[1], "socket"));
@@ -4105,8 +4179,7 @@ class Socket extends Duplex {
       self._fd = r[0];
       if (options.noDelay !== false)
         self.setNoDelay(true);
-      const err = native.connect(self._fd, options.host || "127.0.0.1",
-                                 options.port);
+      const err = native.connect(self._fd, host, options.port);
       if (err === 0) {
         self._afterConnect();
       } else if (err === C.EINPROGRESS || err === C.EAGAIN ||
@@ -5636,6 +5709,9 @@ class Hash {
       out = Buffer.from(sha1(input));
     else if (this._alg === "sha256")
       out = Buffer.from(sha256(input));
+    else if ((this._alg === "sha384" || this._alg === "sha512") &&
+             typeof native.digest === "function")
+      out = Buffer.from(native.digest(this._alg, input));
     else
       throw new Error("Digest method not supported: " + this._alg);
     return encoding ? out.toString(encoding) : out;
@@ -5649,7 +5725,8 @@ class Hash {
 
 const HASH_ALIASES = {
   md5: "md5", sha1: "sha1", "sha-1": "sha1", sha256: "sha256",
-  "sha-256": "sha256",
+  "sha-256": "sha256", sha384: "sha384", "sha-384": "sha384",
+  sha512: "sha512", "sha-512": "sha512",
 };
 
 function createHash(algorithm) {
@@ -5958,6 +6035,19 @@ class StringDecoder {
 /* small core modules                                                 */
 /* ------------------------------------------------------------------ */
 
+/* Node exposes Buffer's statics as enumerable properties; polyfills such as
+   safer-buffer copy them with for..in / hasOwnProperty. */
+for (const key of Object.getOwnPropertyNames(Buffer)) {
+  if (key === "length" || key === "name" || key === "prototype" ||
+      key === "caller" || key === "arguments")
+    continue;
+  const desc = Object.getOwnPropertyDescriptor(Buffer, key);
+  if (desc && !desc.enumerable) {
+    desc.enumerable = true;
+    Object.defineProperty(Buffer, key, desc);
+  }
+}
+
 const bufferModule = {
   Buffer,
   SlowBuffer: Buffer,
@@ -6131,12 +6221,30 @@ const zlib = {
   brotliDecompressSync: zlibUnsupported("brotliDecompressSync"),
 };
 
+const DNS_CACHE = new Map();
+const DNS_TTL = 300000;
+
+function dnsCached(hostname) {
+  const key = String(hostname);
+  const now = Date.now();
+  const hit = DNS_CACHE.get(key);
+  if (hit && hit.expires > now)
+    return hit.result;
+  const result = native.dns(key);
+  if (!result[1]) {
+    if (DNS_CACHE.size >= 500)
+      DNS_CACHE.clear();
+    DNS_CACHE.set(key, { result, expires: now + DNS_TTL });
+  }
+  return result;
+}
+
 const dns = {
   lookup(hostname, options, cb) {
     if (typeof options === "function") { cb = options; options = {}; }
     options = options || {};
     queueMicrotask(() => {
-      const r = native.dns(String(hostname));
+      const r = dnsCached(hostname);
       if (r[1]) { cb(sysError(r[1], "getaddrinfo", hostname)); return; }
       const list = r[0];
       if (!list.length) {
@@ -7276,6 +7384,9 @@ function fetchOnce(url, init, redirects) {
     const secure = u.protocol === "https:";
     const headers = {};
     init.headers.forEach((v, k) => { headers[k] = v; });
+    if (headers["accept-encoding"] === undefined &&
+        init.acceptEncoding !== false)
+      headers["accept-encoding"] = "gzip, deflate";
     const opts = {
       hostname: u.hostname,
       port: u.port || (secure ? 443 : 80),
@@ -7380,8 +7491,757 @@ function fetch(input, init) {
 }
 
 /* ------------------------------------------------------------------ */
+/* npm installer                                                      */
+/* ------------------------------------------------------------------ */
+
+const NPM_REGISTRY = (process.env.npm_config_registry ||
+  process.env.NPM_CONFIG_REGISTRY || "https://registry.npmjs.org")
+  .replace(/\/+$/, "");
+
+function npmParseVersion(v) {
+  const m = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/
+    .exec(String(v).trim());
+  if (!m)
+    return null;
+  return {
+    major: +m[1], minor: +m[2], patch: +m[3], pre: m[4] || "",
+    raw: String(v).trim(),
+  };
+}
+
+function npmCompareVersion(a, b) {
+  if (typeof a === "string") a = npmParseVersion(a);
+  if (typeof b === "string") b = npmParseVersion(b);
+  if (!a && !b) return 0;
+  if (!a) return -1;
+  if (!b) return 1;
+  for (const k of ["major", "minor", "patch"]) {
+    if (a[k] !== b[k])
+      return a[k] < b[k] ? -1 : 1;
+  }
+  if (!a.pre && b.pre) return 1;
+  if (a.pre && !b.pre) return -1;
+  if (a.pre === b.pre) return 0;
+  const ap = a.pre.split("."), bp = b.pre.split(".");
+  for (let i = 0; i < Math.max(ap.length, bp.length); i++) {
+    if (ap[i] === undefined) return -1;
+    if (bp[i] === undefined) return 1;
+    const an = /^\d+$/.test(ap[i]) ? +ap[i] : ap[i];
+    const bn = /^\d+$/.test(bp[i]) ? +bp[i] : bp[i];
+    if (typeof an === "number" && typeof bn === "number") {
+      if (an !== bn) return an < bn ? -1 : 1;
+    } else if (String(an) !== String(bn)) {
+      return String(an) < String(bn) ? -1 : 1;
+    }
+  }
+  return 0;
+}
+
+function npmNextAfter(parts) {
+  /* smallest version greater than the prefix described by parts */
+  const major = parts[0];
+  const minor = parts[1] === null ? 0 : parts[1];
+  const patch = parts[2] === null ? 0 : parts[2];
+  if (parts[2] === null)
+    return { major, minor: minor + 1, patch: 0, pre: "", raw: "" };
+  return { major, minor, patch: patch + 1, pre: "", raw: "" };
+}
+
+function npmParseRangeAtom(token) {
+  token = token.trim();
+  if (!token || token === "*" || token === "x" || token === "X" ||
+      token === "latest")
+    return null;
+  const m = /^(\^|~|>=|<=|>|<|=)?\s*v?(\d+|[xX*])(?:\.(\d+|[xX*]))?(?:\.(\d+|[xX*]))?(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/
+    .exec(token);
+  if (!m)
+    return null;
+  const wild = (x) => x === undefined || x === "x" || x === "X" || x === "*";
+  if (wild(m[2]))
+    return null;
+  return {
+    op: m[1] || "=",
+    parts: [Number(m[2]), wild(m[3]) ? null : Number(m[3]),
+            wild(m[4]) ? null : Number(m[4])],
+    pre: m[5] || "",
+  };
+}
+
+function npmAtomMatches(vs, atom) {
+  const { op, parts, pre } = atom;
+  const target = {
+    major: parts[0],
+    minor: parts[1] === null ? 0 : parts[1],
+    patch: parts[2] === null ? 0 : parts[2],
+    pre,
+  };
+  if (op === "=") {
+    if (parts[1] === null)
+      return vs.major === parts[0];
+    if (parts[2] === null)
+      return vs.major === parts[0] && vs.minor === parts[1];
+    return npmCompareVersion(vs, target) === 0;
+  }
+  if (op === ">") {
+    if (parts[2] === null)
+      return npmCompareVersion(vs, target) > 0;
+    return npmCompareVersion(vs, target) > 0;
+  }
+  if (op === ">=")
+    return npmCompareVersion(vs, target) >= 0;
+  if (op === "<")
+    return npmCompareVersion(vs, target) < 0;
+  if (op === "<=") {
+    if (parts[2] === null && parts[1] !== null) {
+      const next = npmNextAfter(parts);
+      return npmCompareVersion(vs, next) < 0;
+    }
+    return npmCompareVersion(vs, target) <= 0;
+  }
+  if (op === "~") {
+    if (npmCompareVersion(vs, target) < 0)
+      return false;
+    if (parts[1] === null)
+      return vs.major === parts[0];
+    return vs.major === parts[0] && vs.minor === parts[1];
+  }
+  /* caret */
+  if (npmCompareVersion(vs, target) < 0)
+    return false;
+  if (parts[0] > 0)
+    return vs.major === parts[0];
+  if (parts[1] === null)
+    return vs.major === 0;
+  if (parts[1] > 0)
+    return vs.major === 0 && vs.minor === parts[1];
+  if (parts[2] === null)
+    return vs.major === 0 && vs.minor === 0;
+  return vs.major === 0 && vs.minor === 0 && vs.patch === parts[2];
+}
+
+function npmRangeAtoms(range) {
+  const atoms = [];
+  let text = String(range).trim();
+  /* hyphen ranges: "1.2.3 - 2.3.4" */
+  const hy = /^([0-9xX*.]+)\s+-\s+([0-9xX*.]+)$/.exec(text);
+  if (hy) {
+    const lo = npmParseRangeAtom(hy[1]);
+    const hi = npmParseRangeAtom(hy[2]);
+    if (lo)
+      atoms.push({ op: ">=", parts: lo.parts, pre: lo.pre });
+    if (hi) {
+      if (hi.parts[1] === null)
+        atoms.push({ op: "<", parts: [hi.parts[0] + 1, null, null], pre: "" });
+      else if (hi.parts[2] === null)
+        atoms.push({ op: "<", parts: [hi.parts[0], hi.parts[1] + 1, null],
+                     pre: "" });
+      else
+        atoms.push({ op: "<=", parts: hi.parts, pre: hi.pre });
+    }
+    return atoms;
+  }
+  /* allow whitespace between an operator and its version */
+  text = text.replace(/(>=|<=|>|<|=|~|\^)\s+/g, "$1");
+  for (const token of text.split(/\s+/)) {
+    if (!token)
+      continue;
+    const atom = npmParseRangeAtom(token);
+    if (atom)
+      atoms.push(atom);
+    else
+      return null;
+  }
+  return atoms;
+}
+
+function npmSatisfies(version, range) {
+  if (!range)
+    return true;
+  const v = typeof version === "string" ? npmParseVersion(version) : version;
+  if (!v)
+    return false;
+  for (const alt of String(range).split("||")) {
+    const atoms = npmRangeAtoms(alt);
+    if (atoms === null)
+      continue;
+    if (atoms.every((a) => npmAtomMatches(v, a)))
+      return true;
+  }
+  return false;
+}
+
+const npmPackuments = new Map();
+const NPM_NET_LIMIT = 8;
+
+function npmLimit(ctx, fn) {
+  const run = () => {
+    if (ctx.active < NPM_NET_LIMIT)
+      return fn();
+    return ctx.queue.push(fn).then((f) => f());
+  };
+  return new Promise((resolve, reject) => {
+    const task = () => {
+      ctx.active++;
+      Promise.resolve()
+        .then(fn)
+        .then(resolve, reject)
+        .finally(() => {
+          ctx.active--;
+          const next = ctx.queue.shift();
+          if (next)
+            next();
+        });
+    };
+    if (ctx.active < NPM_NET_LIMIT)
+      task();
+    else
+      ctx.queue.push(task);
+  });
+}
+
+async function npmFetchPackument(ctx, name) {
+  let cached = npmPackuments.get(name);
+  if (cached)
+    return cached;
+  const p = (async () => {
+    const url = NPM_REGISTRY + "/" + name.replace("/", "%2f");
+    let lastErr;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const res = await npmLimit(ctx, () => fetch(url, {
+          headers: { accept: "application/vnd.npm.install-v1+json" },
+        }));
+        if (res.status === 404) {
+          const e = new Error("404 Not Found - " + name);
+          e.code = "E404";
+          throw e;
+        }
+        if (!res.ok)
+          throw new Error("failed to fetch " + name + ": HTTP " + res.status);
+        const doc = await res.json();
+        return doc;
+      } catch (e) {
+        lastErr = e;
+        if (e && e.code === "E404")
+          throw e;
+      }
+    }
+    throw lastErr;
+  })();
+  npmPackuments.set(name, p);
+  p.catch(() => npmPackuments.delete(name));
+  return p;
+}
+
+function npmLatestVersion(doc, range) {
+  const versions = Object.keys(doc.versions || {});
+  let best = null;
+  for (const v of versions) {
+    if (v === "0.0.0" || v.indexOf("npm:") >= 0)
+      continue;
+    if (!npmSatisfies(v, range))
+      continue;
+    if (!best || npmCompareVersion(v, best) > 0)
+      best = v;
+  }
+  if (!best && (range === "*" || range === "" || range === "latest")) {
+    for (const v of versions)
+      if (!best || npmCompareVersion(v, best) > 0)
+        best = v;
+  }
+  return best;
+}
+
+function npmTarField(header, off, len) {
+  let end = off;
+  const stop = off + len;
+  while (end < stop && header[end] !== 0)
+    end++;
+  return header.toString("utf8", off, end);
+}
+
+function npmExtractTarball(buf, dest) {
+  let tar = buf;
+  if (buf.length > 2 && buf[0] === 0x1f && buf[1] === 0x8b)
+    tar = zlib.gunzipSync(buf);
+  fsSync.mkdirSync(dest, { recursive: true });
+  let off = 0;
+  let override = null;
+  let count = 0;
+  while (off + 512 <= tar.length) {
+    const header = tar.subarray(off, off + 512);
+    let empty = true;
+    for (let i = 0; i < 512; i++)
+      if (header[i]) { empty = false; break; }
+    if (empty)
+      break;
+    let name = npmTarField(header, 0, 100);
+    const prefix = npmTarField(header, 345, 155);
+    const modeStr = npmTarField(header, 100, 8);
+    const sizeStr = npmTarField(header, 124, 12);
+    const type = header[156] ? String.fromCharCode(header[156]) : "0";
+    const size = parseInt(sizeStr.trim() || "0", 8) || 0;
+    const mode = parseInt(modeStr.trim() || "644", 8) || 0o644;
+    const dataOff = off + 512;
+    off = dataOff + Math.ceil(size / 512) * 512;
+    if (prefix)
+      name = prefix + "/" + name;
+    if (type === "L" || type === "x") {
+      const text = tar.toString("utf8", dataOff, dataOff + size);
+      if (type === "L") {
+        override = text.replace(/\0+$/, "");
+      } else {
+        /* pax extended header: "len key=value\n" records */
+        let pos = 0;
+        while (pos < text.length) {
+          const sp = text.indexOf(" ", pos);
+          if (sp < 0)
+            break;
+          const len = parseInt(text.slice(pos, sp), 10);
+          if (!len || len <= 0)
+            break;
+          const rec = text.slice(sp + 1, pos + len - 1);
+          const eq = rec.indexOf("=");
+          if (eq > 0 && rec.slice(0, eq) === "path")
+            override = rec.slice(eq + 1);
+          pos += len;
+        }
+      }
+      continue;
+    }
+    if (type === "g" || type === "K")
+      continue;
+    if (override) {
+      name = override;
+      override = null;
+    }
+    let rel = name.replace(/\\/g, "/").replace(/^\.?\//, "");
+    const slash = rel.indexOf("/");
+    if (slash >= 0)
+      rel = rel.slice(slash + 1);
+    if (!rel)
+      continue;
+    const out = pathJoin(dest, rel);
+    const base = pathResolve(dest);
+    if (pathResolve(out) !== base && !pathResolve(out).startsWith(base + "/"))
+      continue;
+    if (type === "5") {
+      fsSync.mkdirSync(out, { recursive: true });
+      continue;
+    }
+    if (type === "2") {
+      const link = npmTarField(header, 157, 100);
+      fsSync.mkdirSync(pathDirname(out), { recursive: true });
+      try { fsSync.unlinkSync(out); } catch (e) { /* ignore */ }
+      try { fsSync.symlinkSync(link, out); } catch (e) { /* ignore */ }
+      continue;
+    }
+    if (type !== "0" && type !== "\0")
+      continue;
+    fsSync.mkdirSync(pathDirname(out), { recursive: true });
+    fsSync.writeFileSync(out, tar.subarray(dataOff, dataOff + size));
+    try { fsSync.chmodSync(out, mode & 0o777); } catch (e) { /* ignore */ }
+    count++;
+  }
+  return count;
+}
+
+function npmIntegrityCheck(buf, dist) {
+  const integrity = dist && dist.integrity;
+  if (!integrity)
+    return;
+  for (const item of String(integrity).split(/\s+/)) {
+    const dash = item.indexOf("-");
+    if (dash < 0)
+      continue;
+    const alg = item.slice(0, dash);
+    const expected = item.slice(dash + 1);
+    let actual;
+    try {
+      actual = createHash(alg).update(buf).digest("base64");
+    } catch (e) {
+      continue;
+    }
+    if (actual !== expected)
+      throw new Error("integrity checksum failed (wanted " + expected +
+                      " got " + actual + ")");
+    return;
+  }
+}
+
+function npmParseSpec(spec) {
+  spec = String(spec);
+  let at = spec.lastIndexOf("@");
+  if (at > 0)
+    return { name: spec.slice(0, at), range: spec.slice(at + 1) || "*" };
+  return { name: spec, range: "*" };
+}
+
+function npmPackageDir(root, name) {
+  return pathJoin(root, "node_modules", ...name.split("/"));
+}
+
+function npmReadPackageJson(dir) {
+  try {
+    return JSON.parse(fsSync.readFileSync(pathJoin(dir, "package.json"), "utf8"));
+  } catch (e) {
+    return null;
+  }
+}
+
+function npmFindExisting(fromDir, projectRoot, name, range) {
+  let dir = fromDir;
+  for (;;) {
+    const candidate = npmPackageDir(dir, name);
+    const pkg = npmReadPackageJson(candidate);
+    if (pkg && pkg.version && npmSatisfies(pkg.version, range))
+      return { dir: candidate, pkg };
+    if (dir === projectRoot)
+      break;
+    const parent = pathDirname(dir);
+    if (parent === dir)
+      break;
+    dir = parent;
+  }
+  return null;
+}
+
+async function npmWithLock(ctx, key, fn) {
+  const prev = ctx.locks.get(key) || Promise.resolve();
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  ctx.locks.set(key, prev.then(() => gate));
+  await prev;
+  try {
+    return await fn();
+  } finally {
+    release();
+  }
+}
+
+async function npmDownloadTarball(ctx, url) {
+  let cached = ctx.tarballs.get(url);
+  if (cached)
+    return cached;
+  const p = (async () => {
+    let lastErr;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const res = await npmLimit(ctx, () => fetch(url, { acceptEncoding: true }));
+        if (!res.ok)
+          throw new Error("HTTP " + res.status + " for " + url);
+        return Buffer.from(await res.arrayBuffer());
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    throw lastErr;
+  })();
+  ctx.tarballs.set(url, p);
+  p.catch(() => ctx.tarballs.delete(url));
+  return p;
+}
+
+async function npmProcessDeps(projectRoot, dir, ctx, chain) {
+  if (ctx.done.has(dir))
+    return;
+  if (ctx.processing.has(dir))
+    return ctx.processing.get(dir);
+  const pkg = npmReadPackageJson(dir);
+  if (!pkg) {
+    ctx.done.add(dir);
+    return;
+  }
+  const promise = (async () => {
+    await npmInstallDeps(projectRoot, dir, pkg, ctx, chain);
+  })();
+  ctx.processing.set(dir, promise);
+  try {
+    await promise;
+    ctx.done.add(dir);
+  } finally {
+    ctx.processing.delete(dir);
+  }
+}
+
+async function npmInstallOne(projectRoot, fromDir, name, range, ctx, chain) {
+  const existing = npmFindExisting(fromDir, projectRoot, name, range);
+  if (existing) {
+    if (chain.has(existing.dir))
+      return { name, version: existing.pkg.version, installed: false };
+    if (!ctx.done.has(existing.dir)) {
+      const nextChain = new Set(chain);
+      nextChain.add(existing.dir);
+      await npmProcessDeps(projectRoot, existing.dir, ctx, nextChain);
+    }
+    return { name, version: existing.pkg.version, installed: false };
+  }
+
+  const doc = await npmFetchPackument(ctx, name);
+  const version = npmLatestVersion(doc, range);
+  if (!version)
+    throw new Error("No matching version found for " + name + "@" + range);
+  const info = (doc.versions || {})[version];
+  if (!info || !info.dist || !info.dist.tarball)
+    throw new Error("No tarball for " + name + "@" + version);
+
+  const rootTarget = npmPackageDir(projectRoot, name);
+  const rootPkg = npmReadPackageJson(rootTarget);
+
+  /* Install a package into `target` unless a compatible copy is already
+     there. When `replace` is false an existing incompatible copy is left
+     alone and the caller nests the package instead. */
+  const place = (target, replace) => npmWithLock(ctx, target, async () => {
+    const now = npmReadPackageJson(target);
+    if (now && npmSatisfies(now.version, range))
+      return false;
+    if (now && !replace)
+      return null;
+    const tgz = await npmDownloadTarball(ctx, info.dist.tarball);
+    npmIntegrityCheck(tgz, info.dist);
+    fsSync.rmSync(target, { recursive: true, force: true });
+    npmExtractTarball(tgz, target);
+    ctx.added++;
+    process.stderr.write("qnode install: " + name + "@" + version + "\n");
+    return true;
+  });
+
+  let target = (fromDir === projectRoot || !rootPkg) ? rootTarget
+    : npmPackageDir(fromDir, name);
+  if (chain.has(target))
+    return { name, version, installed: false };
+
+  let placed = await place(target, fromDir === projectRoot);
+  if (placed === null) {
+    /* A concurrent install populated the hoisted slot with a different
+       version: keep ours next to the package that asked for it. */
+    target = npmPackageDir(fromDir, name);
+    if (chain.has(target))
+      return { name, version, installed: false };
+    placed = await place(target, true);
+  }
+
+  const nextChain = new Set(chain);
+  nextChain.add(target);
+  await npmProcessDeps(projectRoot, target, ctx, nextChain);
+  return { name, version, installed: placed !== false };
+}
+
+async function npmInstallDeps(projectRoot, dir, pkg, ctx, chain) {
+  const deps = Object.assign({}, pkg.dependencies || {},
+                             pkg.optionalDependencies || {});
+  const optional = pkg.optionalDependencies || {};
+  const tasks = Object.keys(deps).map((dep) => (async () => {
+    try {
+      await npmInstallOne(projectRoot, dir, dep, deps[dep], ctx, chain);
+    } catch (e) {
+      if (dep in optional)
+        return;
+      throw e;
+    }
+  })());
+  const results = await Promise.allSettled(tasks);
+  const failed = results.find((r) => r.status === "rejected");
+  if (failed)
+    throw failed.reason;
+}
+
+async function npmInstall(args) {
+  const started = Date.now();
+  const cwd = process.cwd();
+  const pkgPath = pathJoin(cwd, "package.json");
+  let pkg = npmReadPackageJson(cwd);
+  if (!pkg) {
+    if (!args.length)
+      throw new Error("no package.json found in " + cwd);
+    pkg = { name: pathBasename(cwd), version: "1.0.0" };
+  }
+  const specs = [];
+  if (args.length) {
+    for (const a of args) {
+      if (a.startsWith("-"))
+        continue;
+      specs.push(npmParseSpec(a));
+    }
+  } else {
+    for (const k of Object.keys(pkg.dependencies || {}))
+      specs.push({ name: k, range: pkg.dependencies[k] });
+    for (const k of Object.keys(pkg.devDependencies || {}))
+      specs.push({ name: k, range: pkg.devDependencies[k] });
+    for (const k of Object.keys(pkg.optionalDependencies || {}))
+      specs.push({ name: k, range: pkg.optionalDependencies[k] });
+  }
+  if (!specs.length) {
+    process.stderr.write("qnode install: nothing to install\n");
+    return 0;
+  }
+
+  const ctx = {
+    added: 0, seen: new Set(), done: new Set(), processing: new Map(),
+    locks: new Map(), tarballs: new Map(), active: 0, queue: [],
+  };
+  const resolved = [];
+  const chain = new Set();
+  await Promise.all(specs.map(async (spec) => {
+    const r = await npmInstallOne(cwd, cwd, spec.name, spec.range, ctx, chain);
+    resolved.push({ name: spec.name, range: spec.range, version: r.version });
+  }));
+
+  if (args.length) {
+    pkg.dependencies = pkg.dependencies || {};
+    for (const r of resolved)
+      pkg.dependencies[r.name] = "^" + r.version;
+    fsSync.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + "\n");
+  }
+
+  const secs = ((Date.now() - started) / 1000).toFixed(2);
+  process.stderr.write("added " + ctx.added + " package" +
+                       (ctx.added === 1 ? "" : "s") + " in " + secs + "s\n");
+  return 0;
+}
+
+globalThis.__qnode_npm_install = npmInstall;
+
+/* ------------------------------------------------------------------ */
 /* globals                                                            */
 /* ------------------------------------------------------------------ */
+
+/* V8-style call site introspection. Some npm packages (depd, debug) walk
+   Error.prepareStackTrace output, so expose structured frames. */
+function makeCallSite(file, line, column, fn, isNative) {
+  return {
+    getFileName: () => file || null,
+    getScriptNameOrSourceURL: () => file || null,
+    getLineNumber: () => line,
+    getColumnNumber: () => column,
+    getFunctionName: () => fn || null,
+    getMethodName: () => null,
+    getTypeName: () => null,
+    isEval: () => !!(file && file === "<eval>"),
+    getEvalOrigin: () => (!file ? undefined
+      : { toString: () => file }),
+    isNative: () => !!isNative,
+    isConstructor: () => false,
+    isToplevel: () => !fn,
+    isAsync: () => false,
+    isPromiseAll: () => false,
+    getThis: () => undefined,
+    toString() {
+      if (isNative)
+        return (fn ? fn + " (native)" : "native");
+      const loc = file + (line === null ? "" : ":" + line + ":" + column);
+      return fn ? fn + " (" + loc + ")" : loc;
+    },
+  };
+}
+
+function parseStackFrames(raw) {
+  const frames = [];
+  for (const lineText of String(raw || "").split("\n")) {
+    const m = /^\s*at (.*)$/.exec(lineText);
+    if (!m)
+      continue;
+    let rest = m[1].trim();
+    let fn = null;
+    let loc = rest;
+    if (rest.endsWith(")") && rest.lastIndexOf(" (") >= 0) {
+      const idx = rest.lastIndexOf(" (");
+      fn = rest.slice(0, idx);
+      loc = rest.slice(idx + 2, -1);
+    }
+    let file = loc;
+    let line = null;
+    let column = null;
+    let native = loc === "native";
+    if (!native) {
+      const lm = /^(.*):(\d+):(\d+)$/.exec(loc);
+      if (lm) {
+        file = lm[1];
+        line = Number(lm[2]);
+        column = Number(lm[3]);
+      } else if (loc.startsWith("(") && loc.endsWith(")")) {
+        file = loc.slice(1, -1);
+      }
+    }
+    frames.push(makeCallSite(file, line, column, fn, native));
+  }
+  return frames;
+}
+
+if (typeof Error.captureStackTrace !== "function") {
+  if (typeof Error.stackTraceLimit !== "number")
+    Error.stackTraceLimit = 10;
+  Error.captureStackTrace = function captureStackTrace(obj, ctor) {
+    const raw = new Error().stack;
+    let frames = parseStackFrames(raw);
+    /* Drop our own frame, matching V8 (captureStackTrace does not appear). */
+    if (frames.length && frames[0].getFunctionName() === "captureStackTrace")
+      frames.shift();
+    if (typeof ctor === "function" && ctor.name) {
+      const idx = frames.findIndex((f) => f.getFunctionName() === ctor.name);
+      if (idx >= 0)
+        frames = frames.slice(idx + 1);
+    }
+    const limit = Number(Error.stackTraceLimit);
+    if (Number.isFinite(limit) && limit >= 0 && frames.length > limit)
+      frames = frames.slice(0, limit);
+    Object.defineProperty(obj, "stack", {
+      configurable: true,
+      enumerable: false,
+      get() {
+        const prep = Error.prepareStackTrace;
+        if (typeof prep === "function")
+          return prep(obj, frames);
+        return frames.map((f) => "    at " + f.toString()).join("\n");
+      },
+      set(value) {
+        Object.defineProperty(obj, "stack", {
+          configurable: true, enumerable: false, writable: true, value,
+        });
+      },
+    });
+  };
+}
+
+/* quickjs-ng's native CallSite objects lack a few V8 methods that call-site
+   walking packages rely on. Fill them in on the shared prototype. */
+(function patchCallSites() {
+  try {
+    const saved = Error.prepareStackTrace;
+    Error.prepareStackTrace = (err, stack) => stack;
+    const probe = {};
+    Error.captureStackTrace(probe);
+    const frames = probe.stack;
+    Error.prepareStackTrace = saved;
+    if (!Array.isArray(frames) || !frames.length)
+      return;
+    const proto = Object.getPrototypeOf(frames[0]);
+    if (!proto || typeof proto !== "object")
+      return;
+    if (typeof proto.isEval !== "function")
+      proto.isEval = function() {
+        const f = this.getFileName && this.getFileName();
+        return f === "<eval>" || f === "<input>";
+      };
+    if (typeof proto.getEvalOrigin !== "function")
+      proto.getEvalOrigin = function() {
+        const f = this.getFileName && this.getFileName();
+        return f ? String(f) : undefined;
+      };
+    if (typeof proto.getMethodName !== "function")
+      proto.getMethodName = () => null;
+    if (typeof proto.getTypeName !== "function")
+      proto.getTypeName = () => null;
+    if (typeof proto.getThis !== "function")
+      proto.getThis = () => undefined;
+    if (typeof proto.isToplevel !== "function")
+      proto.isToplevel = function() { return !this.getFunctionName(); };
+    if (typeof proto.isAsync !== "function")
+      proto.isAsync = () => false;
+    if (typeof proto.isPromiseAll !== "function")
+      proto.isPromiseAll = () => false;
+  } catch (e) { /* ignore */ }
+})();
 
 function formatError(err) {
   if (err && typeof err === "object" && err.stack) {
