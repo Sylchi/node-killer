@@ -1,1 +1,0 @@
-/usr/bin/cc -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/api-test.dir/link.d "CMakeFiles/api-test.dir/api-test.c.o" -o api-test  libqjs.a libqjs-libc.a libqjs.a -lm -ldl
