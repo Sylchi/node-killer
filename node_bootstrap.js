@@ -387,8 +387,7 @@ class Buffer extends Uint8Array {
     }
     if (ArrayBuffer.isView(value)) {
       const b = Buffer.allocUnsafe(value.byteLength);
-      new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
-        .forEach((v, i) => { b[i] = v; });
+      b.set(new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
       return b;
     }
     if (Array.isArray(value) || typeof value === "object") {
@@ -4508,6 +4507,7 @@ class Server extends EventEmitter {
       const sock = new Socket();
       sock._fd = r[0];
       sock.server = this;
+      sock.setNoDelay(true);
       this._connections++;
       const peer = native.getpeername(sock._fd);
       if (!peer[1]) {
