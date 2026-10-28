@@ -73,6 +73,10 @@ typedef sig_t sighandler_t;
 #define environ (*_NSGetEnviron())
 #endif
 
+#if defined(QJS_HAVE_LIBEV)
+#include <ev.h>
+#endif
+
 #ifdef __sun
 typedef void (*sighandler_t)(int);
 extern char **environ;
@@ -128,6 +132,10 @@ typedef struct {
     struct list_head link;
     int sig_num;
     JSValue func;
+#if defined(QJS_HAVE_LIBEV)
+    struct ev_signal *ev_watcher;
+    JSContext *ctx;
+#endif
 } JSOSSignalHandler;
 
 typedef struct {
@@ -199,9 +207,14 @@ typedef struct JSThreadState {
     JSClassID worker_class_id;
     JSInterruptHandler *prev_interrupt_handler;
     void *prev_interrupt_opaque;
+#if defined(QJS_HAVE_LIBEV)
+    struct ev_loop *ev_loop;
+#endif
 } JSThreadState;
 
 static uint64_t os_pending_signals;
+
+static int call_handler(JSContext *ctx, JSValue func);
 
 static void *js_std_dbuf_realloc(void *opaque, void *ptr, size_t size)
 {
@@ -2362,10 +2375,56 @@ static JSOSSignalHandler *find_sh(JSThreadState *ts, int sig_num)
 
 static void free_sh(JSRuntime *rt, JSOSSignalHandler *sh)
 {
+#if defined(QJS_HAVE_LIBEV)
+    JSThreadState *ts = js_get_thread_state(rt);
+    if (sh->ev_watcher && ts) {
+        struct ev_signal *w = sh->ev_watcher;
+        ev_signal_stop(ts->ev_loop, w);
+        js_free_rt(rt, w);
+        sh->ev_watcher = NULL;
+    }
+#endif
     list_del(&sh->link);
     JS_FreeValueRT(rt, sh->func);
     js_free_rt(rt, sh);
 }
+
+#if defined(QJS_HAVE_LIBEV)
+static struct ev_loop *js_get_ev_loop(JSThreadState *ts)
+{
+    if (!ts->ev_loop)
+        ts->ev_loop = ev_loop_new(EVFLAG_AUTO);
+    return ts->ev_loop;
+}
+
+static void js_ev_signal_cb(struct ev_loop *loop, ev_signal *w, int revents)
+{
+    JSOSSignalHandler *sh = w->data;
+    struct ev_loop *saved_loop = loop;
+    (void)revents;
+    call_handler(sh->ctx, sh->func);
+    ev_break(saved_loop, EVBREAK_ONE);
+}
+
+static void js_os_signal_set_ev(JSThreadState *ts, JSOSSignalHandler *sh,
+                                JSContext *ctx)
+{
+    struct ev_signal *w = sh->ev_watcher;
+    struct ev_loop *loop = js_get_ev_loop(ts);
+
+    if (!w) {
+        w = js_mallocz(ctx, sizeof(*w));
+        if (!w)
+            return;
+        sh->ev_watcher = w;
+    }
+    ev_signal_stop(loop, w);
+    ev_signal_init(w, js_ev_signal_cb, sh->sig_num);
+    w->data = sh;
+    sh->ctx = ctx;
+    ev_signal_start(loop, w);
+}
+#endif
 
 static void os_signal_handler(int sig_num)
 {
@@ -2418,7 +2477,11 @@ static JSValue js_os_signal(JSContext *ctx, JSValueConst this_val,
         }
         JS_FreeValue(ctx, sh->func);
         sh->func = JS_DupValue(ctx, func);
+#if defined(QJS_HAVE_LIBEV)
+        js_os_signal_set_ev(ts, sh, ctx);
+#else
         signal(sig_num, os_signal_handler);
+#endif
     }
     return JS_UNDEFINED;
 }
@@ -2849,6 +2912,196 @@ int js_std_poll_io(JSContext *ctx, int timeout_ms)
     return ret;
 }
 #else // !defined(_WIN32)
+
+#if defined(QJS_HAVE_LIBEV)
+
+typedef struct {
+    JSContext *ctx;
+    int fd;
+    int revents;
+    bool fired;
+    bool timer_fired;
+} JSEvPollCtx;
+
+static void js_ev_io_cb(struct ev_loop *loop, ev_io *w, int revents)
+{
+    JSEvPollCtx *pc = w->data;
+    if (!pc->fired) {
+        pc->fd = w->fd;
+        pc->revents = revents;
+        pc->fired = true;
+    }
+    ev_break(loop, EVBREAK_ONE);
+}
+
+static void js_ev_poll_timer_cb(struct ev_loop *loop, ev_timer *w, int revents)
+{
+    JSEvPollCtx *pc = w->data;
+    (void)revents;
+    pc->timer_fired = true;
+    ev_break(loop, EVBREAK_ONE);
+}
+
+/* Wait for io or timer events using libev. One event is dispatched per
+   iteration, matching the historical poll()-based loop. */
+static int js_os_poll_internal(JSContext *ctx, int timeout_ms, int flags)
+{
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    JSThreadState *ts = js_get_thread_state(rt);
+    struct ev_loop *loop;
+    int r, w, ret, nfds, min_delay, count;
+    JSOSRWHandler *rh;
+    struct list_head *el;
+    ev_io *ios = NULL;
+    ev_timer timer;
+    bool timer_started = false;
+    JSEvPollCtx pc = { .ctx = ctx, .fd = -1, .revents = 0 };
+
+    min_delay = timeout_ms;
+
+    /* only check signals in the main thread */
+    if ((flags & JS_OS_POLL_SIGNALS) &&
+        !ts->recv_pipe &&
+        unlikely(os_pending_signals != 0)) {
+        JSOSSignalHandler *sh;
+        uint64_t mask;
+
+        list_for_each(el, &ts->os_signal_handlers) {
+            sh = list_entry(el, JSOSSignalHandler, link);
+            mask = (uint64_t)1 << sh->sig_num;
+            if (os_pending_signals & mask) {
+                os_pending_signals &= ~mask;
+                return call_handler(ctx, sh->func);
+            }
+        }
+    }
+
+    if (flags & JS_OS_POLL_RUN_TIMERS) {
+        if (js_os_run_timers(rt, ctx, ts, &min_delay))
+            return -1;
+        if (min_delay == 0)
+            return 0; // expired timer
+        if (min_delay < 0)
+            if (list_empty(&ts->os_rw_handlers) && list_empty(&ts->port_list))
+                return -1; /* no more events */
+    }
+
+    loop = js_get_ev_loop(ts);
+    if (!loop)
+        return -1;
+
+    nfds = 0;
+    list_for_each(el, &ts->os_rw_handlers) {
+        rh = list_entry(el, JSOSRWHandler, link);
+        nfds += (!JS_IsNull(rh->rw_func[0]) || !JS_IsNull(rh->rw_func[1]));
+    }
+
+#ifdef USE_WORKER
+    if (flags & JS_OS_POLL_WORKERS) {
+        list_for_each(el, &ts->port_list) {
+            JSWorkerMessageHandler *port = list_entry(el, JSWorkerMessageHandler, link);
+            nfds += !JS_IsNull(port->on_message_func);
+        }
+    }
+#endif // USE_WORKER
+
+    if (nfds == 0) {
+        if (min_delay > 0) {
+            ev_timer_init(&timer, js_ev_poll_timer_cb, min_delay / 1000.0, 0.);
+            timer.data = &pc;
+            ev_timer_start(loop, &timer);
+            ev_run(loop, 0);
+            ev_timer_stop(loop, &timer);
+        }
+        return 0;
+    }
+
+    ios = js_malloc(ctx, nfds * sizeof(*ios));
+    if (!ios)
+        return -1;
+
+    count = 0;
+    list_for_each(el, &ts->os_rw_handlers) {
+        rh = list_entry(el, JSOSRWHandler, link);
+        r = !JS_IsNull(rh->rw_func[0]);
+        w = !JS_IsNull(rh->rw_func[1]);
+        if (r || w) {
+            ev_io *io = &ios[count++];
+            ev_io_init(io, js_ev_io_cb, rh->fd,
+                       (r ? EV_READ : 0) | (w ? EV_WRITE : 0) | EV_ERROR);
+            io->data = &pc;
+            ev_io_start(loop, io);
+        }
+    }
+
+#ifdef USE_WORKER
+    if (flags & JS_OS_POLL_WORKERS) {
+        list_for_each(el, &ts->port_list) {
+            JSWorkerMessageHandler *port = list_entry(el, JSWorkerMessageHandler, link);
+            if (!JS_IsNull(port->on_message_func)) {
+                JSWorkerMessagePipe *ps = port->recv_pipe;
+                ev_io *io = &ios[count++];
+                ev_io_init(io, js_ev_io_cb, ps->waker.read_fd, EV_READ);
+                io->data = &pc;
+                ev_io_start(loop, io);
+            }
+        }
+    }
+#endif // USE_WORKER
+
+    if (min_delay >= 0) {
+        ev_timer_init(&timer, js_ev_poll_timer_cb, min_delay / 1000.0, 0.);
+        timer.data = &pc;
+        ev_timer_start(loop, &timer);
+        timer_started = true;
+    }
+
+    ev_run(loop, 0);
+
+    if (timer_started)
+        ev_timer_stop(loop, &timer);
+    for (int i = 0; i < count; i++)
+        ev_io_stop(loop, &ios[i]);
+    js_free(ctx, ios);
+
+    ret = 0;
+    if (pc.timer_fired)
+        return 0;
+    if (!pc.fired)
+        return 0;
+
+    rh = find_rh(ts, pc.fd);
+    if (rh) {
+        r = (EV_ERROR | EV_READ) * !JS_IsNull(rh->rw_func[0]);
+        w = (EV_ERROR | EV_WRITE) * !JS_IsNull(rh->rw_func[1]);
+        if (r & pc.revents) {
+            ret = call_handler(ctx, rh->rw_func[0]);
+            return ret;
+        }
+        if (w & pc.revents) {
+            ret = call_handler(ctx, rh->rw_func[1]);
+            return ret;
+        }
+    }
+#ifdef USE_WORKER
+    else if (flags & JS_OS_POLL_WORKERS) {
+        list_for_each(el, &ts->port_list) {
+            JSWorkerMessageHandler *port = list_entry(el, JSWorkerMessageHandler, link);
+            if (!JS_IsNull(port->on_message_func)) {
+                JSWorkerMessagePipe *ps = port->recv_pipe;
+                if (pc.fd == ps->waker.read_fd) {
+                    handle_posted_message(rt, ctx, port);
+                    return ret;
+                }
+            }
+        }
+    }
+#endif // USE_WORKER
+    return ret;
+}
+
+#else // !QJS_HAVE_LIBEV
+
 static int js_os_poll_internal(JSContext *ctx, int timeout_ms, int flags)
 {
     JSRuntime *rt = JS_GetRuntime(ctx);
@@ -2990,6 +3243,8 @@ done:
         js_free(ctx, pfds);
     return ret;
 }
+
+#endif // QJS_HAVE_LIBEV
 
 static int js_os_poll(JSContext *ctx)
 {
@@ -4726,6 +4981,13 @@ void js_std_free_handlers(JSRuntime *rt)
     /* XXX: free port_list ? */
     js_free_message_pipe(ts->recv_pipe);
     js_free_message_pipe(ts->send_pipe);
+#endif
+
+#if defined(QJS_HAVE_LIBEV)
+    if (ts->ev_loop) {
+        ev_loop_destroy(ts->ev_loop);
+        ts->ev_loop = NULL;
+    }
 #endif
 }
 

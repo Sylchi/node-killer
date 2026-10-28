@@ -277,6 +277,15 @@ set(qjs_sources
     quickjs.c
 )
 
+# libev is vendored and statically linked into the core library. It backs
+# quickjs-libc's event loop (io, timers, signals) on POSIX platforms.
+if(NOT WIN32 AND NOT CMAKE_SYSTEM_NAME STREQUAL "WASI" AND NOT EMSCRIPTEN)
+    list(APPEND qjs_sources vendor/libev/ev.c)
+    list(APPEND qjs_defines EV_STANDALONE QJS_HAVE_LIBEV)
+    set(QJS_HAVE_LIBEV TRUE)
+    message(STATUS "  libev: vendored (static)")
+endif()
+
 if(QJS_BUILD_LIBC)
     list(APPEND qjs_sources quickjs-libc.c)
     # The definition must be added to the entire project.
@@ -306,6 +315,7 @@ add_library(qjs ${qjs_sources})
 target_compile_definitions(qjs PRIVATE ${qjs_defines})
 target_include_directories(qjs PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/vendor/libev>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 target_link_libraries(qjs PUBLIC ${qjs_libs})
