@@ -17,12 +17,12 @@ jobs:
       - uses: actions/checkout@v7
       - uses: quickjs-ng/setup-alpine@master
         with:
-          # Static zlib and OpenSSL are required by qnode.
+          # Static zlib and mbedTLS are required by qnode.
           branch: edge
           arch: ${{matrix.arch}}
           extra-repositories: |
             http://dl-cdn.alpinelinux.org/alpine/edge/testing
-          packages: "build-base make cmake zlib-static openssl-libs-static"
+          packages: "build-base make cmake zlib-static mbedtls-static"
           apk-tools-url: https://raw.githubusercontent.com/quickjs-ng/apk-for-ci/refs/heads/master/apk.static#!sha256!34bb1a96f0258982377a289392d4ea9f3f4b767a4bb5806b1b87179b79ad8a1c
       - name: build
         shell: alpine.sh {0}

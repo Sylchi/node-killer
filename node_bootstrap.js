@@ -7336,8 +7336,8 @@ class TLSSocket extends Socket {
   _onTLSReadable() {
     if (this.destroyed || this._fd === undefined)
       return;
-    /* SSL_read can leave later records buffered inside OpenSSL even when the
-       socket has no more bytes to report. Drain everything that is already
+    /* tlsRead can leave later records buffered inside the TLS stack even when
+       the socket has no more bytes to report. Drain everything that is already
        available and push it as one chunk, otherwise the tail of a response
        can be stranded waiting for a new fd event. */
     const parts = [];

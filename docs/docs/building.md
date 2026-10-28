@@ -27,12 +27,13 @@ This will build the `qjs` and `qjsc` executables and other test tools. Head over
 instructions on how to use them.
 
 On Linux the build also produces `qnode`, a Node.js-compatible runtime. It
-links zlib and OpenSSL statically; run `scripts/fetch-static-libs.sh` once to
+links zlib and mbedTLS statically; run `scripts/fetch-static-libs.sh` once to
 populate `vendor/static`, or install the static development packages for your
-distribution (for example `zlib1g-dev` and `libssl-dev`).
+distribution (for example `zlib1g-dev` and `libmbedtls-dev`).
 
 On Linux there are no build options for the runtime features: WebAssembly
-(wasm3), libev, zlib and OpenSSL are always compiled in.
+(wasm3), libev, zlib and mbedTLS are always compiled in. mbedTLS 3.0 or newer
+is required for TLS 1.3; older versions still provide TLS 1.2.
 
 ## Big Endian architecture support
 

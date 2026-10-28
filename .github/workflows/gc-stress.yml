@@ -31,7 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: install static dependencies
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libssl-dev
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libmbedtls-dev
       - name: build
         run: |
           cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo \

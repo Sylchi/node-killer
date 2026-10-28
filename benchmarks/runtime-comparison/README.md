@@ -9,18 +9,20 @@ scripts in this directory on one machine.
 | Version | `v20.11.0-qnode.0.1.0` (QuickJS-ng 0.17.0, `dac3d6e`) | `v24.22.1` | `1.4.4` (reports `process.version` `v26.3.0` for compatibility) |
 | Engine | QuickJS-ng interpreter | V8 with JIT | JavaScriptCore with JIT |
 | Implementation | C | C++ | Zig/C++ |
-| Binary, stripped | **7.5 MB** (static-pie) | 52 MB (dynamic) | 101 MB (dynamic) |
+| Binary, stripped | **2.8 MB** (static-pie, mbedTLS) | 52 MB (dynamic) | 101 MB (dynamic) |
 | Idle RSS | **5.6 MB** | 47.9 MB | 26.1 MB |
 | Startup, `-e ""` | 23.7 ms | 54.9 ms | **2.3 ms** |
 | Startup, load `fs/http/os/path` + write | **24.4 ms** | 87.9 ms | 29.6 ms |
 
 Machine: AMD Ryzen 7 7840U (16 threads), Alpine Linux 3.24 (musl), kernel
 6.18 on WSL2, x86-64. qnode built with GCC 15.2, `Release`, static CLI,
-vendored libev with epoll.
+vendored libev with epoll. The qnode binary size was re-measured after the
+switch from OpenSSL to mbedTLS; the startup and RSS figures were not
+re-measured after that swap.
 
 ## TL;DR
 
-- **qnode is small and starts fast.** 7.5 MB stripped, 5.6 MB idle RSS,
+- **qnode is small and starts fast.** 2.8 MB stripped, 5.6 MB idle RSS,
   ~24 ms startup. It beats Node on every startup test and beats Bun once a
   realistic CommonJS prelude is loaded.
 - **qnode is 2–13x slower on CPU-bound JavaScript** than Node, and up to
@@ -193,7 +195,7 @@ For reference, the repo's QuickJS-ng 0.17.0 is much faster than apk's 0.11.0:
 | Metric | Node.js | Bun | qnode | `qjs -c` |
 |---|---:|---:|---:|---:|
 | Startup, hello world | 51.9 ms | 2.2 ms | 22.5 ms | **1.3 ms** |
-| Binary, stripped | 52 MB | 101 MB | 7.5 MB | **1.5 MB** |
+| Binary, stripped | 52 MB | 101 MB | 2.8 MB | **1.5 MB** |
 | Idle RSS | 47.9 MB | 26.1 MB | 5.6 MB | **1.5 MB** |
 
 CPU benchmarks, same workloads as above (ms, lower is better):
@@ -218,7 +220,7 @@ What gets faster with `qjs -c`:
 
 - **Startup:** ~22.5 ms → ~1.3 ms, because the 274 KB qnode bootstrap and all
   source parsing disappear.
-- **Footprint:** ~7.5 MB → ~1.5 MB stripped, ~5.6 MB → ~1.5 MB idle RSS.
+- **Footprint:** ~2.8 MB → ~1.5 MB stripped, ~5.6 MB → ~1.5 MB idle RSS.
 - **Deployment:** one self-contained executable, no `node_modules` or runtime
   install.
 

@@ -32,13 +32,22 @@
 #include <netdb.h>
 #include <pwd.h>
 
+#include <strings.h>
 #include <zlib.h>
-#include <openssl/ssl.h>
-#include <openssl/err.h>
-#include <openssl/x509.h>
-#include <openssl/x509v3.h>
-#include <openssl/pem.h>
-#include <openssl/bio.h>
+#include <mbedtls/version.h>
+#include <mbedtls/ssl.h>
+#include <mbedtls/x509_crt.h>
+#include <mbedtls/pk.h>
+#include <mbedtls/pem.h>
+#include <mbedtls/md.h>
+#include <mbedtls/oid.h>
+#include <mbedtls/error.h>
+#if MBEDTLS_VERSION_MAJOR >= 4
+#include <psa/crypto.h>
+#else
+#include <mbedtls/entropy.h>
+#include <mbedtls/ctr_drbg.h>
+#endif
 
 #include "cutils.h"
 #include "quickjs.h"
@@ -1697,88 +1706,297 @@ static JSValue js_node_utf8_encode(JSContext *ctx, JSValueConst this_val,
 #define NODE_TLS_WANT_WRITE 1002
 
 typedef struct {
-    SSL_CTX *ctx;
+    mbedtls_x509_crt cert;
+    mbedtls_pk_context key;
+    mbedtls_x509_crt ca;
+    int has_ca;
     int used;
+    int refs;
 } NodeTLSContext;
 
 typedef struct {
-    SSL *ssl;
-    SSL_CTX *own_ctx; /* client connections own their context */
+    mbedtls_ssl_context ssl;
+    mbedtls_ssl_config conf;
+    mbedtls_x509_crt ca;          /* custom CA for client connections */
+    NodeTLSContext *server_ctx;   /* borrowed server context */
+    char **alpn;
+    int alpn_count;
+    int has_ca;
     int used;
 } NodeTLSConn;
 
-static NodeTLSContext node_tls_contexts[NODE_TLS_MAX_CTX];
+static NodeTLSContext *node_tls_contexts[NODE_TLS_MAX_CTX];
 static NodeTLSConn node_tls_conns[NODE_TLS_MAX_CONN];
 static int node_tls_initialized;
+static mbedtls_x509_crt node_tls_system_ca;
+static int node_tls_system_ca_loaded;
+
+#if MBEDTLS_VERSION_MAJOR >= 4
+static int node_tls_rng_init(void)
+{
+    return psa_crypto_init() == PSA_SUCCESS ? 0 : -1;
+}
+#else
+static mbedtls_entropy_context node_tls_entropy;
+static mbedtls_ctr_drbg_context node_tls_drbg;
+
+static int node_tls_rng_init(void)
+{
+    mbedtls_entropy_init(&node_tls_entropy);
+    mbedtls_ctr_drbg_init(&node_tls_drbg);
+    return mbedtls_ctr_drbg_seed(&node_tls_drbg, mbedtls_entropy_func,
+                                 &node_tls_entropy, NULL, 0);
+}
+#endif
 
 static void node_tls_init(void)
 {
-    if (!node_tls_initialized) {
-        OPENSSL_init_ssl(0, NULL);
-        node_tls_initialized = 1;
-    }
+    if (node_tls_initialized)
+        return;
+    node_tls_rng_init();
+    node_tls_initialized = 1;
 }
 
-/* Default client contexts are shared: creating one parses the system CA
-   bundle, which is far too slow to repeat for every connection. */
-static SSL_CTX *node_tls_client_default_ctx(int verify)
+static void node_tls_set_min_version(mbedtls_ssl_config *conf)
 {
-    static SSL_CTX *verify_ctx, *plain_ctx;
-    SSL_CTX **slot = verify ? &verify_ctx : &plain_ctx;
-    SSL_CTX *c;
+#if MBEDTLS_VERSION_MAJOR >= 3
+    mbedtls_ssl_conf_min_tls_version(conf, MBEDTLS_SSL_VERSION_TLS1_2);
+#else
+    mbedtls_ssl_conf_min_version(conf, MBEDTLS_SSL_MAJOR_VERSION_3,
+                                 MBEDTLS_SSL_MINOR_VERSION_3);
+#endif
+}
 
-    if (*slot)
-        return *slot;
-    c = SSL_CTX_new(TLS_client_method());
+static void node_tls_set_rng(mbedtls_ssl_config *conf)
+{
+#if MBEDTLS_VERSION_MAJOR < 4
+    mbedtls_ssl_conf_rng(conf, mbedtls_ctr_drbg_random, &node_tls_drbg);
+#else
+    (void)conf;
+#endif
+}
+
+static int node_tls_pk_parse_key(mbedtls_pk_context *pk,
+                                 const unsigned char *buf, size_t len)
+{
+#if MBEDTLS_VERSION_MAJOR == 3
+    return mbedtls_pk_parse_key(pk, buf, len, NULL, 0,
+                                mbedtls_ctr_drbg_random, &node_tls_drbg);
+#else
+    return mbedtls_pk_parse_key(pk, buf, len, NULL, 0);
+#endif
+}
+
+/* mbedTLS does not ship a public OID-to-short-name helper in every version,
+   so map the attribute types Node exposes by hand. */
+static const char *node_tls_oid_short_name(const mbedtls_asn1_buf *oid)
+{
+#define NODE_OID_MATCH(s) \
+    (oid->len == sizeof(s) - 1 && memcmp(oid->p, s, sizeof(s) - 1) == 0)
+    if (NODE_OID_MATCH(MBEDTLS_OID_AT_CN))              return "CN";
+    if (NODE_OID_MATCH(MBEDTLS_OID_AT_SUR_NAME))        return "SN";
+    if (NODE_OID_MATCH(MBEDTLS_OID_AT_GIVEN_NAME))      return "GN";
+    if (NODE_OID_MATCH(MBEDTLS_OID_AT_SERIAL_NUMBER))   return "serialNumber";
+    if (NODE_OID_MATCH(MBEDTLS_OID_AT_COUNTRY))         return "C";
+    if (NODE_OID_MATCH(MBEDTLS_OID_AT_LOCALITY))        return "L";
+    if (NODE_OID_MATCH(MBEDTLS_OID_AT_STATE))           return "ST";
+    if (NODE_OID_MATCH(MBEDTLS_OID_AT_ORGANIZATION))    return "O";
+    if (NODE_OID_MATCH(MBEDTLS_OID_AT_ORG_UNIT))        return "OU";
+    if (NODE_OID_MATCH(MBEDTLS_OID_AT_TITLE))           return "title";
+    if (NODE_OID_MATCH(MBEDTLS_OID_AT_PSEUDONYM))       return "pseudonym";
+    if (NODE_OID_MATCH(MBEDTLS_OID_DOMAIN_COMPONENT))   return "DC";
+    if (NODE_OID_MATCH(MBEDTLS_OID_PKCS9_EMAIL))        return "emailAddress";
+#undef NODE_OID_MATCH
+    return NULL;
+}
+
+static void node_tls_context_free_now(NodeTLSContext *c)
+{
     if (!c)
-        return NULL;
-    SSL_CTX_set_min_proto_version(c, TLS1_2_VERSION);
-    SSL_CTX_set_verify(c, verify ? SSL_VERIFY_PEER : SSL_VERIFY_NONE, NULL);
-    if (verify)
-        SSL_CTX_set_default_verify_paths(c);
-    *slot = c;
-    return c;
+        return;
+    mbedtls_x509_crt_free(&c->cert);
+    mbedtls_pk_free(&c->key);
+    mbedtls_x509_crt_free(&c->ca);
+    free(c);
 }
 
-static void node_tls_raise(JSContext *ctx, SSL *ssl, const char *what)
+static void node_tls_context_put(NodeTLSContext *c)
 {
-    unsigned long e = ERR_get_error();
-    char errbuf[256] = "";
-    long vr = ssl ? SSL_get_verify_result(ssl) : X509_V_OK;
+    if (!c)
+        return;
+    if (--c->refs == 0)
+        node_tls_context_free_now(c);
+}
 
-    if (e)
-        ERR_error_string_n(e, errbuf, sizeof(errbuf));
-    ERR_clear_error();
-    if (vr != X509_V_OK) {
-        JS_ThrowPlainError(ctx, "%s: %s", what,
-                              X509_verify_cert_error_string(vr));
-    } else if (errbuf[0]) {
-        JS_ThrowPlainError(ctx, "%s: %s", what, errbuf);
-    } else {
-        JS_ThrowPlainError(ctx, "%s failed", what);
+static void node_tls_free_alpn(NodeTLSConn *c)
+{
+    if (!c->alpn)
+        return;
+    for (int i = 0; i < c->alpn_count; i++)
+        free(c->alpn[i]);
+    free(c->alpn);
+    c->alpn = NULL;
+    c->alpn_count = 0;
+}
+
+static void node_tls_conn_clear(NodeTLSConn *c)
+{
+    mbedtls_ssl_free(&c->ssl);
+    mbedtls_ssl_config_free(&c->conf);
+    mbedtls_x509_crt_free(&c->ca);
+    node_tls_free_alpn(c);
+    node_tls_context_put(c->server_ctx);
+    memset(c, 0, sizeof(*c));
+}
+
+static int node_tls_alloc_conn(void)
+{
+    for (int i = 0; i < NODE_TLS_MAX_CONN; i++) {
+        if (!node_tls_conns[i].used) {
+            memset(&node_tls_conns[i], 0, sizeof(node_tls_conns[i]));
+            node_tls_conns[i].used = 1;
+            return i;
+        }
     }
+    return -1;
 }
 
-static int node_tls_add_ca(SSL_CTX *ctx, const char *pem)
+/* The ALPN argument is the wire format Node uses: a sequence of
+   length-prefixed protocol names. mbedTLS wants a NULL-terminated array of
+   C strings, which must stay alive for the lifetime of the connection. */
+static int node_tls_parse_alpn(NodeTLSConn *c, const uint8_t *data, size_t len)
 {
-    BIO *bio = BIO_new_mem_buf(pem, -1);
-    X509_STORE *store = SSL_CTX_get_cert_store(ctx);
-    int added = 0;
-    X509 *x;
+    size_t off = 0, n = 0;
 
-    if (!bio)
+    while (off < len) {
+        size_t l = data[off++];
+        if (off + l > len)
+            return -1;
+        n++;
+        off += l;
+    }
+    if (n == 0)
         return 0;
-    for (;;) {
-        x = PEM_read_bio_X509(bio, NULL, NULL, NULL);
-        if (!x)
-            break;
-        if (X509_STORE_add_cert(store, x) == 1)
-            added++;
-        X509_free(x);
+
+    c->alpn = calloc(n + 1, sizeof(char *));
+    if (!c->alpn)
+        return -1;
+
+    off = 0;
+    n = 0;
+    while (off < len) {
+        size_t l = data[off++];
+        c->alpn[n] = malloc(l + 1);
+        if (!c->alpn[n])
+            return -1;
+        memcpy(c->alpn[n], data + off, l);
+        c->alpn[n][l] = '\0';
+        n++;
+        c->alpn_count = (int)n;
+        off += l;
     }
-    ERR_clear_error();
-    BIO_free(bio);
-    return added;
+    c->alpn[n] = NULL;
+    return 0;
+}
+
+/* Non-blocking socket callbacks. Returning 0 from recv signals EOF, which
+   mbedTLS reports as MBEDTLS_ERR_SSL_CONN_EOF. */
+static int node_tls_bio_send(void *ctx, const unsigned char *buf, size_t len)
+{
+    int fd = (int)(intptr_t)ctx;
+    ssize_t n;
+    do {
+        n = send(fd, buf, len, MSG_NOSIGNAL);
+    } while (n < 0 && errno == EINTR);
+    if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            return MBEDTLS_ERR_SSL_WANT_WRITE;
+        return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+    }
+    return (int)n;
+}
+
+static int node_tls_bio_recv(void *ctx, unsigned char *buf, size_t len)
+{
+    int fd = (int)(intptr_t)ctx;
+    ssize_t n;
+    do {
+        n = recv(fd, buf, len, 0);
+    } while (n < 0 && errno == EINTR);
+    if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            return MBEDTLS_ERR_SSL_WANT_READ;
+        return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+    }
+    return (int)n;
+}
+
+static int node_tls_load_system_ca(void)
+{
+    static const char *paths[] = {
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/ssl/cert.pem",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+        "/etc/ssl/ca-bundle.pem",
+        "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+        NULL
+    };
+    const char *env;
+
+    if (node_tls_system_ca_loaded)
+        return node_tls_system_ca.raw.p ? 0 : -1;
+    node_tls_system_ca_loaded = 1;
+    mbedtls_x509_crt_init(&node_tls_system_ca);
+
+    /* Match the OpenSSL default-path behaviour: SSL_CERT_FILE and
+       SSL_CERT_DIR override the platform locations. */
+    env = getenv("SSL_CERT_FILE");
+    if (env && env[0] &&
+        mbedtls_x509_crt_parse_file(&node_tls_system_ca, env) >= 0 &&
+        node_tls_system_ca.raw.p)
+        return 0;
+
+    for (int i = 0; paths[i]; i++) {
+        if (mbedtls_x509_crt_parse_file(&node_tls_system_ca, paths[i]) >= 0 &&
+            node_tls_system_ca.raw.p)
+            return 0;
+    }
+
+    env = getenv("SSL_CERT_DIR");
+    if (env && env[0] &&
+        mbedtls_x509_crt_parse_path(&node_tls_system_ca, env) >= 0 &&
+        node_tls_system_ca.raw.p)
+        return 0;
+    if (mbedtls_x509_crt_parse_path(&node_tls_system_ca, "/etc/ssl/certs") >= 0 &&
+        node_tls_system_ca.raw.p)
+        return 0;
+    return -1;
+}
+
+static void node_tls_raise(JSContext *ctx, mbedtls_ssl_context *ssl,
+                           int ret, const char *what)
+{
+    char errbuf[256] = "";
+
+    if (ret != 0)
+        mbedtls_strerror(ret, errbuf, sizeof(errbuf));
+
+    if (ssl) {
+        uint32_t flags = mbedtls_ssl_get_verify_result(ssl);
+        if (flags != 0 && flags != (uint32_t)-1) {
+            char vbuf[512], *nl;
+            mbedtls_x509_crt_verify_info(vbuf, sizeof(vbuf), "", flags);
+            nl = strchr(vbuf, '\n');
+            if (nl)
+                *nl = '\0';
+            JS_ThrowPlainError(ctx, "%s: %s", what, vbuf);
+            return;
+        }
+    }
+    if (errbuf[0])
+        JS_ThrowPlainError(ctx, "%s: %s", what, errbuf);
+    else
+        JS_ThrowPlainError(ctx, "%s failed", what);
 }
 
 /* tlsClientInit(fd, hostname, verify, caPem|null, alpnWire|null) */
@@ -1786,13 +2004,13 @@ static JSValue js_node_tls_client_init(JSContext *ctx, JSValueConst this_val,
                                        int argc, JSValueConst *argv)
 {
     int32_t fd;
-    SSL_CTX *c;
-    SSL *ssl;
     int verify = 1;
     const char *host = NULL;
     const char *ca = NULL;
     NodeBytes alpn = { 0 };
-    int own_ctx = 0;
+    NodeTLSConn *conn;
+    mbedtls_x509_crt *ca_chain = NULL;
+    int id, ret;
 
     node_tls_init();
     if (JS_ToInt32(ctx, &fd, argv[0]))
@@ -1819,56 +2037,75 @@ static JSValue js_node_tls_client_init(JSContext *ctx, JSValueConst this_val,
         }
     }
 
+    id = node_tls_alloc_conn();
+    if (id < 0)
+        goto oom;
+    conn = &node_tls_conns[id];
+    mbedtls_ssl_init(&conn->ssl);
+    mbedtls_ssl_config_init(&conn->conf);
+    mbedtls_x509_crt_init(&conn->ca);
+
     if (ca && ca[0]) {
-        c = SSL_CTX_new(TLS_client_method());
-        if (!c)
-            goto oom;
-        SSL_CTX_set_min_proto_version(c, TLS1_2_VERSION);
-        SSL_CTX_set_verify(c, verify ? SSL_VERIFY_PEER : SSL_VERIFY_NONE, NULL);
-        if (verify)
-            node_tls_add_ca(c, ca);
-        own_ctx = 1;
-    } else {
-        c = node_tls_client_default_ctx(verify);
-        if (!c)
-            goto oom;
+        ret = mbedtls_x509_crt_parse(&conn->ca,
+                                     (const unsigned char *)ca, strlen(ca) + 1);
+        if (ret >= 0 && conn->ca.raw.p) {
+            conn->has_ca = 1;
+            ca_chain = &conn->ca;
+        }
+    } else if (verify) {
+        if (node_tls_load_system_ca() == 0)
+            ca_chain = &node_tls_system_ca;
     }
 
-    ssl = SSL_new(c);
-    if (!ssl) {
-        if (own_ctx)
-            SSL_CTX_free(c);
-        goto oom;
+    ret = mbedtls_ssl_config_defaults(&conn->conf, MBEDTLS_SSL_IS_CLIENT,
+                                      MBEDTLS_SSL_TRANSPORT_STREAM,
+                                      MBEDTLS_SSL_PRESET_DEFAULT);
+    if (ret != 0)
+        goto fail;
+    node_tls_set_min_version(&conn->conf);
+    node_tls_set_rng(&conn->conf);
+    mbedtls_ssl_conf_authmode(&conn->conf, verify ? MBEDTLS_SSL_VERIFY_REQUIRED
+                                                  : MBEDTLS_SSL_VERIFY_NONE);
+    if (verify && ca_chain)
+        mbedtls_ssl_conf_ca_chain(&conn->conf, ca_chain, NULL);
+
+    if (alpn.len) {
+        if (node_tls_parse_alpn(conn, alpn.data, alpn.len))
+            goto fail;
+#if MBEDTLS_VERSION_MAJOR >= 4
+        mbedtls_ssl_conf_alpn_protocols(&conn->conf,
+                                        (const char * const *)conn->alpn);
+#else
+        mbedtls_ssl_conf_alpn_protocols(&conn->conf, (const char **)conn->alpn);
+#endif
     }
-    SSL_set_fd(ssl, fd);
-    SSL_set_connect_state(ssl);
+
+    ret = mbedtls_ssl_setup(&conn->ssl, &conn->conf);
+    if (ret != 0)
+        goto fail;
     if (host && host[0]) {
-        SSL_set_tlsext_host_name(ssl, host);
-        if (verify)
-            SSL_set1_host(ssl, host);
+        ret = mbedtls_ssl_set_hostname(&conn->ssl, host);
+        if (ret != 0)
+            goto fail;
     }
-    if (alpn.len)
-        SSL_set_alpn_protos(ssl, alpn.data, (unsigned int)alpn.len);
+    mbedtls_ssl_set_bio(&conn->ssl, (void *)(intptr_t)fd,
+                        node_tls_bio_send, node_tls_bio_recv, NULL);
 
     node_free_bytes(ctx, &alpn);
     if (host) JS_FreeCString(ctx, host);
     if (ca) JS_FreeCString(ctx, ca);
+    return node_ok(ctx, JS_NewInt32(ctx, id));
 
-    for (int i = 0; i < NODE_TLS_MAX_CONN; i++) {
-        if (!node_tls_conns[i].used) {
-            node_tls_conns[i].ssl = ssl;
-            node_tls_conns[i].own_ctx = own_ctx ? c : NULL;
-            node_tls_conns[i].used = 1;
-            return node_ok(ctx, JS_NewInt32(ctx, i));
-        }
-    }
-    SSL_free(ssl);
-    if (own_ctx)
-        SSL_CTX_free(c);
-    return node_err(ctx, JS_NULL, ENOMEM);
+fail:
+    node_tls_conn_clear(conn);
+    node_tls_conns[id].used = 0;
+    node_free_bytes(ctx, &alpn);
+    if (host) JS_FreeCString(ctx, host);
+    if (ca) JS_FreeCString(ctx, ca);
+    node_tls_raise(ctx, NULL, ret, "cannot create TLS connection");
+    return JS_EXCEPTION;
 
 oom:
-    ERR_clear_error();
     node_free_bytes(ctx, &alpn);
     if (host) JS_FreeCString(ctx, host);
     if (ca) JS_FreeCString(ctx, ca);
@@ -1880,11 +2117,8 @@ static JSValue js_node_tls_server_context(JSContext *ctx, JSValueConst this_val,
                                           int argc, JSValueConst *argv)
 {
     const char *cert, *key, *ca = NULL;
-    SSL_CTX *c;
-    BIO *bio;
-    X509 *x;
-    EVP_PKEY *pkey;
-    int id = -1;
+    NodeTLSContext *c = NULL;
+    int slot = -1, ret;
 
     node_tls_init();
     cert = node_cstr(ctx, argv[0]);
@@ -1904,73 +2138,59 @@ static JSValue js_node_tls_server_context(JSContext *ctx, JSValueConst this_val,
         }
     }
 
-    c = SSL_CTX_new(TLS_server_method());
-    if (!c)
-        goto fail;
-
-    SSL_CTX_set_min_proto_version(c, TLS1_2_VERSION);
-
-    bio = BIO_new_mem_buf(cert, -1);
-    if (!bio)
-        goto fail;
-    x = PEM_read_bio_X509(bio, NULL, NULL, NULL);
-    if (!x) {
-        BIO_free(bio);
-        goto fail;
-    }
-    if (SSL_CTX_use_certificate(c, x) != 1) {
-        X509_free(x);
-        BIO_free(bio);
-        goto fail;
-    }
-    X509_free(x);
-    ERR_clear_error();
-    while ((x = PEM_read_bio_X509(bio, NULL, NULL, NULL)) != NULL)
-        SSL_CTX_add_extra_chain_cert(c, x);
-    ERR_clear_error();
-    BIO_free(bio);
-
-    bio = BIO_new_mem_buf(key, -1);
-    if (!bio)
-        goto fail;
-    pkey = PEM_read_bio_PrivateKey(bio, NULL, NULL, NULL);
-    BIO_free(bio);
-    if (!pkey)
-        goto fail;
-    if (SSL_CTX_use_PrivateKey(c, pkey) != 1) {
-        EVP_PKEY_free(pkey);
-        goto fail;
-    }
-    EVP_PKEY_free(pkey);
-    if (SSL_CTX_check_private_key(c) != 1)
-        goto fail;
-    if (ca && ca[0])
-        node_tls_add_ca(c, ca);
-
     for (int i = 0; i < NODE_TLS_MAX_CTX; i++) {
-        if (!node_tls_contexts[i].used) {
-            node_tls_contexts[i].ctx = c;
-            node_tls_contexts[i].used = 1;
-            id = i;
+        if (!node_tls_contexts[i]) {
+            slot = i;
             break;
         }
     }
+    if (slot < 0)
+        goto oom;
+
+    c = calloc(1, sizeof(*c));
+    if (!c)
+        goto oom;
+    mbedtls_x509_crt_init(&c->cert);
+    mbedtls_pk_init(&c->key);
+    mbedtls_x509_crt_init(&c->ca);
+
+    ret = mbedtls_x509_crt_parse(&c->cert, (const unsigned char *)cert,
+                                 strlen(cert) + 1);
+    if (ret < 0 || !c->cert.raw.p)
+        goto fail;
+    ret = node_tls_pk_parse_key(&c->key, (const unsigned char *)key,
+                                strlen(key) + 1);
+    if (ret != 0)
+        goto fail;
+    if (ca && ca[0]) {
+        ret = mbedtls_x509_crt_parse(&c->ca, (const unsigned char *)ca,
+                                     strlen(ca) + 1);
+        if (ret >= 0 && c->ca.raw.p)
+            c->has_ca = 1;
+    }
+
+    c->refs = 1;
+    c->used = 1;
+    node_tls_contexts[slot] = c;
+
     JS_FreeCString(ctx, cert);
     JS_FreeCString(ctx, key);
     if (ca) JS_FreeCString(ctx, ca);
-    if (id < 0) {
-        SSL_CTX_free(c);
-        return node_err(ctx, JS_NULL, ENOMEM);
-    }
-    return node_ok(ctx, JS_NewInt32(ctx, id));
+    return node_ok(ctx, JS_NewInt32(ctx, slot));
 
 fail:
-    if (c) SSL_CTX_free(c);
-    node_tls_raise(ctx, NULL, "cannot create TLS context");
+    node_tls_context_free_now(c);
+    node_tls_raise(ctx, NULL, ret, "cannot create TLS context");
     JS_FreeCString(ctx, cert);
     JS_FreeCString(ctx, key);
     if (ca) JS_FreeCString(ctx, ca);
     return JS_EXCEPTION;
+
+oom:
+    JS_FreeCString(ctx, cert);
+    JS_FreeCString(ctx, key);
+    if (ca) JS_FreeCString(ctx, ca);
+    return JS_ThrowOutOfMemory(ctx);
 }
 
 /* tlsAccept(ctxId, fd) -> conn id */
@@ -1978,72 +2198,84 @@ static JSValue js_node_tls_accept(JSContext *ctx, JSValueConst this_val,
                                   int argc, JSValueConst *argv)
 {
     int32_t ctxid, fd;
-    SSL *ssl;
+    NodeTLSContext *sc;
+    NodeTLSConn *conn;
+    int id, ret;
 
     node_tls_init();
     if (JS_ToInt32(ctx, &ctxid, argv[0]) || JS_ToInt32(ctx, &fd, argv[1]))
         return JS_EXCEPTION;
     if (ctxid < 0 || ctxid >= NODE_TLS_MAX_CTX ||
-        !node_tls_contexts[ctxid].used ||
-        !node_tls_contexts[ctxid].ctx)
+        !node_tls_contexts[ctxid])
         return JS_ThrowRangeError(ctx, "invalid TLS context");
+    sc = node_tls_contexts[ctxid];
 
-    ssl = SSL_new(node_tls_contexts[ctxid].ctx);
-    if (!ssl)
-        return JS_ThrowOutOfMemory(ctx);
-    SSL_set_fd(ssl, fd);
-    SSL_set_accept_state(ssl);
+    id = node_tls_alloc_conn();
+    if (id < 0)
+        return node_err(ctx, JS_NULL, ENOMEM);
+    conn = &node_tls_conns[id];
+    mbedtls_ssl_init(&conn->ssl);
+    mbedtls_ssl_config_init(&conn->conf);
+    mbedtls_x509_crt_init(&conn->ca);
 
-    for (int i = 0; i < NODE_TLS_MAX_CONN; i++) {
-        if (!node_tls_conns[i].used) {
-            node_tls_conns[i].ssl = ssl;
-            node_tls_conns[i].own_ctx = NULL;
-            node_tls_conns[i].used = 1;
-            return node_ok(ctx, JS_NewInt32(ctx, i));
-        }
-    }
-    SSL_free(ssl);
-    return node_err(ctx, JS_NULL, ENOMEM);
+    ret = mbedtls_ssl_config_defaults(&conn->conf, MBEDTLS_SSL_IS_SERVER,
+                                      MBEDTLS_SSL_TRANSPORT_STREAM,
+                                      MBEDTLS_SSL_PRESET_DEFAULT);
+    if (ret != 0)
+        goto fail;
+    node_tls_set_min_version(&conn->conf);
+    node_tls_set_rng(&conn->conf);
+    mbedtls_ssl_conf_authmode(&conn->conf, MBEDTLS_SSL_VERIFY_NONE);
+    if (sc->has_ca)
+        mbedtls_ssl_conf_ca_chain(&conn->conf, &sc->ca, NULL);
+    mbedtls_ssl_conf_own_cert(&conn->conf, &sc->cert, &sc->key);
+
+    ret = mbedtls_ssl_setup(&conn->ssl, &conn->conf);
+    if (ret != 0)
+        goto fail;
+    mbedtls_ssl_set_bio(&conn->ssl, (void *)(intptr_t)fd,
+                        node_tls_bio_send, node_tls_bio_recv, NULL);
+
+    sc->refs++;
+    conn->server_ctx = sc;
+    return node_ok(ctx, JS_NewInt32(ctx, id));
+
+fail:
+    node_tls_conn_clear(conn);
+    node_tls_conns[id].used = 0;
+    node_tls_raise(ctx, NULL, ret, "cannot create TLS connection");
+    return JS_EXCEPTION;
 }
 
-static SSL *node_tls_ssl(JSContext *ctx, JSValueConst v)
+static NodeTLSConn *node_tls_conn(JSContext *ctx, JSValueConst v)
 {
     int32_t id;
-    if (JS_ToInt32(ctx, &id, v)) {
+    if (JS_ToInt32(ctx, &id, v))
         return NULL;
-    }
     if (id < 0 || id >= NODE_TLS_MAX_CONN || !node_tls_conns[id].used) {
         JS_ThrowRangeError(ctx, "invalid TLS handle");
         return NULL;
     }
-    return node_tls_conns[id].ssl;
+    return &node_tls_conns[id];
 }
 
 /* tlsHandshake(id) -> 0 done, 1 want read, 2 want write */
 static JSValue js_node_tls_handshake(JSContext *ctx, JSValueConst this_val,
                                      int argc, JSValueConst *argv)
 {
-    SSL *ssl = node_tls_ssl(ctx, argv[0]);
-    int r, err;
+    NodeTLSConn *conn = node_tls_conn(ctx, argv[0]);
+    int ret;
 
-    if (!ssl)
+    if (!conn)
         return JS_EXCEPTION;
-    ERR_clear_error();
-    r = SSL_do_handshake(ssl);
-    if (r == 1)
+    ret = mbedtls_ssl_handshake(&conn->ssl);
+    if (ret == 0)
         return node_ok(ctx, JS_NewInt32(ctx, 0));
-    /* A failed peer verification is terminal: OpenSSL may keep reporting
-       WANT_READ/WANT_WRITE after sending the alert, so surface it here. */
-    if (SSL_get_verify_result(ssl) != X509_V_OK) {
-        node_tls_raise(ctx, ssl, "TLS handshake failed");
-        return JS_EXCEPTION;
-    }
-    err = SSL_get_error(ssl, r);
-    if (err == SSL_ERROR_WANT_READ)
+    if (ret == MBEDTLS_ERR_SSL_WANT_READ)
         return node_ok(ctx, JS_NewInt32(ctx, 1));
-    if (err == SSL_ERROR_WANT_WRITE)
+    if (ret == MBEDTLS_ERR_SSL_WANT_WRITE)
         return node_ok(ctx, JS_NewInt32(ctx, 2));
-    node_tls_raise(ctx, ssl, "TLS handshake failed");
+    node_tls_raise(ctx, &conn->ssl, ret, "TLS handshake failed");
     return JS_EXCEPTION;
 }
 
@@ -2051,12 +2283,12 @@ static JSValue js_node_tls_handshake(JSContext *ctx, JSValueConst this_val,
 static JSValue js_node_tls_read(JSContext *ctx, JSValueConst this_val,
                                 int argc, JSValueConst *argv)
 {
-    SSL *ssl = node_tls_ssl(ctx, argv[0]);
+    NodeTLSConn *conn = node_tls_conn(ctx, argv[0]);
     int32_t len = 16384;
     uint8_t *buf;
-    int r, err;
+    int ret;
 
-    if (!ssl)
+    if (!conn)
         return JS_EXCEPTION;
     if (argc > 1 && !JS_IsUndefined(argv[1]) &&
         JS_ToInt32(ctx, &len, argv[1]))
@@ -2067,24 +2299,28 @@ static JSValue js_node_tls_read(JSContext *ctx, JSValueConst this_val,
     buf = js_malloc(ctx, len);
     if (!buf)
         return JS_EXCEPTION;
-    ERR_clear_error();
-    r = SSL_read(ssl, buf, len);
-    if (r > 0) {
-        JSValue v = JS_NewUint8ArrayCopy(ctx, buf, r);
+    for (;;) {
+        ret = mbedtls_ssl_read(&conn->ssl, buf, len);
+#ifdef MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET
+        if (ret == MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET)
+            continue;
+#endif
+        break;
+    }
+    if (ret > 0) {
+        JSValue v = JS_NewUint8ArrayCopy(ctx, buf, ret);
         js_free(ctx, buf);
         return node_ok(ctx, v);
     }
     js_free(ctx, buf);
-    err = SSL_get_error(ssl, r);
-    if (err == SSL_ERROR_WANT_READ)
+    if (ret == MBEDTLS_ERR_SSL_WANT_READ)
         return node_err(ctx, JS_NULL, NODE_TLS_WANT_READ);
-    if (err == SSL_ERROR_WANT_WRITE)
+    if (ret == MBEDTLS_ERR_SSL_WANT_WRITE)
         return node_err(ctx, JS_NULL, NODE_TLS_WANT_WRITE);
-    if (err == SSL_ERROR_ZERO_RETURN)
+    if (ret == 0 || ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY ||
+        ret == MBEDTLS_ERR_SSL_CONN_EOF)
         return node_ok(ctx, JS_NewUint8ArrayCopy(ctx, (const uint8_t *)"", 0));
-    if (err == SSL_ERROR_SYSCALL && (errno == EAGAIN || errno == EINTR))
-        return node_err(ctx, JS_NULL, NODE_TLS_WANT_READ);
-    node_tls_raise(ctx, ssl, "TLS read failed");
+    node_tls_raise(ctx, &conn->ssl, ret, "TLS read failed");
     return JS_EXCEPTION;
 }
 
@@ -2092,37 +2328,33 @@ static JSValue js_node_tls_read(JSContext *ctx, JSValueConst this_val,
 static JSValue js_node_tls_write(JSContext *ctx, JSValueConst this_val,
                                  int argc, JSValueConst *argv)
 {
-    SSL *ssl = node_tls_ssl(ctx, argv[0]);
+    NodeTLSConn *conn = node_tls_conn(ctx, argv[0]);
     NodeBytes b;
-    int r, err;
+    int ret;
 
-    if (!ssl)
+    if (!conn)
         return JS_EXCEPTION;
     if (node_get_bytes(ctx, argv[1], &b))
         return JS_EXCEPTION;
-    ERR_clear_error();
-    r = SSL_write(ssl, b.data, (int)b.len);
+    ret = mbedtls_ssl_write(&conn->ssl, b.data, b.len);
     node_free_bytes(ctx, &b);
-    if (r > 0)
-        return node_ok(ctx, JS_NewInt32(ctx, r));
-    err = SSL_get_error(ssl, r);
-    if (err == SSL_ERROR_WANT_READ)
+    if (ret >= 0)
+        return node_ok(ctx, JS_NewInt32(ctx, ret));
+    if (ret == MBEDTLS_ERR_SSL_WANT_READ)
         return node_err(ctx, JS_NULL, NODE_TLS_WANT_READ);
-    if (err == SSL_ERROR_WANT_WRITE)
+    if (ret == MBEDTLS_ERR_SSL_WANT_WRITE)
         return node_err(ctx, JS_NULL, NODE_TLS_WANT_WRITE);
-    node_tls_raise(ctx, ssl, "TLS write failed");
+    node_tls_raise(ctx, &conn->ssl, ret, "TLS write failed");
     return JS_EXCEPTION;
 }
 
 static JSValue js_node_tls_shutdown(JSContext *ctx, JSValueConst this_val,
                                     int argc, JSValueConst *argv)
 {
-    SSL *ssl = node_tls_ssl(ctx, argv[0]);
-    if (!ssl)
+    NodeTLSConn *conn = node_tls_conn(ctx, argv[0]);
+    if (!conn)
         return JS_EXCEPTION;
-    ERR_clear_error();
-    SSL_shutdown(ssl);
-    ERR_clear_error();
+    mbedtls_ssl_close_notify(&conn->ssl);
     return JS_UNDEFINED;
 }
 
@@ -2133,12 +2365,8 @@ static JSValue js_node_tls_free(JSContext *ctx, JSValueConst this_val,
     if (JS_ToInt32(ctx, &id, argv[0]))
         return JS_EXCEPTION;
     if (id >= 0 && id < NODE_TLS_MAX_CONN && node_tls_conns[id].used) {
-        SSL_free(node_tls_conns[id].ssl);
-        if (node_tls_conns[id].own_ctx)
-            SSL_CTX_free(node_tls_conns[id].own_ctx);
+        node_tls_conn_clear(&node_tls_conns[id]);
         node_tls_conns[id].used = 0;
-        node_tls_conns[id].ssl = NULL;
-        node_tls_conns[id].own_ctx = NULL;
     }
     return JS_UNDEFINED;
 }
@@ -2147,153 +2375,165 @@ static JSValue js_node_tls_free_context(JSContext *ctx, JSValueConst this_val,
                                         int argc, JSValueConst *argv)
 {
     int32_t id;
+    NodeTLSContext *c;
+
     if (JS_ToInt32(ctx, &id, argv[0]))
         return JS_EXCEPTION;
-    if (id >= 0 && id < NODE_TLS_MAX_CTX && node_tls_contexts[id].used) {
-        SSL_CTX_free(node_tls_contexts[id].ctx);
-        node_tls_contexts[id].used = 0;
-        node_tls_contexts[id].ctx = NULL;
-    }
+    if (id < 0 || id >= NODE_TLS_MAX_CTX ||
+        !(c = node_tls_contexts[id]))
+        return JS_UNDEFINED;
+    node_tls_contexts[id] = NULL;
+    c->used = 0;
+    node_tls_context_put(c);
     return JS_UNDEFINED;
 }
 
-static JSValue node_tls_name_object(JSContext *ctx, X509_NAME *name)
+static JSValue node_tls_name_object(JSContext *ctx, const mbedtls_x509_name *name)
 {
     JSValue obj = JS_NewObject(ctx);
-    int n = X509_NAME_entry_count(name);
-    for (int i = 0; i < n; i++) {
-        X509_NAME_ENTRY *e = X509_NAME_get_entry(name, i);
-        ASN1_OBJECT *o = X509_NAME_ENTRY_get_object(e);
-        ASN1_STRING *d = X509_NAME_ENTRY_get_data(e);
-        const char *key = OBJ_nid2sn(OBJ_obj2nid(o));
-        unsigned char *utf8 = NULL;
-        int len = ASN1_STRING_to_UTF8(&utf8, d);
-        if (len >= 0 && key) {
+    for (const mbedtls_x509_name *cur = name; cur; cur = cur->next) {
+        const char *key = node_tls_oid_short_name(&cur->oid);
+        if (key)
             JS_SetPropertyStr(ctx, obj, key,
-                              JS_NewStringLen(ctx, (const char *)utf8, len));
-        }
-        OPENSSL_free(utf8);
+                              JS_NewStringLen(ctx, (const char *)cur->val.p,
+                                              cur->val.len));
     }
     return obj;
 }
 
-static JSValue node_tls_time_string(JSContext *ctx, const ASN1_TIME *t)
+static JSValue node_tls_time_string(JSContext *ctx, const mbedtls_x509_time *t)
 {
-    BIO *bio = BIO_new(BIO_s_mem());
-    BUF_MEM *mem = NULL;
-    JSValue v = JS_NULL;
-    if (!bio)
+    static const char *months[] = {
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+    };
+    char buf[64];
+
+    if (t->mon < 1 || t->mon > 12)
         return JS_NULL;
-    ASN1_TIME_print(bio, t);
-    BIO_get_mem_ptr(bio, &mem);
-    if (mem)
-        v = JS_NewStringLen(ctx, mem->data, mem->length);
-    BIO_free(bio);
+    snprintf(buf, sizeof(buf), "%s %2d %02d:%02d:%02d %d GMT",
+             months[t->mon - 1], t->day, t->hour, t->min, t->sec, t->year);
+    return JS_NewString(ctx, buf);
+}
+
+/* Format the serial the way Node does: uppercase hex with leading zero
+   bytes stripped. */
+static JSValue node_tls_serial_string(JSContext *ctx,
+                                      const mbedtls_x509_buf *serial)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    size_t i = 0, n;
+    char *buf, *p;
+    JSValue v;
+
+    while (i < serial->len && serial->p[i] == 0)
+        i++;
+    n = serial->len - i;
+    if (n == 0)
+        return JS_NewString(ctx, "0");
+    buf = js_malloc(ctx, n * 2 + 1);
+    if (!buf)
+        return JS_EXCEPTION;
+    p = buf;
+    for (; i < serial->len; i++) {
+        *p++ = hex[serial->p[i] >> 4];
+        *p++ = hex[serial->p[i] & 0x0f];
+    }
+    *p = '\0';
+    v = JS_NewStringLen(ctx, buf, n * 2);
+    js_free(ctx, buf);
     return v;
 }
 
 static JSValue js_node_tls_peer_cert(JSContext *ctx, JSValueConst this_val,
                                      int argc, JSValueConst *argv)
 {
-    SSL *ssl = node_tls_ssl(ctx, argv[0]);
-    X509 *cert;
+    NodeTLSConn *conn = node_tls_conn(ctx, argv[0]);
+    const mbedtls_x509_crt *cert;
     JSValue obj;
-    unsigned char *der = NULL, *pem = NULL;
-    int derlen, pemlen;
-    BIO *bio;
-    BUF_MEM *mem;
-    char hex[3];
 
-    if (!ssl)
+    if (!conn)
         return JS_EXCEPTION;
-    cert = SSL_get1_peer_certificate(ssl);
+    cert = mbedtls_ssl_get_peer_cert(&conn->ssl);
     if (!cert)
         return JS_NULL;
 
     obj = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, obj, "subject",
-                      node_tls_name_object(ctx, X509_get_subject_name(cert)));
+                      node_tls_name_object(ctx, &cert->subject));
     JS_SetPropertyStr(ctx, obj, "issuer",
-                      node_tls_name_object(ctx, X509_get_issuer_name(cert)));
+                      node_tls_name_object(ctx, &cert->issuer));
     JS_SetPropertyStr(ctx, obj, "valid_from",
-                      node_tls_time_string(ctx, X509_get0_notBefore(cert)));
+                      node_tls_time_string(ctx, &cert->valid_from));
     JS_SetPropertyStr(ctx, obj, "valid_to",
-                      node_tls_time_string(ctx, X509_get0_notAfter(cert)));
+                      node_tls_time_string(ctx, &cert->valid_to));
+    JS_SetPropertyStr(ctx, obj, "raw",
+                      JS_NewArrayBufferCopy(ctx, cert->raw.p, cert->raw.len));
+    JS_SetPropertyStr(ctx, obj, "serialNumber",
+                      node_tls_serial_string(ctx, &cert->serial));
 
-    derlen = i2d_X509(cert, &der);
-    if (derlen > 0) {
-        JSValue raw = JS_NewArrayBufferCopy(ctx, der, derlen);
-        JS_SetPropertyStr(ctx, obj, "raw", raw);
-        OPENSSL_free(der);
-    }
-
-    bio = BIO_new(BIO_s_mem());
-    if (bio && PEM_write_bio_X509(bio, cert) == 1) {
-        BIO_get_mem_ptr(bio, &mem);
-        pem = (unsigned char *)mem->data;
-        pemlen = (int)mem->length;
-        JS_SetPropertyStr(ctx, obj, "pem",
-                          JS_NewStringLen(ctx, (const char *)pem, pemlen));
-    }
-    if (bio)
-        BIO_free(bio);
-
-    /* SHA-256 fingerprint of the DER encoding */
     {
-        unsigned char md[EVP_MAX_MD_SIZE];
-        unsigned int mdlen = 0;
-        char fp[EVP_MAX_MD_SIZE * 3];
-        size_t off = 0;
-        if (X509_digest(cert, EVP_sha256(), md, &mdlen) == 1) {
-            for (unsigned int i = 0; i < mdlen; i++) {
-                snprintf(hex, sizeof(hex), "%02X", md[i]);
-                if (i)
-                    fp[off++] = ':';
-                fp[off++] = hex[0];
-                fp[off++] = hex[1];
-            }
-            fp[off] = '\0';
-            JS_SetPropertyStr(ctx, obj, "fingerprint256",
-                              JS_NewString(ctx, fp));
+        size_t cap = cert->raw.len * 2 + 256;
+        unsigned char *pem = js_malloc(ctx, cap);
+        if (pem) {
+            size_t olen = 0;
+            int ret = mbedtls_pem_write_buffer(
+                "-----BEGIN CERTIFICATE-----\n",
+                "-----END CERTIFICATE-----\n",
+                cert->raw.p, cert->raw.len, pem, cap, &olen);
+            if (ret == 0)
+                JS_SetPropertyStr(ctx, obj, "pem",
+                                  JS_NewStringLen(ctx, (const char *)pem, olen));
+            js_free(ctx, pem);
         }
     }
 
     {
-        BIGNUM *bn = ASN1_INTEGER_to_BN(X509_get_serialNumber(cert), NULL);
-        if (bn) {
-            char *s = BN_bn2hex(bn);
-            if (s) {
-                JS_SetPropertyStr(ctx, obj, "serialNumber",
-                                  JS_NewString(ctx, s));
-                OPENSSL_free(s);
+        const mbedtls_md_info_t *info =
+            mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+        unsigned char md[32];
+        if (info && mbedtls_md(info, cert->raw.p, cert->raw.len, md) == 0) {
+            size_t size = mbedtls_md_get_size(info) * 3;
+            char *fp = js_malloc(ctx, size);
+            if (fp) {
+                size_t off = 0;
+                for (size_t i = 0; i < mbedtls_md_get_size(info); i++) {
+                    if (i)
+                        fp[off++] = ':';
+                    snprintf(fp + off, 3, "%02X", md[i]);
+                    off += 2;
+                }
+                fp[off] = '\0';
+                JS_SetPropertyStr(ctx, obj, "fingerprint256",
+                                  JS_NewString(ctx, fp));
+                js_free(ctx, fp);
             }
-            BN_free(bn);
         }
     }
 
-    X509_free(cert);
     return obj;
 }
 
 static JSValue js_node_tls_info(JSContext *ctx, JSValueConst this_val,
                                 int argc, JSValueConst *argv)
 {
-    SSL *ssl = node_tls_ssl(ctx, argv[0]);
+    NodeTLSConn *conn = node_tls_conn(ctx, argv[0]);
+    const char *protocol, *cipher, *alpn;
     JSValue obj;
-    const unsigned char *alpn = NULL;
-    unsigned int alpnlen = 0;
 
-    if (!ssl)
+    if (!conn)
         return JS_EXCEPTION;
+    protocol = mbedtls_ssl_get_version(&conn->ssl);
+    cipher = mbedtls_ssl_get_ciphersuite(&conn->ssl);
+    alpn = mbedtls_ssl_get_alpn_protocol(&conn->ssl);
+
     obj = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, obj, "protocol",
-                      JS_NewString(ctx, SSL_get_version(ssl)));
+                      JS_NewString(ctx, protocol ? protocol : ""));
     JS_SetPropertyStr(ctx, obj, "cipher",
-                      JS_NewString(ctx, SSL_get_cipher_name(ssl)));
-    SSL_get0_alpn_selected(ssl, &alpn, &alpnlen);
-    if (alpn && alpnlen)
-        JS_SetPropertyStr(ctx, obj, "alpnProtocol",
-                          JS_NewStringLen(ctx, (const char *)alpn, alpnlen));
+                      JS_NewString(ctx, cipher ? cipher : ""));
+    if (alpn && alpn[0])
+        JS_SetPropertyStr(ctx, obj, "alpnProtocol", JS_NewString(ctx, alpn));
     else
         JS_SetPropertyStr(ctx, obj, "alpnProtocol", JS_FALSE);
     return obj;
@@ -2306,9 +2546,10 @@ static JSValue js_node_digest(JSContext *ctx, JSValueConst this_val,
 {
     const char *name;
     NodeBytes in;
-    NodeBytes out;
-    unsigned int outlen = 0;
-    const EVP_MD *md;
+    unsigned char *out = NULL;
+    size_t outlen;
+    mbedtls_md_type_t type = MBEDTLS_MD_NONE;
+    const mbedtls_md_info_t *info;
     JSValue val;
 
     name = node_cstr(ctx, argv[0]);
@@ -2318,29 +2559,39 @@ static JSValue js_node_digest(JSContext *ctx, JSValueConst this_val,
         JS_FreeCString(ctx, name);
         return JS_EXCEPTION;
     }
-    md = EVP_get_digestbyname(name);
-    if (!md) {
+
+    if (!strcasecmp(name, "md5"))         type = MBEDTLS_MD_MD5;
+    else if (!strcasecmp(name, "sha1"))   type = MBEDTLS_MD_SHA1;
+    else if (!strcasecmp(name, "sha224")) type = MBEDTLS_MD_SHA224;
+    else if (!strcasecmp(name, "sha256")) type = MBEDTLS_MD_SHA256;
+    else if (!strcasecmp(name, "sha384")) type = MBEDTLS_MD_SHA384;
+    else if (!strcasecmp(name, "sha512")) type = MBEDTLS_MD_SHA512;
+
+    info = type == MBEDTLS_MD_NONE ? NULL : mbedtls_md_info_from_type(type);
+    if (!info) {
         JS_FreeCString(ctx, name);
         node_free_bytes(ctx, &in);
         return JS_ThrowTypeError(ctx, "Digest method not supported: %s", name);
     }
-    out.data = js_malloc(ctx, EVP_MAX_MD_SIZE);
-    if (!out.data) {
+
+    node_tls_init();
+    outlen = mbedtls_md_get_size(info);
+    out = js_malloc(ctx, outlen);
+    if (!out) {
         JS_FreeCString(ctx, name);
         node_free_bytes(ctx, &in);
         return JS_EXCEPTION;
     }
-    if (!EVP_Digest(in.data, in.len, out.data, &outlen, md, NULL)) {
-        ERR_clear_error();
-        js_free(ctx, out.data);
+    if (mbedtls_md(info, in.data, in.len, out) != 0) {
+        js_free(ctx, out);
         JS_FreeCString(ctx, name);
         node_free_bytes(ctx, &in);
         return JS_ThrowPlainError(ctx, "digest failed: %s", name);
     }
     JS_FreeCString(ctx, name);
     node_free_bytes(ctx, &in);
-    val = JS_NewUint8ArrayCopy(ctx, out.data, outlen);
-    js_free(ctx, out.data);
+    val = JS_NewUint8ArrayCopy(ctx, out, outlen);
+    js_free(ctx, out);
     return val;
 }
 

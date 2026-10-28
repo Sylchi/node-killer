@@ -302,10 +302,11 @@ set_source_files_properties(node.c PROPERTIES OBJECT_DEPENDS ${NODE_BOOTSTRAP_H}
 #
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    # zlib and OpenSSL are linked statically so qnode is self-contained.
+    # zlib and mbedTLS are linked statically so qnode is self-contained.
     # scripts/fetch-static-libs.sh populates vendor/static for Alpine/musl;
     # system static archives are used as a fallback.
-    set(QNODE_STATIC_LIB_DIR ${CMAKE_CURRENT_SOURCE_DIR}/vendor/static/usr/lib)
+    set(QNODE_STATIC_PREFIX ${CMAKE_CURRENT_SOURCE_DIR}/vendor/static/usr)
+    set(QNODE_STATIC_LIB_DIR ${QNODE_STATIC_PREFIX}/lib)
     set(_qnode_lib_suffixes ${CMAKE_FIND_LIBRARY_SUFFIXES})
     set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
 
@@ -315,32 +316,51 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         find_library(QNODE_ZLIB_LIBRARY NAMES z)
     endif()
 
-    find_library(QNODE_SSL_LIBRARY NAMES ssl
+    find_library(QNODE_MBEDTLS_LIBRARY NAMES mbedtls
         PATHS ${QNODE_STATIC_LIB_DIR} NO_DEFAULT_PATH)
-    if(NOT QNODE_SSL_LIBRARY)
-        find_library(QNODE_SSL_LIBRARY NAMES ssl)
+    if(NOT QNODE_MBEDTLS_LIBRARY)
+        find_library(QNODE_MBEDTLS_LIBRARY NAMES mbedtls)
     endif()
 
-    find_library(QNODE_CRYPTO_LIBRARY NAMES crypto
+    find_library(QNODE_MBEDX509_LIBRARY NAMES mbedx509
         PATHS ${QNODE_STATIC_LIB_DIR} NO_DEFAULT_PATH)
-    if(NOT QNODE_CRYPTO_LIBRARY)
-        find_library(QNODE_CRYPTO_LIBRARY NAMES crypto)
+    if(NOT QNODE_MBEDX509_LIBRARY)
+        find_library(QNODE_MBEDX509_LIBRARY NAMES mbedx509)
+    endif()
+
+    find_library(QNODE_MBEDCRYPTO_LIBRARY NAMES mbedcrypto
+        PATHS ${QNODE_STATIC_LIB_DIR} NO_DEFAULT_PATH)
+    if(NOT QNODE_MBEDCRYPTO_LIBRARY)
+        find_library(QNODE_MBEDCRYPTO_LIBRARY NAMES mbedcrypto)
+    endif()
+
+    find_path(QNODE_MBEDTLS_INCLUDE_DIR mbedtls/ssl.h
+        PATHS ${QNODE_STATIC_PREFIX}/include NO_DEFAULT_PATH)
+    if(NOT QNODE_MBEDTLS_INCLUDE_DIR)
+        find_path(QNODE_MBEDTLS_INCLUDE_DIR mbedtls/ssl.h)
     endif()
 
     set(CMAKE_FIND_LIBRARY_SUFFIXES ${_qnode_lib_suffixes})
 
-    if(NOT QNODE_ZLIB_LIBRARY OR NOT QNODE_SSL_LIBRARY OR NOT QNODE_CRYPTO_LIBRARY)
+    if(NOT QNODE_ZLIB_LIBRARY OR NOT QNODE_MBEDTLS_LIBRARY OR
+       NOT QNODE_MBEDX509_LIBRARY OR NOT QNODE_MBEDCRYPTO_LIBRARY OR
+       NOT QNODE_MBEDTLS_INCLUDE_DIR)
         message(FATAL_ERROR
-            "qnode requires static zlib and OpenSSL libraries.\n"
+            "qnode requires static zlib and mbedTLS libraries.\n"
             "Run scripts/fetch-static-libs.sh or install the static\n"
-            "development packages for zlib and OpenSSL.")
+            "development packages for zlib and mbedTLS.")
     endif()
 
     add_library(qnode_core STATIC node.c)
     target_compile_definitions(qnode_core PRIVATE ${qjs_defines})
-    target_include_directories(qnode_core PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+    target_include_directories(qnode_core PRIVATE
+        ${CMAKE_CURRENT_BINARY_DIR}
+        ${QNODE_MBEDTLS_INCLUDE_DIR})
     target_link_libraries(qnode_core PRIVATE qjs qjs-libc
-        ${QNODE_ZLIB_LIBRARY} ${QNODE_SSL_LIBRARY} ${QNODE_CRYPTO_LIBRARY})
+        ${QNODE_ZLIB_LIBRARY}
+        ${QNODE_MBEDTLS_LIBRARY}
+        ${QNODE_MBEDX509_LIBRARY}
+        ${QNODE_MBEDCRYPTO_LIBRARY})
     add_dependencies(qnode_core node_bootstrap_header)
 
     add_executable(qnode_exe qnode.c)
