@@ -301,6 +301,26 @@ else()
     message(STATUS "  zlib: not found (zlib module disabled)")
 endif()
 
+# Static OpenSSL for TLS (see scripts/fetch-static-libs.sh).
+find_library(QNODE_SSL_LIBRARY NAMES ssl
+    PATHS ${CMAKE_CURRENT_SOURCE_DIR}/vendor/static/usr/lib
+    NO_DEFAULT_PATH)
+find_library(QNODE_CRYPTO_LIBRARY NAMES crypto
+    PATHS ${CMAKE_CURRENT_SOURCE_DIR}/vendor/static/usr/lib
+    NO_DEFAULT_PATH)
+if(NOT QNODE_SSL_LIBRARY)
+    find_library(QNODE_SSL_LIBRARY NAMES ssl)
+endif()
+if(NOT QNODE_CRYPTO_LIBRARY)
+    find_library(QNODE_CRYPTO_LIBRARY NAMES crypto)
+endif()
+if(QNODE_SSL_LIBRARY AND QNODE_CRYPTO_LIBRARY)
+    add_definitions(-DQNODE_HAVE_OPENSSL)
+    message(STATUS "  openssl: ${QNODE_SSL_LIBRARY} ${QNODE_CRYPTO_LIBRARY}")
+else()
+    message(STATUS "  openssl: not found (TLS disabled)")
+endif()
+
 if(QJS_BUILD_LIBC)
     list(APPEND qjs_sources quickjs-libc.c)
     # The definition must be added to the entire project.
@@ -364,7 +384,8 @@ endif()
 if(NOT QJS_BUILD_LIBC)
     add_library(qjs-libc STATIC quickjs-libc.c node.c)
     target_compile_definitions(qjs-libc PRIVATE ${qjs_defines})
-    target_link_libraries(qjs-libc PRIVATE ${qjs_libs} qjs ${QNODE_ZLIB_LIBRARY})
+    target_link_libraries(qjs-libc PRIVATE ${qjs_libs} qjs ${QNODE_ZLIB_LIBRARY}
+        ${QNODE_SSL_LIBRARY} ${QNODE_CRYPTO_LIBRARY})
     add_dependencies(qjs-libc node_bootstrap_header)
     target_include_directories(qjs-libc PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 else()

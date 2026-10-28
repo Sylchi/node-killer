@@ -4648,7 +4648,8 @@ class HttpServer extends EventEmitter {
   constructor(options, listener) {
     super();
     if (typeof options === "function") { listener = options; options = {}; }
-    this._server = net.createServer((socket) => this._onSocket(socket));
+    this._options = options || {};
+    this._server = this._createServer(this._options);
     this._server.on("error", (e) => this.emit("error", e));
     this._server.on("listening", () => this.emit("listening"));
     this._server.on("close", () => this.emit("close"));
@@ -4658,6 +4659,10 @@ class HttpServer extends EventEmitter {
     this.keepAliveTimeout = 5000;
     this.headersTimeout = 60000;
   }
+  _createServer(options) {
+    return net.createServer((socket) => this._onSocket(socket));
+  }
+
   listen(...args) { this._server.listen(...args); return this; }
   close(cb) { this._server.close(cb); return this; }
   address() { return this._server.address(); }
@@ -4842,10 +4847,14 @@ class ClientRequest extends Writable {
     const o = this._options;
     const port = Number(o.port) || (o.protocol === "https:" ? 443 : 80);
     const host = o.hostname || o.host || "localhost";
-    this.socket = new Socket();
+    if (typeof o.createConnection === "function") {
+      this.socket = o.createConnection(Object.assign({}, o, { port, host }));
+    } else {
+      this.socket = new Socket();
+      this.socket.connect({ port, host });
+    }
     this.socket.on("connect", () => this.emit("socket", this.socket));
     this.socket.on("error", (e) => this.emit("error", e));
-    this.socket.connect({ port, host });
     this.socket.on("data", (chunk) => this._onData(chunk));
     this.socket.on("end", () => {
       if (!this.res)
@@ -5029,19 +5038,69 @@ const http = {
 };
 http.globalAgent = new http.Agent();
 
+function httpsNormalize(options) {
+  if (typeof options === "string" || options instanceof URL) {
+    const u = options instanceof URL ? options : new URL(options);
+    return {
+      protocol: u.protocol,
+      hostname: u.hostname,
+      port: u.port || undefined,
+      path: u.pathname + u.search,
+      auth: u.username
+        ? decodeURIComponent(u.username) + ":" + decodeURIComponent(u.password)
+        : undefined,
+    };
+  }
+  return Object.assign({}, options);
+}
+
+const TLS_REQUEST_OPTIONS = [
+  "servername", "rejectUnauthorized", "ca", "cert", "key", "pfx",
+  "passphrase", "ALPNProtocols", "checkServerIdentity", "minVersion",
+  "maxVersion", "ciphers", "secureProtocol", "session",
+];
+
+function httpsRequest(options, cb) {
+  if (typeof options === "function") { cb = options; options = {}; }
+  options = httpsNormalize(options || {});
+  if (!options.protocol)
+    options.protocol = "https:";
+  if (options.servername === undefined)
+    options.servername = options.hostname || options.host;
+  if (typeof options.createConnection !== "function") {
+    const tlsOpts = {};
+    for (const k of TLS_REQUEST_OPTIONS)
+      if (options[k] !== undefined)
+        tlsOpts[k] = options[k];
+    options.createConnection = (o) => tls.connect(Object.assign({}, tlsOpts, {
+      port: o.port,
+      host: o.host,
+      servername: tlsOpts.servername || o.host,
+    }));
+  }
+  return new ClientRequest(options, cb);
+}
+
+class HttpsServer extends HttpServer {
+  _createServer(options) {
+    return tls.createServer(options || {}, (socket) => this._onSocket(socket));
+  }
+}
+
 const https = Object.assign({}, http, {
-  request(options, cb) {
-    const e = new Error("https is not supported yet (TLS support pending)");
-    e.code = "ERR_TLS_NOT_SUPPORTED";
-    throw e;
-  },
+  Server: HttpsServer,
+  request: httpsRequest,
   get(options, cb) {
-    return https.request(options, cb);
+    const req = httpsRequest(options, cb);
+    req.end();
+    return req;
   },
-  createServer() {
-    throw new Error("https.createServer is not supported yet");
+  createServer(options, listener) {
+    if (typeof options === "function") { listener = options; options = {}; }
+    return new HttpsServer(options, listener);
   },
 });
+https.globalAgent = new http.Agent();
 
 /* ------------------------------------------------------------------ */
 /* child_process                                                      */
@@ -6490,25 +6549,450 @@ const readlinePromises = {
 };
 
 /* ------------------------------------------------------------------ */
-/* tls (stub until a TLS stack is vendored)                           */
+/* tls                                                                */
 /* ------------------------------------------------------------------ */
 
 function tlsUnsupported() {
-  const e = new Error("TLS is not supported yet (no TLS stack linked)");
+  const e = new Error("TLS is not supported in this build");
   e.code = "ERR_TLS_NOT_SUPPORTED";
   throw e;
 }
 
+function hasTLS() { return typeof native.tlsClientInit === "function"; }
+
+function pemString(v) {
+  if (v === undefined || v === null)
+    return null;
+  if (Array.isArray(v))
+    return v.map((x) => String(x)).join("\n");
+  return String(v);
+}
+
+function alpnWire(protocols) {
+  if (!protocols)
+    return null;
+  if (typeof protocols === "string")
+    protocols = [protocols];
+  const parts = [];
+  for (const p of protocols) {
+    const b = Buffer.from(String(p), "latin1");
+    if (b.length > 255)
+      continue;
+    parts.push(Buffer.from([b.length]), b);
+  }
+  return parts.length ? Buffer.concat(parts) : null;
+}
+
+class TLSSocket extends Socket {
+  constructor(options) {
+    super();
+    options = options || {};
+    this._tlsOptions = options;
+    this._isServer = !!options.isServer;
+    this._secureEstablished = false;
+    this._tlsHandle = undefined;
+    this.authorized = false;
+    this.authorizationError = null;
+    this.alpnProtocol = false;
+    this.encrypted = true;
+    if (this._isServer) {
+      this._fd = options.fd !== undefined
+        ? options.fd : (options.socket ? options.socket._fd : undefined);
+      this._serverContextId = options.secureContext;
+      this.server = options.server || null;
+      queueMicrotask(() => this._startServerTLS());
+    }
+  }
+
+  /* TCP is connected: start the TLS handshake instead of reading
+     plaintext. */
+  _afterConnect() {
+    this.connecting = false;
+    const local = native.getsockname(this._fd);
+    if (!local[1]) {
+      this.localAddress = local[0][0];
+      this.localPort = local[0][2];
+      this.localFamily = local[0][1] === C.AF_INET6 ? "IPv6" : "IPv4";
+    }
+    const peer = native.getpeername(this._fd);
+    if (!peer[1]) {
+      this.remoteAddress = peer[0][0];
+      this.remotePort = peer[0][2];
+    }
+    const o = this._tlsOptions;
+    const ca = pemString(o.ca);
+    const alpn = alpnWire(o.ALPNProtocols);
+    let r;
+    try {
+      r = native.tlsClientInit(this._fd, o.servername || o.host || "localhost",
+                               o.rejectUnauthorized !== false, ca || null, alpn);
+    } catch (e) {
+      this.destroy(tlsError(e));
+      return;
+    }
+    if (r[1]) {
+      this.destroy(sysError(r[1], "tls"));
+      return;
+    }
+    this._tlsHandle = r[0];
+    this._driveHandshake();
+  }
+
+  _startServerTLS() {
+    if (this.destroyed)
+      return;
+    let r;
+    try {
+      r = native.tlsAccept(this._serverContextId, this._fd);
+    } catch (e) {
+      this.destroy(tlsError(e));
+      return;
+    }
+    if (r[1]) {
+      this.destroy(sysError(r[1], "tls"));
+      return;
+    }
+    this._tlsHandle = r[0];
+    this._driveHandshake();
+  }
+
+  _driveHandshake() {
+    let st;
+    try {
+      st = native.tlsHandshake(this._tlsHandle);
+    } catch (e) {
+      this.destroy(tlsError(e));
+      return;
+    }
+    if (st[1]) {
+      this.destroy(sysError(st[1], "tls"));
+      return;
+    }
+    const code = st[0];
+    if (code === 0) {
+      this._onSecure();
+      return;
+    }
+    this._waitTLSEvent(code, () => this._driveHandshake());
+  }
+
+  _waitTLSEvent(code, fn) {
+    const fd = this._fd;
+    const onEvent = () => {
+      qjsos.setReadHandler(fd, null);
+      qjsos.setWriteHandler(fd, null);
+      if (!this.destroyed)
+        fn();
+    };
+    if (code === 1)
+      qjsos.setReadHandler(fd, onEvent);
+    else
+      qjsos.setWriteHandler(fd, onEvent);
+  }
+
+  _onSecure() {
+    const info = native.tlsInfo(this._tlsHandle);
+    this._secureEstablished = true;
+    this.alpnProtocol = info.alpnProtocol;
+    this.protocol = info.protocol;
+    this.cipher = { name: info.cipher, version: info.protocol };
+    this.authorized = this._isServer ||
+      this._tlsOptions.rejectUnauthorized !== false;
+    if (!this._isServer && this.authorized &&
+        typeof this._tlsOptions.checkServerIdentity === "function") {
+      const cert = native.tlsPeerCert(this._tlsHandle);
+      const err = this._tlsOptions.checkServerIdentity(
+        this._tlsOptions.servername || this._tlsOptions.host, cert);
+      if (err) {
+        this.authorized = false;
+        this.authorizationError = err;
+        this.destroy(err);
+        return;
+      }
+    }
+    this._attachTLS();
+    if (this._isServer) {
+      this.emit("secureConnect");
+    } else {
+      this.emit("secure");
+      this.emit("secureConnect");
+      this.emit("connect");
+      this.emit("ready");
+    }
+  }
+
+  _attachTLS() {
+    if (this._attached)
+      return;
+    this._attached = true;
+    qjsos.setReadHandler(this._fd, () => this._onTLSReadable());
+    this.resume();
+  }
+
+  _onTLSReadable() {
+    if (this.destroyed || this._fd === undefined)
+      return;
+    let r;
+    try {
+      r = native.tlsRead(this._tlsHandle, 65536);
+    } catch (e) {
+      this.destroy(tlsError(e));
+      return;
+    }
+    if (r[1]) {
+      if (r[1] === C.TLS_WANT_WRITE)
+        this._waitTLSEvent(2, () => this._onTLSReadable());
+      return;
+    }
+    const buf = Buffer.from(r[0]);
+    if (buf.length === 0) {
+      this.readable = false;
+      qjsos.setReadHandler(this._fd, null);
+      this.push(null);
+      if (!this.allowHalfOpen)
+        this.end();
+      return;
+    }
+    this.bytesRead += buf.length;
+    this.push(buf);
+  }
+
+  _flushWrite(buf, cb) {
+    if (this.destroyed) {
+      cb(new Error("Socket is closed"));
+      return;
+    }
+    if (this._tlsHandle === undefined) {
+      this.once("secureConnect", () => this._flushWrite(buf, cb));
+      return;
+    }
+    let off = 0;
+    const attempt = () => {
+      while (off < buf.length) {
+        let r;
+        try {
+          r = native.tlsWrite(this._tlsHandle, buf.subarray(off));
+        } catch (e) {
+          cb(tlsError(e));
+          return;
+        }
+        if (r[1] === C.TLS_WANT_READ || r[1] === C.TLS_WANT_WRITE) {
+          const code = r[1];
+          this._pendingWrite = { buf, off, cb };
+          const onEvent = () => {
+            qjsos.setReadHandler(this._fd, null);
+            qjsos.setWriteHandler(this._fd, null);
+            const p = this._pendingWrite;
+            this._pendingWrite = null;
+            if (p && !this.destroyed) {
+              off = p.off; buf = p.buf; cb = p.cb;
+              attempt();
+            }
+          };
+          if (code === C.TLS_WANT_READ)
+            qjsos.setReadHandler(this._fd, onEvent);
+          else
+            qjsos.setWriteHandler(this._fd, onEvent);
+          return;
+        }
+        if (r[1]) {
+          cb(sysError(r[1], "write"));
+          return;
+        }
+        const n = r[0];
+        if (!n)
+          break;
+        off += n;
+        this.bytesWritten += n;
+      }
+      cb();
+    };
+    attempt();
+  }
+
+  end(data, encoding, cb) {
+    if (typeof data === "function") { cb = data; data = undefined; }
+    if (typeof encoding === "function") { cb = encoding; encoding = undefined; }
+    const self = this;
+    if (data !== undefined && data !== null)
+      this.write(data, encoding);
+    this._ending = true;
+    const finish = () => {
+      if (self._tlsHandle !== undefined) {
+        try { native.tlsShutdown(self._tlsHandle); } catch (e) { /* ignore */ }
+      }
+      if (self._fd !== undefined) {
+        native.shutdown(self._fd, C.SHUT_WR);
+        self.writable = false;
+      }
+      if (cb)
+        self.once("finish", cb);
+      self.emit("finish");
+      if (self.allowHalfOpen)
+        self._maybeClose();
+      else
+        self.destroySoon();
+    };
+    if (this._pendingWrite)
+      this.once("drain", finish);
+    else
+      finish();
+    return this;
+  }
+
+  destroy(err) {
+    if (this._tlsHandle !== undefined) {
+      try {
+        native.tlsShutdown(this._tlsHandle);
+        native.tlsFree(this._tlsHandle);
+      } catch (e) { /* ignore */ }
+      this._tlsHandle = undefined;
+    }
+    return super.destroy(err);
+  }
+
+  getPeerCertificate() {
+    if (this._tlsHandle === undefined)
+      return {};
+    return native.tlsPeerCert(this._tlsHandle) || {};
+  }
+  getCertificate() { return this.getPeerCertificate(); }
+  getProtocol() { return this.protocol || null; }
+  getCipher() { return this.cipher || { name: null, version: null }; }
+  getEphemeralKeyInfo() { return {}; }
+  getSession() { return null; }
+  isSessionReused() { return false; }
+  setServername(name) { return this; }
+  setMaxSendFragment(size) { return true; }
+  disableRenegotiation() {}
+  exportKeyingMaterial() { return Buffer.alloc(0); }
+}
+
+function tlsError(e) {
+  if (e && !e.code) {
+    const msg = String(e.message || e);
+    if (/self.signed/i.test(msg))
+      e.code = "DEPTH_ZERO_SELF_SIGNED_CERT";
+    else if (/unable to get local issuer|unable to verify the first/i.test(msg))
+      e.code = "UNABLE_TO_VERIFY_LEAF_SIGNATURE";
+    else if (/expired/i.test(msg))
+      e.code = "CERT_HAS_EXPIRED";
+    else if (/hostname|altname|IP address mismatch|does not match/i.test(msg))
+      e.code = "ERR_TLS_CERT_ALTNAME_INVALID";
+    else if (/certificate|verify/i.test(msg))
+      e.code = "ERR_TLS_CERT_ALTNAME_INVALID";
+    else
+      e.code = "ERR_SSL_SSL/TLS_ALERT";
+    if (e.name === "InternalError")
+      e.name = "Error";
+  }
+  return e;
+}
+
+class SecureContext {
+  constructor(options) {
+    options = options || {};
+    this.context = undefined;
+    if (!hasTLS())
+      tlsUnsupported();
+    const cert = pemString(options.cert);
+    const key = pemString(options.key);
+    if (cert && key) {
+      const r = native.tlsServerContext(cert, key, pemString(options.ca));
+      if (r[1])
+        throw sysError(r[1], "tls");
+      this.context = r[0];
+      this._ctxId = r[0];
+    }
+  }
+}
+
+class TLSServer extends EventEmitter {
+  constructor(options, listener) {
+    super();
+    options = options || {};
+    if (!hasTLS())
+      tlsUnsupported();
+    this._options = options;
+    this._context = tls.createSecureContext(options);
+    this._server = net.createServer((raw) => this._onConnection(raw));
+    this._server.on("error", (e) => this.emit("error", e));
+    this._server.on("listening", () => this.emit("listening"));
+    this._server.on("close", () => this.emit("close"));
+    if (listener)
+      this.on("secureConnection", listener);
+  }
+
+  _onConnection(raw) {
+    const fd = raw._fd;
+    raw._fd = undefined;
+    qjsos.setReadHandler(fd, null);
+    raw.removeAllListeners();
+    const sock = new TLSSocket({
+      isServer: true, fd, secureContext: this._context._ctxId, server: this,
+    });
+    sock.on("secureConnect", () => this.emit("secureConnection", sock));
+    sock.on("error", (e) => this.emit("clientError", e, sock));
+    const peer = native.getpeername(fd);
+    if (!peer[1]) {
+      sock.remoteAddress = peer[0][0];
+      sock.remotePort = peer[0][2];
+    }
+    const local = native.getsockname(fd);
+    if (!local[1]) {
+      sock.localAddress = local[0][0];
+      sock.localPort = local[0][2];
+    }
+  }
+
+  listen(...args) { this._server.listen(...args); return this; }
+  close(cb) { this._server.close(cb); return this; }
+  address() { return this._server.address(); }
+  getConnections(cb) { this._server.getConnections(cb); }
+  setTimeout(ms, cb) { if (cb) this.once("timeout", cb); return this; }
+  ref() { return this; }
+  unref() { return this; }
+}
+
+function normalizeTLSOptions(args) {
+  let options = {}, cb;
+  if (typeof args[0] === "object" && args[0] !== null) {
+    options = Object.assign({}, args[0]);
+    cb = args[1];
+  } else {
+    options.port = Number(args[0]);
+    let i = 1;
+    if (typeof args[i] === "string")
+      options.host = options.servername = args[i++];
+    if (typeof args[i] === "object" && args[i] !== null) {
+      Object.assign(options, args[i]);
+      i++;
+    }
+    cb = args[i];
+  }
+  if (options.servername === undefined)
+    options.servername = options.hostname || options.host;
+  return { options, cb };
+}
+
 const tls = {
-  connect: tlsUnsupported,
-  createServer: tlsUnsupported,
-  TLSSocket: class TLSSocket extends Socket {
-    constructor() { super(); tlsUnsupported(); }
+  TLSSocket,
+  SecureContext,
+  Server: TLSServer,
+  connect(...args) {
+    const { options, cb } = normalizeTLSOptions(args);
+    const s = new TLSSocket(options);
+    if (cb)
+      s.once("secureConnect", cb);
+    s.connect(options);
+    return s;
   },
-  SecureContext: class SecureContext {
-    constructor() { tlsUnsupported(); }
+  createServer(options, listener) {
+    if (typeof options === "function") { listener = options; options = {}; }
+    return new TLSServer(options, listener);
   },
-  createSecureContext: tlsUnsupported,
+  createSecureContext(options) { return new SecureContext(options); },
+  getCiphers() { return ["TLS_AES_256_GCM_SHA384", "TLS_CHACHA20_POLY1305_SHA256"]; },
   DEFAULT_MIN_VERSION: "TLSv1.2",
   DEFAULT_MAX_VERSION: "TLSv1.3",
 };
@@ -6762,55 +7246,136 @@ class Request {
   clone() { return new Request(this); }
 }
 
-function fetch(input, init) {
+const FETCH_REDIRECT_CODES = new Set([301, 302, 303, 307, 308]);
+
+function fetchDecodeBody(buf, encoding) {
+  const enc = String(encoding || "").toLowerCase().trim();
+  if (enc === "gzip" || enc === "x-gzip")
+    return zlib.gunzipSync(buf);
+  if (enc === "deflate")
+    return zlib.inflateSync(buf);
+  if (enc === "br" && typeof zlib.brotliDecompressSync === "function")
+    return zlib.brotliDecompressSync(buf);
+  return buf;
+}
+
+function fetchOnce(url, init, redirects) {
   return new Promise((resolve, reject) => {
-    const req = input instanceof Request ? input : new Request(input, init);
+    const req0 = init.request instanceof Request ? init.request : null;
     let u;
-    try { u = new URL(req.url); }
-    catch (e) { reject(new TypeError("Failed to parse URL from " + req.url)); return; }
-    if (u.protocol !== "http:") {
-      reject(new TypeError("fetch: only http:// is supported for now"));
+    try { u = new URL(url); }
+    catch (e) { reject(new TypeError("Failed to parse URL from " + url)); return; }
+    if (u.protocol !== "http:" && u.protocol !== "https:") {
+      reject(new TypeError("fetch: unsupported protocol " + u.protocol));
       return;
     }
-    if (req.signal && req.signal.aborted) {
-      reject(req.signal.reason);
+    if (init.signal && init.signal.aborted) {
+      reject(init.signal.reason);
       return;
     }
+    const secure = u.protocol === "https:";
     const headers = {};
-    req.headers.forEach((v, k) => { headers[k] = v; });
-    const r = http.request({
+    init.headers.forEach((v, k) => { headers[k] = v; });
+    const opts = {
       hostname: u.hostname,
-      port: u.port || 80,
+      port: u.port || (secure ? 443 : 80),
       path: u.pathname + u.search,
-      method: req.method,
+      method: init.method,
       headers,
-    }, (res) => {
+    };
+    if (secure) {
+      if (init.rejectUnauthorized !== undefined)
+        opts.rejectUnauthorized = init.rejectUnauthorized;
+      if (init.ca !== undefined)
+        opts.ca = init.ca;
+    }
+    else if (init.rejectUnauthorized !== undefined)
+      opts.rejectUnauthorized = init.rejectUnauthorized;
+    const mod = secure ? https : http;
+    const r = mod.request(opts, (res) => {
+      const location = res.headers.location;
+      if (FETCH_REDIRECT_CODES.has(res.statusCode) && location &&
+          init.redirect !== "manual" && redirects > 0) {
+        res.resume();
+        let next;
+        try { next = new URL(location, url).href; }
+        catch (e) { reject(new TypeError("fetch: invalid redirect URL")); return; }
+        let method = init.method;
+        let body = init.bodyText;
+        if (res.statusCode === 303 ||
+            ((res.statusCode === 301 || res.statusCode === 302) &&
+             method === "POST")) {
+          method = "GET";
+          body = undefined;
+        }
+        const nextInit = Object.assign({}, init, {
+          request: null, method, bodyText: body,
+        });
+        if (nextInit.headers && nextInit.headers.delete) {
+          if (method === "GET")
+            nextInit.headers.delete("content-length");
+          nextInit.headers.delete("host");
+        }
+        resolve(fetchOnce(next, nextInit, redirects - 1));
+        return;
+      }
       const chunks = [];
       res.on("data", (c) => chunks.push(c));
       res.on("end", () => {
         const outHeaders = {};
         for (const k of Object.keys(res.headers))
           outHeaders[k] = res.headers[k];
-        resolve(new Response(Buffer.concat(chunks), {
-          status: res.statusCode,
-          statusText: res.statusMessage,
-          headers: outHeaders,
-          url: req.url,
-        }));
+        let body = Buffer.concat(chunks);
+        try {
+          body = fetchDecodeBody(body, res.headers["content-encoding"]);
+        } catch (e) {
+          reject(e);
+          return;
+        }
+        const out = new Response(
+          init.method === "HEAD" ? null : body, {
+            status: res.statusCode,
+            statusText: res.statusMessage,
+            headers: outHeaders,
+            url,
+          });
+        out.redirected = redirects !== init.maxRedirects;
+        resolve(out);
       });
       res.on("error", reject);
     });
     r.on("error", reject);
-    if (req.signal && req.signal.addEventListener) {
-      req.signal.addEventListener("abort", () => {
+    if (init.signal && init.signal.addEventListener) {
+      init.signal.addEventListener("abort", () => {
         r.destroy();
-        reject(req.signal.reason);
+        reject(init.signal.reason);
       }, { once: true });
     }
-    if (req.body !== undefined && req.body !== null)
-      r.end(req.body);
+    if (init.bodyText !== undefined && init.bodyText !== null &&
+        init.method !== "GET" && init.method !== "HEAD")
+      r.end(init.bodyText);
     else
       r.end();
+  });
+}
+
+function fetch(input, init) {
+  return new Promise((resolve, reject) => {
+    let req;
+    try { req = input instanceof Request ? input : new Request(input, init); }
+    catch (e) { reject(e); return; }
+    const headers = new Headers();
+    req.headers.forEach((v, k) => headers.set(k, v));
+    fetchOnce(req.url, {
+      request: req,
+      method: req.method,
+      headers,
+      signal: req.signal,
+      redirect: req.redirect,
+      maxRedirects: 20,
+      bodyText: req.body === undefined || req.body === null
+        ? undefined : req.body,
+    }, 20).then(resolve, reject);
   });
 }
 
@@ -6854,7 +7419,7 @@ process.report = {
 process.allowedNodeEnvironmentFlags = { has: () => false };
 process.features.typescript = false;
 process.features.inspector = false;
-process.features.tls = false;
+process.features.tls = hasTLS();
 process.features.cached_builtins = false;
 process.features.require_module = true;
 

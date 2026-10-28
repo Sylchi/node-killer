@@ -35,6 +35,15 @@
 #include <zlib.h>
 #endif
 
+#ifdef QNODE_HAVE_OPENSSL
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
+#include <openssl/pem.h>
+#include <openssl/bio.h>
+#endif
+
 #include "cutils.h"
 #include "quickjs.h"
 #include "quickjs-libc.h"
@@ -258,7 +267,7 @@ static JSValue js_node_random_bytes(JSContext *ctx, JSValueConst this_val,
     }
     if (got < (size_t)len) {
         js_free(ctx, buf);
-        return JS_ThrowInternalError(ctx, "cannot read random bytes");
+        return JS_ThrowPlainError(ctx, "cannot read random bytes");
     }
     JSValue val = JS_NewUint8ArrayCopy(ctx, buf, len);
     js_free(ctx, buf);
@@ -1475,7 +1484,7 @@ static JSValue js_node_zlib_compress(JSContext *ctx, JSValueConst this_val,
     r = deflateInit2(&zs, level, Z_DEFLATED, windowBits, memLevel, strategy);
     if (r != Z_OK) {
         node_free_bytes(ctx, &in);
-        return JS_ThrowInternalError(ctx, "zlib: deflateInit2 failed (%d)", r);
+        return JS_ThrowPlainError(ctx, "zlib: deflateInit2 failed (%d)", r);
     }
 
     uLong bound = deflateBound(&zs, (uLong)in.len);
@@ -1495,7 +1504,7 @@ static JSValue js_node_zlib_compress(JSContext *ctx, JSValueConst this_val,
     node_free_bytes(ctx, &in);
     if (r != Z_STREAM_END) {
         js_free(ctx, out);
-        return JS_ThrowInternalError(ctx, "zlib: deflate failed (%d)", r);
+        return JS_ThrowPlainError(ctx, "zlib: deflate failed (%d)", r);
     }
     JSValue val = JS_NewUint8ArrayCopy(ctx, out, produced);
     js_free(ctx, out);
@@ -1525,7 +1534,7 @@ static JSValue js_node_zlib_decompress(JSContext *ctx, JSValueConst this_val,
     r = inflateInit2(&zs, windowBits);
     if (r != Z_OK) {
         node_free_bytes(ctx, &in);
-        return JS_ThrowInternalError(ctx, "zlib: inflateInit2 failed (%d)", r);
+        return JS_ThrowPlainError(ctx, "zlib: inflateInit2 failed (%d)", r);
     }
 
     cap = in.len ? in.len * 4 : 256;
@@ -1551,7 +1560,7 @@ static JSValue js_node_zlib_decompress(JSContext *ctx, JSValueConst this_val,
             js_free(ctx, out);
             inflateEnd(&zs);
             node_free_bytes(ctx, &in);
-            return JS_ThrowInternalError(ctx, "zlib: inflate failed (%d)", r);
+            return JS_ThrowPlainError(ctx, "zlib: inflate failed (%d)", r);
         }
         if (zs.avail_out == 0) {
             size_t ncap = cap * 2;
@@ -1570,7 +1579,7 @@ static JSValue js_node_zlib_decompress(JSContext *ctx, JSValueConst this_val,
         js_free(ctx, out);
         inflateEnd(&zs);
         node_free_bytes(ctx, &in);
-        return JS_ThrowInternalError(ctx, "zlib: unexpected end of file");
+        return JS_ThrowPlainError(ctx, "zlib: unexpected end of file");
     }
     inflateEnd(&zs);
     node_free_bytes(ctx, &in);
@@ -1597,6 +1606,595 @@ static JSValue js_node_crc32(JSContext *ctx, JSValueConst this_val,
 }
 
 #endif /* QNODE_HAVE_ZLIB */
+
+#ifdef QNODE_HAVE_OPENSSL
+
+#define NODE_TLS_MAX_CTX 256
+#define NODE_TLS_MAX_CONN 1024
+#define NODE_TLS_WANT_READ 1001
+#define NODE_TLS_WANT_WRITE 1002
+
+typedef struct {
+    SSL_CTX *ctx;
+    int used;
+} NodeTLSContext;
+
+typedef struct {
+    SSL *ssl;
+    SSL_CTX *own_ctx; /* client connections own their context */
+    int used;
+} NodeTLSConn;
+
+static NodeTLSContext node_tls_contexts[NODE_TLS_MAX_CTX];
+static NodeTLSConn node_tls_conns[NODE_TLS_MAX_CONN];
+static int node_tls_initialized;
+
+static void node_tls_init(void)
+{
+    if (!node_tls_initialized) {
+        OPENSSL_init_ssl(0, NULL);
+        node_tls_initialized = 1;
+    }
+}
+
+static void node_tls_raise(JSContext *ctx, SSL *ssl, const char *what)
+{
+    unsigned long e = ERR_get_error();
+    char errbuf[256] = "";
+    long vr = ssl ? SSL_get_verify_result(ssl) : X509_V_OK;
+
+    if (e)
+        ERR_error_string_n(e, errbuf, sizeof(errbuf));
+    ERR_clear_error();
+    if (vr != X509_V_OK) {
+        JS_ThrowPlainError(ctx, "%s: %s", what,
+                              X509_verify_cert_error_string(vr));
+    } else if (errbuf[0]) {
+        JS_ThrowPlainError(ctx, "%s: %s", what, errbuf);
+    } else {
+        JS_ThrowPlainError(ctx, "%s failed", what);
+    }
+}
+
+static int node_tls_add_ca(SSL_CTX *ctx, const char *pem)
+{
+    BIO *bio = BIO_new_mem_buf(pem, -1);
+    X509_STORE *store = SSL_CTX_get_cert_store(ctx);
+    int added = 0;
+    X509 *x;
+
+    if (!bio)
+        return 0;
+    for (;;) {
+        x = PEM_read_bio_X509(bio, NULL, NULL, NULL);
+        if (!x)
+            break;
+        if (X509_STORE_add_cert(store, x) == 1)
+            added++;
+        X509_free(x);
+    }
+    ERR_clear_error();
+    BIO_free(bio);
+    return added;
+}
+
+/* tlsClientInit(fd, hostname, verify, caPem|null, alpnWire|null) */
+static JSValue js_node_tls_client_init(JSContext *ctx, JSValueConst this_val,
+                                       int argc, JSValueConst *argv)
+{
+    int32_t fd;
+    SSL_CTX *c;
+    SSL *ssl;
+    int verify = 1;
+    const char *host = NULL;
+    const char *ca = NULL;
+    NodeBytes alpn = { 0 };
+
+    node_tls_init();
+    if (JS_ToInt32(ctx, &fd, argv[0]))
+        return JS_EXCEPTION;
+    if (argc > 1 && !JS_IsUndefined(argv[1]) && !JS_IsNull(argv[1])) {
+        host = node_cstr(ctx, argv[1]);
+        if (!host)
+            return JS_EXCEPTION;
+    }
+    if (argc > 2 && !JS_IsUndefined(argv[2]))
+        verify = JS_ToBool(ctx, argv[2]);
+    if (argc > 3 && JS_IsString(argv[3])) {
+        ca = node_cstr(ctx, argv[3]);
+        if (!ca) {
+            if (host) JS_FreeCString(ctx, host);
+            return JS_EXCEPTION;
+        }
+    }
+    if (argc > 4 && !JS_IsUndefined(argv[4]) && !JS_IsNull(argv[4])) {
+        if (node_get_bytes(ctx, argv[4], &alpn)) {
+            if (host) JS_FreeCString(ctx, host);
+            if (ca) JS_FreeCString(ctx, ca);
+            return JS_EXCEPTION;
+        }
+    }
+
+    if (verify)
+        c = SSL_CTX_new(TLS_client_method());
+    else
+        c = SSL_CTX_new(TLS_client_method());
+    if (!c)
+        goto oom;
+
+    SSL_CTX_set_min_proto_version(c, TLS1_2_VERSION);
+    SSL_CTX_set_verify(c, verify ? SSL_VERIFY_PEER : SSL_VERIFY_NONE, NULL);
+    if (verify) {
+        if (ca && ca[0])
+            node_tls_add_ca(c, ca);
+        else
+            SSL_CTX_set_default_verify_paths(c);
+    }
+
+    ssl = SSL_new(c);
+    if (!ssl) {
+        SSL_CTX_free(c);
+        goto oom;
+    }
+    SSL_set_fd(ssl, fd);
+    SSL_set_connect_state(ssl);
+    if (host && host[0]) {
+        SSL_set_tlsext_host_name(ssl, host);
+        if (verify)
+            SSL_set1_host(ssl, host);
+    }
+    if (alpn.len)
+        SSL_set_alpn_protos(ssl, alpn.data, (unsigned int)alpn.len);
+
+    node_free_bytes(ctx, &alpn);
+    if (host) JS_FreeCString(ctx, host);
+    if (ca) JS_FreeCString(ctx, ca);
+
+    for (int i = 0; i < NODE_TLS_MAX_CONN; i++) {
+        if (!node_tls_conns[i].used) {
+            node_tls_conns[i].ssl = ssl;
+            node_tls_conns[i].own_ctx = c;
+            node_tls_conns[i].used = 1;
+            return node_ok(ctx, JS_NewInt32(ctx, i));
+        }
+    }
+    SSL_free(ssl);
+    SSL_CTX_free(c);
+    return node_err(ctx, JS_NULL, ENOMEM);
+
+oom:
+    ERR_clear_error();
+    node_free_bytes(ctx, &alpn);
+    if (host) JS_FreeCString(ctx, host);
+    if (ca) JS_FreeCString(ctx, ca);
+    return JS_ThrowOutOfMemory(ctx);
+}
+
+/* tlsServerContext(certPem, keyPem, caPem|null) -> ctx id */
+static JSValue js_node_tls_server_context(JSContext *ctx, JSValueConst this_val,
+                                          int argc, JSValueConst *argv)
+{
+    const char *cert, *key, *ca = NULL;
+    SSL_CTX *c;
+    BIO *bio;
+    X509 *x;
+    EVP_PKEY *pkey;
+    int id = -1;
+
+    node_tls_init();
+    cert = node_cstr(ctx, argv[0]);
+    if (!cert)
+        return JS_EXCEPTION;
+    key = node_cstr(ctx, argv[1]);
+    if (!key) {
+        JS_FreeCString(ctx, cert);
+        return JS_EXCEPTION;
+    }
+    if (argc > 2 && JS_IsString(argv[2])) {
+        ca = node_cstr(ctx, argv[2]);
+        if (!ca) {
+            JS_FreeCString(ctx, cert);
+            JS_FreeCString(ctx, key);
+            return JS_EXCEPTION;
+        }
+    }
+
+    c = SSL_CTX_new(TLS_server_method());
+    if (!c)
+        goto fail;
+
+    SSL_CTX_set_min_proto_version(c, TLS1_2_VERSION);
+
+    bio = BIO_new_mem_buf(cert, -1);
+    if (!bio)
+        goto fail;
+    x = PEM_read_bio_X509(bio, NULL, NULL, NULL);
+    if (!x) {
+        BIO_free(bio);
+        goto fail;
+    }
+    if (SSL_CTX_use_certificate(c, x) != 1) {
+        X509_free(x);
+        BIO_free(bio);
+        goto fail;
+    }
+    X509_free(x);
+    ERR_clear_error();
+    while ((x = PEM_read_bio_X509(bio, NULL, NULL, NULL)) != NULL)
+        SSL_CTX_add_extra_chain_cert(c, x);
+    ERR_clear_error();
+    BIO_free(bio);
+
+    bio = BIO_new_mem_buf(key, -1);
+    if (!bio)
+        goto fail;
+    pkey = PEM_read_bio_PrivateKey(bio, NULL, NULL, NULL);
+    BIO_free(bio);
+    if (!pkey)
+        goto fail;
+    if (SSL_CTX_use_PrivateKey(c, pkey) != 1) {
+        EVP_PKEY_free(pkey);
+        goto fail;
+    }
+    EVP_PKEY_free(pkey);
+    if (SSL_CTX_check_private_key(c) != 1)
+        goto fail;
+    if (ca && ca[0])
+        node_tls_add_ca(c, ca);
+
+    for (int i = 0; i < NODE_TLS_MAX_CTX; i++) {
+        if (!node_tls_contexts[i].used) {
+            node_tls_contexts[i].ctx = c;
+            node_tls_contexts[i].used = 1;
+            id = i;
+            break;
+        }
+    }
+    JS_FreeCString(ctx, cert);
+    JS_FreeCString(ctx, key);
+    if (ca) JS_FreeCString(ctx, ca);
+    if (id < 0) {
+        SSL_CTX_free(c);
+        return node_err(ctx, JS_NULL, ENOMEM);
+    }
+    return node_ok(ctx, JS_NewInt32(ctx, id));
+
+fail:
+    if (c) SSL_CTX_free(c);
+    node_tls_raise(ctx, NULL, "cannot create TLS context");
+    JS_FreeCString(ctx, cert);
+    JS_FreeCString(ctx, key);
+    if (ca) JS_FreeCString(ctx, ca);
+    return JS_EXCEPTION;
+}
+
+/* tlsAccept(ctxId, fd) -> conn id */
+static JSValue js_node_tls_accept(JSContext *ctx, JSValueConst this_val,
+                                  int argc, JSValueConst *argv)
+{
+    int32_t ctxid, fd;
+    SSL *ssl;
+
+    node_tls_init();
+    if (JS_ToInt32(ctx, &ctxid, argv[0]) || JS_ToInt32(ctx, &fd, argv[1]))
+        return JS_EXCEPTION;
+    if (ctxid < 0 || ctxid >= NODE_TLS_MAX_CTX ||
+        !node_tls_contexts[ctxid].used ||
+        !node_tls_contexts[ctxid].ctx)
+        return JS_ThrowRangeError(ctx, "invalid TLS context");
+
+    ssl = SSL_new(node_tls_contexts[ctxid].ctx);
+    if (!ssl)
+        return JS_ThrowOutOfMemory(ctx);
+    SSL_set_fd(ssl, fd);
+    SSL_set_accept_state(ssl);
+
+    for (int i = 0; i < NODE_TLS_MAX_CONN; i++) {
+        if (!node_tls_conns[i].used) {
+            node_tls_conns[i].ssl = ssl;
+            node_tls_conns[i].own_ctx = NULL;
+            node_tls_conns[i].used = 1;
+            return node_ok(ctx, JS_NewInt32(ctx, i));
+        }
+    }
+    SSL_free(ssl);
+    return node_err(ctx, JS_NULL, ENOMEM);
+}
+
+static SSL *node_tls_ssl(JSContext *ctx, JSValueConst v)
+{
+    int32_t id;
+    if (JS_ToInt32(ctx, &id, v)) {
+        return NULL;
+    }
+    if (id < 0 || id >= NODE_TLS_MAX_CONN || !node_tls_conns[id].used) {
+        JS_ThrowRangeError(ctx, "invalid TLS handle");
+        return NULL;
+    }
+    return node_tls_conns[id].ssl;
+}
+
+/* tlsHandshake(id) -> 0 done, 1 want read, 2 want write */
+static JSValue js_node_tls_handshake(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv)
+{
+    SSL *ssl = node_tls_ssl(ctx, argv[0]);
+    int r, err;
+
+    if (!ssl)
+        return JS_EXCEPTION;
+    ERR_clear_error();
+    r = SSL_do_handshake(ssl);
+    if (r == 1)
+        return node_ok(ctx, JS_NewInt32(ctx, 0));
+    /* A failed peer verification is terminal: OpenSSL may keep reporting
+       WANT_READ/WANT_WRITE after sending the alert, so surface it here. */
+    if (SSL_get_verify_result(ssl) != X509_V_OK) {
+        node_tls_raise(ctx, ssl, "TLS handshake failed");
+        return JS_EXCEPTION;
+    }
+    err = SSL_get_error(ssl, r);
+    if (err == SSL_ERROR_WANT_READ)
+        return node_ok(ctx, JS_NewInt32(ctx, 1));
+    if (err == SSL_ERROR_WANT_WRITE)
+        return node_ok(ctx, JS_NewInt32(ctx, 2));
+    node_tls_raise(ctx, ssl, "TLS handshake failed");
+    return JS_EXCEPTION;
+}
+
+/* tlsRead(id, max) -> bytes; empty means EOF */
+static JSValue js_node_tls_read(JSContext *ctx, JSValueConst this_val,
+                                int argc, JSValueConst *argv)
+{
+    SSL *ssl = node_tls_ssl(ctx, argv[0]);
+    int32_t len = 16384;
+    uint8_t *buf;
+    int r, err;
+
+    if (!ssl)
+        return JS_EXCEPTION;
+    if (argc > 1 && !JS_IsUndefined(argv[1]) &&
+        JS_ToInt32(ctx, &len, argv[1]))
+        return JS_EXCEPTION;
+    if (len <= 0 || len > 16 * 1024 * 1024)
+        return JS_ThrowRangeError(ctx, "invalid read length");
+
+    buf = js_malloc(ctx, len);
+    if (!buf)
+        return JS_EXCEPTION;
+    ERR_clear_error();
+    r = SSL_read(ssl, buf, len);
+    if (r > 0) {
+        JSValue v = JS_NewUint8ArrayCopy(ctx, buf, r);
+        js_free(ctx, buf);
+        return node_ok(ctx, v);
+    }
+    js_free(ctx, buf);
+    err = SSL_get_error(ssl, r);
+    if (err == SSL_ERROR_WANT_READ)
+        return node_err(ctx, JS_NULL, NODE_TLS_WANT_READ);
+    if (err == SSL_ERROR_WANT_WRITE)
+        return node_err(ctx, JS_NULL, NODE_TLS_WANT_WRITE);
+    if (err == SSL_ERROR_ZERO_RETURN)
+        return node_ok(ctx, JS_NewUint8ArrayCopy(ctx, (const uint8_t *)"", 0));
+    if (err == SSL_ERROR_SYSCALL && (errno == EAGAIN || errno == EINTR))
+        return node_err(ctx, JS_NULL, NODE_TLS_WANT_READ);
+    node_tls_raise(ctx, ssl, "TLS read failed");
+    return JS_EXCEPTION;
+}
+
+/* tlsWrite(id, data) -> bytes written */
+static JSValue js_node_tls_write(JSContext *ctx, JSValueConst this_val,
+                                 int argc, JSValueConst *argv)
+{
+    SSL *ssl = node_tls_ssl(ctx, argv[0]);
+    NodeBytes b;
+    int r, err;
+
+    if (!ssl)
+        return JS_EXCEPTION;
+    if (node_get_bytes(ctx, argv[1], &b))
+        return JS_EXCEPTION;
+    ERR_clear_error();
+    r = SSL_write(ssl, b.data, (int)b.len);
+    node_free_bytes(ctx, &b);
+    if (r > 0)
+        return node_ok(ctx, JS_NewInt32(ctx, r));
+    err = SSL_get_error(ssl, r);
+    if (err == SSL_ERROR_WANT_READ)
+        return node_err(ctx, JS_NULL, NODE_TLS_WANT_READ);
+    if (err == SSL_ERROR_WANT_WRITE)
+        return node_err(ctx, JS_NULL, NODE_TLS_WANT_WRITE);
+    node_tls_raise(ctx, ssl, "TLS write failed");
+    return JS_EXCEPTION;
+}
+
+static JSValue js_node_tls_shutdown(JSContext *ctx, JSValueConst this_val,
+                                    int argc, JSValueConst *argv)
+{
+    SSL *ssl = node_tls_ssl(ctx, argv[0]);
+    if (!ssl)
+        return JS_EXCEPTION;
+    ERR_clear_error();
+    SSL_shutdown(ssl);
+    ERR_clear_error();
+    return JS_UNDEFINED;
+}
+
+static JSValue js_node_tls_free(JSContext *ctx, JSValueConst this_val,
+                                int argc, JSValueConst *argv)
+{
+    int32_t id;
+    if (JS_ToInt32(ctx, &id, argv[0]))
+        return JS_EXCEPTION;
+    if (id >= 0 && id < NODE_TLS_MAX_CONN && node_tls_conns[id].used) {
+        SSL_free(node_tls_conns[id].ssl);
+        if (node_tls_conns[id].own_ctx)
+            SSL_CTX_free(node_tls_conns[id].own_ctx);
+        node_tls_conns[id].used = 0;
+        node_tls_conns[id].ssl = NULL;
+        node_tls_conns[id].own_ctx = NULL;
+    }
+    return JS_UNDEFINED;
+}
+
+static JSValue js_node_tls_free_context(JSContext *ctx, JSValueConst this_val,
+                                        int argc, JSValueConst *argv)
+{
+    int32_t id;
+    if (JS_ToInt32(ctx, &id, argv[0]))
+        return JS_EXCEPTION;
+    if (id >= 0 && id < NODE_TLS_MAX_CTX && node_tls_contexts[id].used) {
+        SSL_CTX_free(node_tls_contexts[id].ctx);
+        node_tls_contexts[id].used = 0;
+        node_tls_contexts[id].ctx = NULL;
+    }
+    return JS_UNDEFINED;
+}
+
+static JSValue node_tls_name_object(JSContext *ctx, X509_NAME *name)
+{
+    JSValue obj = JS_NewObject(ctx);
+    int n = X509_NAME_entry_count(name);
+    for (int i = 0; i < n; i++) {
+        X509_NAME_ENTRY *e = X509_NAME_get_entry(name, i);
+        ASN1_OBJECT *o = X509_NAME_ENTRY_get_object(e);
+        ASN1_STRING *d = X509_NAME_ENTRY_get_data(e);
+        const char *key = OBJ_nid2sn(OBJ_obj2nid(o));
+        unsigned char *utf8 = NULL;
+        int len = ASN1_STRING_to_UTF8(&utf8, d);
+        if (len >= 0 && key) {
+            JS_SetPropertyStr(ctx, obj, key,
+                              JS_NewStringLen(ctx, (const char *)utf8, len));
+        }
+        OPENSSL_free(utf8);
+    }
+    return obj;
+}
+
+static JSValue node_tls_time_string(JSContext *ctx, const ASN1_TIME *t)
+{
+    BIO *bio = BIO_new(BIO_s_mem());
+    BUF_MEM *mem = NULL;
+    JSValue v = JS_NULL;
+    if (!bio)
+        return JS_NULL;
+    ASN1_TIME_print(bio, t);
+    BIO_get_mem_ptr(bio, &mem);
+    if (mem)
+        v = JS_NewStringLen(ctx, mem->data, mem->length);
+    BIO_free(bio);
+    return v;
+}
+
+static JSValue js_node_tls_peer_cert(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv)
+{
+    SSL *ssl = node_tls_ssl(ctx, argv[0]);
+    X509 *cert;
+    JSValue obj;
+    unsigned char *der = NULL, *pem = NULL;
+    int derlen, pemlen;
+    BIO *bio;
+    BUF_MEM *mem;
+    char hex[3];
+
+    if (!ssl)
+        return JS_EXCEPTION;
+    cert = SSL_get1_peer_certificate(ssl);
+    if (!cert)
+        return JS_NULL;
+
+    obj = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, obj, "subject",
+                      node_tls_name_object(ctx, X509_get_subject_name(cert)));
+    JS_SetPropertyStr(ctx, obj, "issuer",
+                      node_tls_name_object(ctx, X509_get_issuer_name(cert)));
+    JS_SetPropertyStr(ctx, obj, "valid_from",
+                      node_tls_time_string(ctx, X509_get0_notBefore(cert)));
+    JS_SetPropertyStr(ctx, obj, "valid_to",
+                      node_tls_time_string(ctx, X509_get0_notAfter(cert)));
+
+    derlen = i2d_X509(cert, &der);
+    if (derlen > 0) {
+        JSValue raw = JS_NewArrayBufferCopy(ctx, der, derlen);
+        JS_SetPropertyStr(ctx, obj, "raw", raw);
+        OPENSSL_free(der);
+    }
+
+    bio = BIO_new(BIO_s_mem());
+    if (bio && PEM_write_bio_X509(bio, cert) == 1) {
+        BIO_get_mem_ptr(bio, &mem);
+        pem = (unsigned char *)mem->data;
+        pemlen = (int)mem->length;
+        JS_SetPropertyStr(ctx, obj, "pem",
+                          JS_NewStringLen(ctx, (const char *)pem, pemlen));
+    }
+    if (bio)
+        BIO_free(bio);
+
+    /* SHA-256 fingerprint of the DER encoding */
+    {
+        unsigned char md[EVP_MAX_MD_SIZE];
+        unsigned int mdlen = 0;
+        char fp[EVP_MAX_MD_SIZE * 3];
+        size_t off = 0;
+        if (X509_digest(cert, EVP_sha256(), md, &mdlen) == 1) {
+            for (unsigned int i = 0; i < mdlen; i++) {
+                snprintf(hex, sizeof(hex), "%02X", md[i]);
+                if (i)
+                    fp[off++] = ':';
+                fp[off++] = hex[0];
+                fp[off++] = hex[1];
+            }
+            fp[off] = '\0';
+            JS_SetPropertyStr(ctx, obj, "fingerprint256",
+                              JS_NewString(ctx, fp));
+        }
+    }
+
+    {
+        BIGNUM *bn = ASN1_INTEGER_to_BN(X509_get_serialNumber(cert), NULL);
+        if (bn) {
+            char *s = BN_bn2hex(bn);
+            if (s) {
+                JS_SetPropertyStr(ctx, obj, "serialNumber",
+                                  JS_NewString(ctx, s));
+                OPENSSL_free(s);
+            }
+            BN_free(bn);
+        }
+    }
+
+    X509_free(cert);
+    return obj;
+}
+
+static JSValue js_node_tls_info(JSContext *ctx, JSValueConst this_val,
+                                int argc, JSValueConst *argv)
+{
+    SSL *ssl = node_tls_ssl(ctx, argv[0]);
+    JSValue obj;
+    const unsigned char *alpn = NULL;
+    unsigned int alpnlen = 0;
+
+    if (!ssl)
+        return JS_EXCEPTION;
+    obj = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, obj, "protocol",
+                      JS_NewString(ctx, SSL_get_version(ssl)));
+    JS_SetPropertyStr(ctx, obj, "cipher",
+                      JS_NewString(ctx, SSL_get_cipher_name(ssl)));
+    SSL_get0_alpn_selected(ssl, &alpn, &alpnlen);
+    if (alpn && alpnlen)
+        JS_SetPropertyStr(ctx, obj, "alpnProtocol",
+                          JS_NewStringLen(ctx, (const char *)alpn, alpnlen));
+    else
+        JS_SetPropertyStr(ctx, obj, "alpnProtocol", JS_FALSE);
+    return obj;
+}
+
+#endif /* QNODE_HAVE_OPENSSL */
 
 /* ---------------- native object ---------------- */
 
@@ -1669,6 +2267,19 @@ static const JSCFunctionListEntry js_node_funcs[] = {
     JS_CFUNC_DEF("zlibCompress", 5, js_node_zlib_compress),
     JS_CFUNC_DEF("zlibDecompress", 2, js_node_zlib_decompress),
     JS_CFUNC_DEF("crc32", 2, js_node_crc32),
+#endif
+#ifdef QNODE_HAVE_OPENSSL
+    JS_CFUNC_DEF("tlsClientInit", 5, js_node_tls_client_init),
+    JS_CFUNC_DEF("tlsServerContext", 3, js_node_tls_server_context),
+    JS_CFUNC_DEF("tlsAccept", 2, js_node_tls_accept),
+    JS_CFUNC_DEF("tlsHandshake", 1, js_node_tls_handshake),
+    JS_CFUNC_DEF("tlsRead", 2, js_node_tls_read),
+    JS_CFUNC_DEF("tlsWrite", 2, js_node_tls_write),
+    JS_CFUNC_DEF("tlsShutdown", 1, js_node_tls_shutdown),
+    JS_CFUNC_DEF("tlsFree", 1, js_node_tls_free),
+    JS_CFUNC_DEF("tlsFreeContext", 1, js_node_tls_free_context),
+    JS_CFUNC_DEF("tlsPeerCert", 1, js_node_tls_peer_cert),
+    JS_CFUNC_DEF("tlsInfo", 1, js_node_tls_info),
 #endif
 };
 
@@ -2006,6 +2617,8 @@ int js_node_init(JSContext *ctx, JSRuntime *rt)
     NC("SIGKILL", SIGKILL);
     NC("SIGINT", SIGINT);
     NC("SIGCHLD", SIGCHLD);
+    NC("TLS_WANT_READ", 1001);
+    NC("TLS_WANT_WRITE", 1002);
 #undef NC
     JS_SetPropertyStr(ctx, global, "__qnode_consts", c);
 
