@@ -347,10 +347,53 @@ if(WIN32)
 endif()
 
 if(NOT QJS_BUILD_LIBC)
-    add_library(qjs-libc STATIC quickjs-libc.c)
+    add_library(qjs-libc STATIC quickjs-libc.c node.c)
     target_compile_definitions(qjs-libc PRIVATE ${qjs_defines})
     target_link_libraries(qjs-libc PRIVATE ${qjs_libs} qjs)
+    add_dependencies(qjs-libc node_bootstrap_header)
+    target_include_directories(qjs-libc PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+else()
+    message(FATAL_ERROR "qnode requires QJS_BUILD_LIBC=OFF")
 endif()
+
+# qnode embeds the JS bootstrap as a C array. xxd ships with vim; fall back
+# to a CMake-generated header when it is unavailable.
+find_program(XXD_EXECUTABLE xxd)
+set(NODE_BOOTSTRAP_H ${CMAKE_CURRENT_BINARY_DIR}/node_bootstrap.h)
+if(XXD_EXECUTABLE)
+    add_custom_command(
+        OUTPUT ${NODE_BOOTSTRAP_H}
+        COMMAND ${XXD_EXECUTABLE} -i -n node_bootstrap_js
+                ${CMAKE_CURRENT_SOURCE_DIR}/node_bootstrap.js
+                ${NODE_BOOTSTRAP_H}
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/node_bootstrap.js
+        COMMENT "Embedding node_bootstrap.js"
+        VERBATIM
+    )
+else()
+    add_custom_command(
+        OUTPUT ${NODE_BOOTSTRAP_H}
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${CMAKE_CURRENT_SOURCE_DIR}/node_bootstrap.js
+                -DOUTPUT=${NODE_BOOTSTRAP_H}
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_js.cmake
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/node_bootstrap.js
+        COMMENT "Embedding node_bootstrap.js (cmake fallback)"
+        VERBATIM
+    )
+endif()
+add_custom_target(node_bootstrap_header DEPENDS ${NODE_BOOTSTRAP_H})
+
+# The qnode executable: Node.js-compatible CLI.
+add_executable(qnode_exe qnode.c)
+add_qjs_libc_if_needed(qnode_exe)
+add_static_if_needed(qnode_exe)
+set_target_properties(qnode_exe PROPERTIES
+    OUTPUT_NAME "qnode"
+    PDB_NAME "qnode"
+    COMPILE_PDB_NAME "qnode"
+)
+target_compile_definitions(qnode_exe PRIVATE ${qjs_defines})
+target_link_libraries(qnode_exe PRIVATE qjs)
 
 if(EMSCRIPTEN)
     add_executable(qjs_wasm ${qjs_sources})
