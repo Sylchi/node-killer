@@ -27,8 +27,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Install static dependencies
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libmbedtls-dev
       - name: build
         run: |
           make codegen
@@ -61,11 +59,6 @@ jobs:
         with:
           submodules: true
 
-      - name: Install static dependencies
-        if: ${{ matrix.config.os == 'ubuntu-latest' && matrix.config.arch == '' }}
-        run: |
-          sudo apt update && sudo apt install -y zlib1g-dev libmbedtls-dev
-
       - name: Install extra dependencies
         if: ${{ matrix.config.arch != '' }}
         shell: 'sh'
@@ -77,7 +70,7 @@ jobs:
         uses: quickjs-ng/setup-alpine@master
         with:
           arch: ${{ matrix.config.arch }}
-          packages: "build-base make cmake git zlib-static mbedtls-static"
+          packages: "build-base make cmake git"
           apk-tools-url: https://raw.githubusercontent.com/quickjs-ng/apk-for-ci/refs/heads/master/apk.static#!sha256!34bb1a96f0258982377a289392d4ea9f3f4b767a4bb5806b1b87179b79ad8a1c
 
       - name: uname
@@ -521,9 +514,6 @@ jobs:
     runs-on: ${{ matrix.config.os }}
     steps:
       - uses: actions/checkout@v7
-      - name: Install static dependencies
-        if: ${{ runner.os == 'Linux' }}
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libmbedtls-dev
       - name: build
         run: |
           make
