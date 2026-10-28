@@ -4099,6 +4099,10 @@ class Socket extends Duplex {
     this.bytesRead = 0;
     this.bytesWritten = 0;
     this._pendingWrite = null;
+    this._wq = [];
+    this._wqActive = false;
+    this._endFinish = null;
+    this._ref = true;
     this.remoteAddress = undefined;
     this.remotePort = undefined;
     this.localAddress = undefined;
@@ -4225,7 +4229,13 @@ class Socket extends Duplex {
     this._attached = true;
     const fd = this._fd;
     qjsos.setReadHandler(fd, () => this._onReadable());
+    this._applyRef();
     this.resume();
+  }
+
+  _applyRef() {
+    if (this._fd !== undefined)
+      qjsos.setHandlerRef(this._fd, this._ref);
   }
 
   _onReadable() {
@@ -4251,9 +4261,36 @@ class Socket extends Duplex {
     this.push(buf);
   }
 
+  /* Only one native write may be in flight: a write that returns EAGAIN is
+     parked in _pendingWrite, and starting a second one would overwrite it.
+     Writes are therefore queued and drained in order. */
   _write(chunk, encoding, cb) {
-    const buf = toChunk(chunk, encoding);
-    this._flushWrite(buf, cb);
+    this._wq.push({ buf: toChunk(chunk, encoding), cb });
+    this._pumpWrites();
+  }
+
+  _pumpWrites() {
+    if (this._wqActive)
+      return;
+    const item = this._wq.shift();
+    if (!item) {
+      this._maybeFinishEnd();
+      return;
+    }
+    this._wqActive = true;
+    this._flushWrite(item.buf, (err) => {
+      this._wqActive = false;
+      item.cb(err);
+      this._pumpWrites();
+    });
+  }
+
+  _maybeFinishEnd() {
+    if (!this._endFinish || this._wqActive || this._wq.length)
+      return;
+    const finish = this._endFinish;
+    this._endFinish = null;
+    finish();
   }
 
   _flushWrite(buf, cb) {
@@ -4317,10 +4354,8 @@ class Socket extends Duplex {
       else
         self.destroySoon();
     };
-    if (this._pendingWrite)
-      this.once("drain", finish);
-    else
-      finish();
+    this._endFinish = finish;
+    this._maybeFinishEnd();
     return this;
   }
 
@@ -4358,8 +4393,16 @@ class Socket extends Duplex {
     return this;
   }
 
-  ref() { return this; }
-  unref() { return this; }
+  ref() {
+    this._ref = true;
+    this._applyRef();
+    return this;
+  }
+  unref() {
+    this._ref = false;
+    this._applyRef();
+    return this;
+  }
 
   pause() { super.pause(); return this; }
   resume() { super.resume(); return this; }
@@ -4384,22 +4427,33 @@ class Server extends EventEmitter {
     this.listening = false;
     this.maxConnections = undefined;
     this._connections = 0;
+    this._sockets = new Set();
     this._fd = undefined;
   }
 
   listen(...args) {
     let options = {};
     let cb;
-    if (typeof args[args.length - 1] === "function")
-      cb = args[args.length - 1];
-    if (typeof args[0] === "object" && args[0] !== null)
-      options = args[0];
-    else if (typeof args[0] === "number")
-      options = { port: args[0], host: args[1] };
-    else if (typeof args[0] === "string" && !isNaN(Number(args[1])))
-      options = { port: Number(args[1]), host: args[0] };
-    else
-      options = { path: args[0] };
+    const last = args[args.length - 1];
+    if (typeof last === "function")
+      cb = last;
+    const a = args.slice(0, cb ? args.length - 1 : args.length);
+
+    if (typeof a[0] === "object" && a[0] !== null) {
+      options = Object.assign({}, a[0]);
+    } else if (typeof a[0] === "number" ||
+               (typeof a[0] === "string" && a[0] !== "" &&
+                !isNaN(Number(a[0])))) {
+      /* listen(port[, host][, backlog]) */
+      options = { port: Number(a[0]) };
+      let i = 1;
+      if (typeof a[i] === "string")
+        options.host = a[i++];
+      if (typeof a[i] === "number")
+        options.backlog = a[i++];
+    } else if (typeof a[0] === "string") {
+      options = { path: a[0] };
+    }
 
     if (cb)
       this.once("listening", cb);
@@ -4466,7 +4520,11 @@ class Server extends EventEmitter {
         sock.localPort = local[0][2];
       }
       sock._attach();
-      sock.on("close", () => { this._connections--; });
+      this._sockets.add(sock);
+      sock.on("close", () => {
+        this._connections--;
+        this._sockets.delete(sock);
+      });
       this.emit("connection", sock);
     }
   }
@@ -4488,6 +4546,10 @@ class Server extends EventEmitter {
       this._fd = undefined;
     }
     this.listening = false;
+    for (const sock of this._sockets) {
+      if (sock._idle && !sock.destroyed)
+        sock.destroy();
+    }
     if (cb)
       queueMicrotask(cb);
     this.emit("close");
@@ -4751,6 +4813,32 @@ class HttpServer extends EventEmitter {
     let bodyChunks = [];
     let chunked = false;
     let chunkState = null;
+    let idleTimer = null;
+
+    /* Idle keep-alive connections are closed after keepAliveTimeout, like
+       Node does. Without this a finished exchange leaves a ref'd socket
+       behind and the process can never exit. */
+    const clearIdle = () => {
+      if (idleTimer !== null) {
+        clearTimeout(idleTimer);
+        idleTimer = null;
+      }
+      socket._idle = false;
+    };
+    const armIdle = () => {
+      clearIdle();
+      if (socket.destroyed)
+        return;
+      socket._idle = true;
+      idleTimer = setTimeout(() => {
+        idleTimer = null;
+        socket._idle = false;
+        if (!socket.destroyed)
+          socket.destroy();
+      }, this.keepAliveTimeout || 5000);
+      if (idleTimer && idleTimer.unref)
+        idleTimer.unref();
+    };
 
     const reset = () => {
       buf = Buffer.alloc(0);
@@ -4808,8 +4896,11 @@ class HttpServer extends EventEmitter {
             expectBody = 0;
           }
           req._onResponseDone = () => {
-            if (buf.length)
+            if (buf.length) {
               processBuffer();
+              return;
+            }
+            armIdle();
           };
           if (expectBody === 0 && !chunked) {
             finishRequest();
@@ -4842,6 +4933,7 @@ class HttpServer extends EventEmitter {
     };
 
     socket.on("data", (chunk) => {
+      clearIdle();
       buf = Buffer.concat([buf, chunk]);
       try {
         processBuffer();
@@ -4851,9 +4943,11 @@ class HttpServer extends EventEmitter {
       }
     });
     socket.on("end", () => {
+      clearIdle();
       if (current)
         current.emit("aborted");
     });
+    socket.on("close", clearIdle);
     socket.on("error", (e) => this.emit("clientError", e, socket));
   }
 }
@@ -4883,6 +4977,224 @@ function decodeChunked(buf) {
   }
 }
 
+function tlsOptionId(value) {
+  if (value !== null && typeof value === "object") {
+    let id = tlsOptionIds.get(value);
+    if (!id) {
+      id = tlsOptionIdNext++;
+      tlsOptionIds.set(value, id);
+    }
+    return id;
+  }
+  const str = String(value);
+  if (str.length <= 24)
+    return str;
+  let h = 0;
+  for (let i = 0; i < str.length; i++)
+    h = (h * 31 + str.charCodeAt(i)) | 0;
+  return "h" + (h >>> 0).toString(36);
+}
+const tlsOptionIds = new WeakMap();
+let tlsOptionIdNext = 1;
+
+function agentKey(options) {
+  const protocol = options.protocol || "http:";
+  const host = options.hostname || options.host || "localhost";
+  const port = Number(options.port) || (protocol === "https:" ? 443 : 80);
+  let key = protocol + "//" + host + ":" + port;
+  if (protocol === "https:") {
+    key += "|" + (options.servername || host);
+    if (options.rejectUnauthorized === false)
+      key += "|insecure";
+    if (options.ca !== undefined)
+      key += "|ca" + tlsOptionId(options.ca);
+  }
+  return key;
+}
+
+/* Create one connected (or connecting) socket for a request, honouring an
+   explicit createConnection option. Used both directly and by Agent. */
+function createSocketForRequest(o) {
+  const protocol = o.protocol || "http:";
+  const port = Number(o.port) || (protocol === "https:" ? 443 : 80);
+  const host = o.hostname || o.host || "localhost";
+  if (typeof o.createConnection === "function")
+    return o.createConnection(Object.assign({}, o, { port, host }));
+  if (protocol === "https:") {
+    const tlsOpts = {};
+    for (const k of TLS_REQUEST_OPTIONS)
+      if (o[k] !== undefined)
+        tlsOpts[k] = o[k];
+    if (tlsOpts.servername === undefined)
+      tlsOpts.servername = host;
+    return tls.connect(Object.assign({}, tlsOpts, { port, host }));
+  }
+  const s = new Socket();
+  s.connect({ port, host });
+  return s;
+}
+
+/* Minimal but functional connection pool. Idle sockets are unref'd so they
+   do not keep the process alive; a socket is handed to a queued request
+   before a new TCP connection is opened. */
+class Agent {
+  constructor(opts) {
+    opts = opts || {};
+    this.options = opts;
+    this.keepAlive = opts.keepAlive !== undefined ? !!opts.keepAlive : false;
+    this.keepAliveMsecs = opts.keepAliveMsecs || 1000;
+    this.maxSockets = opts.maxSockets || Infinity;
+    this.maxFreeSockets = opts.maxFreeSockets || 256;
+    this.freeSockets = new Map();
+    this.sockets = new Set();
+    this.requests = new Map();
+    this._counts = new Map();
+    this.destroyed = false;
+  }
+
+  getName(options) { return agentKey(options || {}); }
+  createConnection(options) { return createSocketForRequest(options || {}); }
+
+  addRequest(req, options, forceNew) {
+    options = options || req._options || {};
+    if (this.destroyed) {
+      const sock = this.createConnection(options);
+      req._bindSocket(sock, false);
+      return;
+    }
+    const key = this.getName(options);
+    req._agent = this;
+    req._agentKey = key;
+
+    if (!forceNew) {
+      const free = this.freeSockets.get(key);
+      while (free && free.length) {
+        const sock = free.pop();
+        if (sock && !sock.destroyed && sock._fd !== undefined &&
+            sock.readable !== false) {
+          this._assign(req, sock, true);
+          return;
+        }
+        this._forget(key, sock);
+        if (sock)
+          sock.destroy();
+      }
+    }
+
+    if ((this._counts.get(key) || 0) < this.maxSockets) {
+      this._counts.set(key, (this._counts.get(key) || 0) + 1);
+      let sock;
+      try {
+        sock = this.createConnection(options);
+      } catch (e) {
+        this._decrement(key);
+        queueMicrotask(() => req._fail(e));
+        return;
+      }
+      sock._agentKey = key;
+      this.sockets.add(sock);
+      sock.once("close", () => this._forget(key, sock));
+      this._assign(req, sock, false);
+      return;
+    }
+
+    let q = this.requests.get(key);
+    if (!q) {
+      q = [];
+      this.requests.set(key, q);
+    }
+    q.push(req);
+  }
+
+  _assign(req, sock, reused) {
+    req._bindSocket(sock, reused);
+  }
+
+  release(req, sock, reusable) {
+    const key = req._agentKey;
+    req._detachSocket();
+    if (!sock || sock.destroyed || !reusable || this.destroyed) {
+      if (sock && !sock.destroyed)
+        sock.destroy();
+      return;
+    }
+
+    const q = this.requests.get(key);
+    if (q && q.length) {
+      const next = q.shift();
+      if (!q.length)
+        this.requests.delete(key);
+      this._assign(next, sock, true);
+      return;
+    }
+
+    sock.unref();
+    const free = this.freeSockets.get(key) || [];
+    if (free.length >= this.maxFreeSockets) {
+      this._forget(key, sock);
+      sock.destroy();
+      return;
+    }
+    if (free.indexOf(sock) < 0)
+      free.push(sock);
+    this.freeSockets.set(key, free);
+  }
+
+  _forget(key, sock) {
+    if (!key)
+      return;
+    const free = this.freeSockets.get(key);
+    if (free) {
+      const i = free.indexOf(sock);
+      if (i >= 0)
+        free.splice(i, 1);
+      if (!free.length)
+        this.freeSockets.delete(key);
+    }
+    if (this.sockets.delete(sock)) {
+      this._decrement(key);
+      this._drain(key);
+    }
+  }
+
+  _decrement(key) {
+    const n = (this._counts.get(key) || 1) - 1;
+    if (n <= 0)
+      this._counts.delete(key);
+    else
+      this._counts.set(key, n);
+  }
+
+  _drain(key) {
+    if (this.destroyed)
+      return;
+    const q = this.requests.get(key);
+    while (q && q.length && (this._counts.get(key) || 0) < this.maxSockets) {
+      const req = q.shift();
+      this.addRequest(req, req._options, false);
+    }
+    if (q && !q.length)
+      this.requests.delete(key);
+  }
+
+  destroy() {
+    this.destroyed = true;
+    for (const sock of this.sockets) {
+      try { sock.destroy(); } catch (e) { /* ignore */ }
+    }
+    this.sockets.clear();
+    this.freeSockets.clear();
+    this.requests.clear();
+    this._counts.clear();
+  }
+}
+
+function socketHangUp() {
+  const e = new Error("socket hang up");
+  e.code = "ECONNRESET";
+  return e;
+}
+
 class ClientRequest extends Writable {
   constructor(options, cb) {
     super();
@@ -4903,12 +5215,21 @@ class ClientRequest extends Writable {
     this.path = options.path || "/";
     this._headers = headersToObject(options.headers);
     this._chunks = [];
+    this._pendingBody = [];
     this._sent = false;
+    this._headWritten = false;
+    this._retried = false;
+    this._failed = false;
+    this._responded = false;
+    this._detached = true;
     this.reusedSocket = false;
     this.aborted = false;
+    this.agent = null;
+    this.socket = null;
+    this._sockListeners = null;
     if (cb)
       this.once("response", cb);
-    this._connect();
+    this._start(false);
   }
 
   setHeader(k, v) { this._headers[k.toLowerCase()] = v; return this; }
@@ -4916,31 +5237,65 @@ class ClientRequest extends Writable {
   removeHeader(k) { delete this._headers[k.toLowerCase()]; }
   flushHeaders() { this._sendHead(); }
 
-  _connect() {
+  _start(forceNew) {
     const o = this._options;
-    const port = Number(o.port) || (o.protocol === "https:" ? 443 : 80);
-    const host = o.hostname || o.host || "localhost";
-    if (typeof o.createConnection === "function") {
-      this.socket = o.createConnection(Object.assign({}, o, { port, host }));
+    const agent = o.agent === undefined
+      ? defaultAgentFor(o.protocol || "http:") : o.agent;
+    if (agent && typeof agent.addRequest === "function") {
+      this.agent = agent;
+      agent.addRequest(this, o, !!forceNew);
     } else {
-      this.socket = new Socket();
-      this.socket.connect({ port, host });
+      this.agent = null;
+      this._bindSocket(createSocketForRequest(o), false);
     }
-    this.socket.on("connect", () => this.emit("socket", this.socket));
-    this.socket.on("error", (e) => this.emit("error", e));
-    this.socket.on("data", (chunk) => this._onData(chunk));
-    this.socket.on("end", () => {
-      if (!this.res)
-        this._fail(new Error("socket hang up"));
-      else if (!this.res.complete)
-        this.res.push(null);
+  }
+
+  _bindSocket(sock, reused) {
+    this.socket = sock;
+    this.reusedSocket = !!reused;
+    this._detached = false;
+    const onData = (chunk) => this._onData(chunk);
+    const onEnd = () => this._onSocketEnd();
+    const onError = (err) => this._onSocketError(err);
+    const onClose = () => this._onSocketClose();
+    this._sockListeners = { onData, onEnd, onError, onClose };
+    sock.on("data", onData);
+    sock.on("end", onEnd);
+    sock.on("error", onError);
+    sock.on("close", onClose);
+    sock.ref();
+    sock.resume();
+    const self = this;
+    queueMicrotask(() => {
+      if (!self._failed && !self.aborted && self.socket === sock)
+        self.emit("socket", sock);
     });
+    this._flushHead();
+    this._flushBody();
+  }
+
+  _detachSocket() {
+    if (this._detached)
+      return;
+    this._detached = true;
+    const sock = this.socket;
+    const l = this._sockListeners;
+    if (sock && l) {
+      sock.removeListener("data", l.onData);
+      sock.removeListener("end", l.onEnd);
+      sock.removeListener("error", l.onError);
+      sock.removeListener("close", l.onClose);
+    }
+    this._sockListeners = null;
+    if (sock && !sock.destroyed)
+      sock.pause();
   }
 
   _sendHead() {
     if (this._sent)
       return;
     this._sent = true;
+    this._headWritten = false;
     const o = this._options;
     const path = this.path;
     let head = this.method + " " + path + " HTTP/1.1\r\n";
@@ -4948,7 +5303,8 @@ class ClientRequest extends Writable {
     if (headers.host === undefined)
       headers.host = o.hostname || o.host || "localhost";
     if (headers.connection === undefined)
-      headers.connection = "close";
+      headers.connection = this.agent && this.agent.keepAlive
+        ? "keep-alive" : "close";
     if (headers["user-agent"] === undefined)
       headers["user-agent"] = "qnode/0.1";
     if (this._chunks.length && headers["content-length"] === undefined &&
@@ -4965,19 +5321,38 @@ class ClientRequest extends Writable {
         head += k + ": " + v + "\r\n";
     }
     this._rawHead = head + "\r\n";
-    if (this.socket && !this.socket.destroyed)
-      this.socket.write(Buffer.from(this._rawHead));
+    this._flushHead();
+  }
+
+  _flushHead() {
+    if (!this._sent || this._headWritten)
+      return;
+    if (!this.socket || this.socket.destroyed)
+      return;
+    this._headWritten = true;
+    this.socket.write(Buffer.from(this._rawHead));
+  }
+
+  _flushBody() {
+    if (!this.socket || this.socket.destroyed)
+      return;
+    while (this._pendingBody.length)
+      this.socket.write(this._pendingBody.shift());
   }
 
   _write(chunk, encoding, cb) {
+    const b = toChunk(chunk, encoding);
     if (!this._sent) {
-      this._chunks.push(toChunk(chunk, encoding));
+      this._chunks.push(b);
       this._sendHead();
-      const body = Buffer.concat(this._chunks);
+      const body = this._chunks;
       this._chunks = [];
-      this.socket.write(body);
+      for (const part of body)
+        this._pendingBody.push(part);
+      this._flushBody();
     } else {
-      this.socket.write(toChunk(chunk, encoding));
+      this._pendingBody.push(b);
+      this._flushBody();
     }
     cb();
   }
@@ -4989,19 +5364,32 @@ class ClientRequest extends Writable {
       this._chunks.push(toChunk(chunk, encoding));
     this._sendHead();
     if (this._chunks.length) {
-      this.socket.write(Buffer.concat(this._chunks));
+      for (const part of this._chunks)
+        this._pendingBody.push(part);
       this._chunks = [];
     }
+    this._flushBody();
     this.emit("finish");
     if (cb) queueMicrotask(cb);
     return this;
   }
 
   abort() {
+    if (this.aborted)
+      return this;
     this.aborted = true;
-    if (this.socket)
+    this._failed = true;
+    this._detachSocket();
+    if (this.socket && !this.socket.destroyed)
       this.socket.destroy();
     this.emit("abort");
+    return this;
+  }
+
+  destroy(err) {
+    if (!this.aborted && !this._failed)
+      this.abort();
+    return super.destroy(err);
   }
 
   setTimeout(ms, cb) {
@@ -5026,18 +5414,16 @@ class ClientRequest extends Writable {
       res.headers = parsed.headers;
       res.rawHeaders = parsed.rawHeaders;
       this.res = res;
+      this._responded = true;
       this._respBuf = rest;
-      this._body = [];
       const te = (res.headers["transfer-encoding"] || "").toLowerCase();
       this._chunked = te === "chunked";
-      this._remaining = res.headers["content-length"] !== undefined
-        ? parseInt(res.headers["content-length"], 10) : -1;
+      const noBody = this.method === "HEAD" || res.statusCode === 204 ||
+        res.statusCode === 304;
+      this._remaining = noBody ? 0
+        : (res.headers["content-length"] !== undefined
+          ? parseInt(res.headers["content-length"], 10) : -1);
       this.emit("response", res);
-      if (this._remaining === 0 || (this._remaining < 0 && !this._chunked &&
-                                    this._respBuf.length === 0 &&
-                                    res.headers.connection === "close")) {
-        /* handled below */
-      }
     }
     this._feedResponse();
   }
@@ -5053,9 +5439,7 @@ class ClientRequest extends Writable {
       this._respBuf = d.rest;
       if (d.body.length)
         res.push(d.body);
-      res.complete = true;
-      this._chunked = false;
-      res.push(null);
+      this._finishResponse(this._respBuf.length === 0);
       return;
     }
     if (this._remaining >= 0) {
@@ -5065,10 +5449,8 @@ class ClientRequest extends Writable {
         this._respBuf = this._respBuf.subarray(take);
         this._remaining -= take;
       }
-      if (this._remaining === 0) {
-        res.complete = true;
-        res.push(null);
-      }
+      if (this._remaining === 0)
+        this._finishResponse(this._respBuf.length === 0);
       return;
     }
     if (this._respBuf.length) {
@@ -5077,7 +5459,96 @@ class ClientRequest extends Writable {
     }
   }
 
+  _finishResponse(reusable) {
+    const res = this.res;
+    if (!res || res.complete)
+      return;
+    res.complete = true;
+    const conn = String(res.headers.connection || "").toLowerCase();
+    const canReuse = reusable && conn !== "close";
+    res.push(null);
+    this._releaseSocket(canReuse);
+  }
+
+  _releaseSocket(reusable) {
+    const sock = this.socket;
+    if (!sock)
+      return;
+    this._detachSocket();
+    if (this.agent)
+      this.agent.release(this, sock, reusable);
+    else if (!sock.destroyed)
+      sock.destroy();
+  }
+
+  _onSocketEnd() {
+    if (this._failed)
+      return;
+    if (!this.res) {
+      this._fail(socketHangUp());
+      return;
+    }
+    if (!this.res.complete)
+      this._finishResponse(false);
+  }
+
+  _onSocketError(err) {
+    this._fail(err);
+  }
+
+  _onSocketClose() {
+    if (this._failed)
+      return;
+    if (!this.res || !this.res.complete)
+      this._fail(socketHangUp());
+  }
+
+  _retryAllowed(err) {
+    if (!this.agent || !this.reusedSocket || this._retried)
+      return false;
+    if (this._responded || this._failed || this.aborted)
+      return false;
+    if (this.method !== "GET" && this.method !== "HEAD")
+      return false;
+    if (this._pendingBody.length)
+      return false;
+    const code = err && err.code;
+    if (code === "ECONNRESET" || code === "EPIPE" || code === "ETIMEDOUT")
+      return true;
+    const msg = String((err && err.message) || err || "");
+    return /socket hang up|other side closed|connection reset/i.test(msg);
+  }
+
+  _retry(err) {
+    this._retried = true;
+    const old = this.socket;
+    this._detachSocket();
+    if (old && !old.destroyed)
+      old.destroy();
+    this._sent = false;
+    this._headWritten = false;
+    this._respBuf = undefined;
+    this._remaining = -1;
+    this._chunked = false;
+    this.res = undefined;
+    this._responded = false;
+    this.reusedSocket = false;
+    this._start(true);
+    this._sendHead();
+  }
+
   _fail(err) {
+    if (this._failed)
+      return;
+    if (this._retryAllowed(err)) {
+      this._retry(err);
+      return;
+    }
+    this._failed = true;
+    this._detachSocket();
+    const sock = this.socket;
+    if (sock && !sock.destroyed)
+      sock.destroy();
     if (!this.listenerCount("error")) {
       reportError(err);
       return;
@@ -5103,13 +5574,12 @@ const http = {
   ServerResponse,
   IncomingMessage,
   ClientRequest,
-  Agent: class Agent { constructor(opts) { this.options = opts || {}; } destroy() {} },
+  Agent,
   createServer: (options, listener) => new HttpServer(options, listener),
   request,
   get,
-  globalAgent: { destroy() {} },
 };
-http.globalAgent = new http.Agent();
+http.globalAgent = new Agent({ keepAlive: true });
 
 function httpsNormalize(options) {
   if (typeof options === "string" || options instanceof URL) {
@@ -5140,17 +5610,6 @@ function httpsRequest(options, cb) {
     options.protocol = "https:";
   if (options.servername === undefined)
     options.servername = options.hostname || options.host;
-  if (typeof options.createConnection !== "function") {
-    const tlsOpts = {};
-    for (const k of TLS_REQUEST_OPTIONS)
-      if (options[k] !== undefined)
-        tlsOpts[k] = options[k];
-    options.createConnection = (o) => tls.connect(Object.assign({}, tlsOpts, {
-      port: o.port,
-      host: o.host,
-      servername: tlsOpts.servername || o.host,
-    }));
-  }
   return new ClientRequest(options, cb);
 }
 
@@ -5173,7 +5632,12 @@ const https = Object.assign({}, http, {
     return new HttpsServer(options, listener);
   },
 });
-https.globalAgent = new http.Agent();
+https.Agent = class HttpsAgent extends Agent {};
+https.globalAgent = new https.Agent({ keepAlive: true });
+
+function defaultAgentFor(protocol) {
+  return protocol === "https:" ? https.globalAgent : http.globalAgent;
+}
 
 /* ------------------------------------------------------------------ */
 /* child_process                                                      */
@@ -6834,26 +7298,46 @@ class TLSSocket extends Socket {
       return;
     this._attached = true;
     qjsos.setReadHandler(this._fd, () => this._onTLSReadable());
+    this._applyRef();
     this.resume();
   }
 
   _onTLSReadable() {
     if (this.destroyed || this._fd === undefined)
       return;
-    let r;
-    try {
-      r = native.tlsRead(this._tlsHandle, 65536);
-    } catch (e) {
-      this.destroy(tlsError(e));
-      return;
+    /* SSL_read can leave later records buffered inside OpenSSL even when the
+       socket has no more bytes to report. Drain everything that is already
+       available and push it as one chunk, otherwise the tail of a response
+       can be stranded waiting for a new fd event. */
+    const parts = [];
+    let total = 0;
+    let eof = false;
+    let want = 0;
+    while (total < 4 * 1024 * 1024) {
+      let r;
+      try {
+        r = native.tlsRead(this._tlsHandle, 65536);
+      } catch (e) {
+        this.destroy(tlsError(e));
+        return;
+      }
+      if (r[1]) {
+        want = r[1];
+        break;
+      }
+      const buf = Buffer.from(r[0]);
+      if (buf.length === 0) {
+        eof = true;
+        break;
+      }
+      parts.push(buf);
+      total += buf.length;
     }
-    if (r[1]) {
-      if (r[1] === C.TLS_WANT_WRITE)
-        this._waitTLSEvent(2, () => this._onTLSReadable());
-      return;
+    if (total > 0) {
+      this.bytesRead += total;
+      this.push(parts.length === 1 ? parts[0] : Buffer.concat(parts, total));
     }
-    const buf = Buffer.from(r[0]);
-    if (buf.length === 0) {
+    if (eof) {
       this.readable = false;
       qjsos.setReadHandler(this._fd, null);
       this.push(null);
@@ -6861,8 +7345,16 @@ class TLSSocket extends Socket {
         this.end();
       return;
     }
-    this.bytesRead += buf.length;
-    this.push(buf);
+    if (want === C.TLS_WANT_WRITE) {
+      this._waitTLSEvent(2, () => this._onTLSReadable());
+      return;
+    }
+    if (total >= 4 * 1024 * 1024) {
+      queueMicrotask(() => {
+        if (!this.destroyed && this._fd !== undefined)
+          this._onTLSReadable();
+      });
+    }
   }
 
   _flushWrite(buf, cb) {
@@ -6941,10 +7433,8 @@ class TLSSocket extends Socket {
       else
         self.destroySoon();
     };
-    if (this._pendingWrite)
-      this.once("drain", finish);
-    else
-      finish();
+    this._endFinish = finish;
+    this._maybeFinishEnd();
     return this;
   }
 
@@ -7680,7 +8170,36 @@ function npmSatisfies(version, range) {
 }
 
 const npmPackuments = new Map();
-const NPM_NET_LIMIT = 8;
+/* Network concurrency; override with NPM_NET_LIMIT for tuning. */
+const NPM_NET_LIMIT = Math.max(1, Number(process.env.NPM_NET_LIMIT) || 8);
+
+/* Set QNODE_NPM_PROFILE=1 to print a network/install breakdown. */
+const NPM_PROFILE = !!process.env.QNODE_NPM_PROFILE;
+const npmProfile = { packs: 0, packMs: 0, tarballs: 0, tarMs: 0,
+                     bytes: 0, extractMs: 0, attempts: 0, waitMs: 0,
+                     netMs: 0, netMax: 0, netCount: 0 };
+
+/* Wrap a network task with queue-wait and service-time accounting. */
+function npmProfileFetch(ctx, fn) {
+  if (!NPM_PROFILE)
+    return npmLimit(ctx, fn);
+  const queued = Date.now();
+  return npmLimit(ctx, () => {
+    const started = Date.now();
+    npmProfile.waitMs += started - queued;
+    npmProfile.attempts++;
+    const p = Promise.resolve().then(fn);
+    const done = () => {
+      const dt = Date.now() - started;
+      npmProfile.netMs += dt;
+      npmProfile.netCount++;
+      if (dt > npmProfile.netMax)
+        npmProfile.netMax = dt;
+    };
+    p.then(done, done);
+    return p;
+  });
+}
 
 function npmLimit(ctx, fn) {
   const run = () => {
@@ -7714,10 +8233,11 @@ async function npmFetchPackument(ctx, name) {
     return cached;
   const p = (async () => {
     const url = NPM_REGISTRY + "/" + name.replace("/", "%2f");
+    const started = Date.now();
     let lastErr;
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
-        const res = await npmLimit(ctx, () => fetch(url, {
+        const res = await npmProfileFetch(ctx, () => fetch(url, {
           headers: { accept: "application/vnd.npm.install-v1+json" },
         }));
         if (res.status === 404) {
@@ -7728,6 +8248,8 @@ async function npmFetchPackument(ctx, name) {
         if (!res.ok)
           throw new Error("failed to fetch " + name + ": HTTP " + res.status);
         const doc = await res.json();
+        npmProfile.packs++;
+        npmProfile.packMs += Date.now() - started;
         return doc;
       } catch (e) {
         lastErr = e;
@@ -7933,13 +8455,19 @@ async function npmDownloadTarball(ctx, url) {
   if (cached)
     return cached;
   const p = (async () => {
+    const started = Date.now();
     let lastErr;
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
-        const res = await npmLimit(ctx, () => fetch(url, { acceptEncoding: true }));
+        const res = await npmProfileFetch(ctx, () => fetch(url, { acceptEncoding: true }));
         if (!res.ok)
           throw new Error("HTTP " + res.status + " for " + url);
-        return Buffer.from(await res.arrayBuffer());
+        const arr = await res.arrayBuffer();
+        const buf = Buffer.from(arr);
+        npmProfile.tarballs++;
+        npmProfile.tarMs += Date.now() - started;
+        npmProfile.bytes += buf.length;
+        return buf;
       } catch (e) {
         lastErr = e;
       }
@@ -8009,7 +8537,9 @@ async function npmInstallOne(projectRoot, fromDir, name, range, ctx, chain) {
     const tgz = await npmDownloadTarball(ctx, info.dist.tarball);
     npmIntegrityCheck(tgz, info.dist);
     fsSync.rmSync(target, { recursive: true, force: true });
+    const extractStarted = Date.now();
     npmExtractTarball(tgz, target);
+    npmProfile.extractMs += Date.now() - extractStarted;
     ctx.added++;
     process.stderr.write("qnode install: " + name + "@" + version + "\n");
     return true;
@@ -8101,6 +8631,17 @@ async function npmInstall(args) {
     for (const r of resolved)
       pkg.dependencies[r.name] = "^" + r.version;
     fsSync.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + "\n");
+  }
+
+  if (NPM_PROFILE) {
+    process.stderr.write("qnode profile: packs=" + npmProfile.packs +
+      " pack=" + npmProfile.packMs + "ms tarballs=" + npmProfile.tarballs +
+      " tar=" + npmProfile.tarMs + "ms bytes=" + npmProfile.bytes +
+      " extract=" + npmProfile.extractMs + "ms netlimit=" + NPM_NET_LIMIT +
+      " attempts=" + npmProfile.attempts + " wait=" + npmProfile.waitMs +
+      "ms service=" + npmProfile.netMs + "ms avg=" +
+      (npmProfile.netCount ? (npmProfile.netMs / npmProfile.netCount).toFixed(1) : 0) +
+      "ms max=" + npmProfile.netMax + "ms\n");
   }
 
   const secs = ((Date.now() - started) / 1000).toFixed(2);

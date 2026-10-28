@@ -42,6 +42,20 @@ xoption(QJS_ENABLE_TSAN "Enable ThreadSanitizer (TSan)" OFF)
 xoption(QJS_ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer (UBSan)" OFF)
 xoption(QJS_ENABLE_GC_STRESS "Force a full GC before every allocation (GC stress test)" OFF)
 
+# Use ccache for compilation when it is available. This keeps rebuilds fast
+# after touching headers and makes switching build options much cheaper.
+option(QJS_USE_CCACHE "Use ccache when available" ON)
+if(QJS_USE_CCACHE)
+    find_program(CCACHE_PROGRAM ccache)
+    if(CCACHE_PROGRAM)
+        set(CMAKE_C_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+        set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+        message(STATUS "  ccache: ${CCACHE_PROGRAM}")
+    else()
+        message(STATUS "  ccache: not found")
+    endif()
+endif()
+
 # Used to properly define JS_LIBC_EXTERN.
 add_compile_definitions(QUICKJS_NG_BUILD)
 

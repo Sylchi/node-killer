@@ -125,6 +125,9 @@ extern char **environ;
 typedef struct {
     struct list_head link;
     int fd;
+    /* false means the handler is still polled but does not keep the
+       event loop alive (Node's socket.unref() semantics). */
+    bool is_ref;
     JSValue rw_func[2];
 } JSOSRWHandler;
 
@@ -2351,6 +2354,7 @@ static JSValue js_os_setReadHandler(JSContext *ctx, JSValueConst this_val,
             if (!rh)
                 return JS_EXCEPTION;
             rh->fd = fd;
+            rh->is_ref = true;
             rh->rw_func[0] = JS_NULL;
             rh->rw_func[1] = JS_NULL;
             list_add_tail(&rh->link, &ts->os_rw_handlers);
@@ -2359,6 +2363,49 @@ static JSValue js_os_setReadHandler(JSContext *ctx, JSValueConst this_val,
         rh->rw_func[magic] = JS_DupValue(ctx, func);
     }
     return JS_UNDEFINED;
+}
+
+/* Node-style ref/unref: an unref'd handler is still polled while other work
+   keeps the loop alive, but it does not by itself keep the process running. */
+static JSValue js_os_setHandlerRef(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv)
+{
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    JSThreadState *ts = js_get_thread_state(rt);
+    JSOSRWHandler *rh;
+    int fd, is_ref;
+
+    if (JS_ToInt32(ctx, &fd, argv[0]))
+        return JS_EXCEPTION;
+    is_ref = JS_ToBool(ctx, argv[1]);
+    if (is_ref < 0)
+        return JS_EXCEPTION;
+    rh = find_rh(ts, fd);
+    if (rh)
+        rh->is_ref = is_ref != 0;
+    return JS_UNDEFINED;
+}
+
+/* True when at least one ref'd handler can produce events. */
+static bool js_os_has_ref_handler(JSThreadState *ts)
+{
+    JSOSRWHandler *rh;
+    struct list_head *el;
+
+    list_for_each(el, &ts->os_rw_handlers) {
+        rh = list_entry(el, JSOSRWHandler, link);
+        if (rh->is_ref &&
+            (!JS_IsNull(rh->rw_func[0]) || !JS_IsNull(rh->rw_func[1])))
+            return true;
+    }
+#ifdef USE_WORKER
+    list_for_each(el, &ts->port_list) {
+        JSWorkerMessageHandler *port = list_entry(el, JSWorkerMessageHandler, link);
+        if (!JS_IsNull(port->on_message_func))
+            return true;
+    }
+#endif
+    return false;
 }
 
 static JSOSSignalHandler *find_sh(JSThreadState *ts, int sig_num)
@@ -2839,7 +2886,7 @@ static int js_os_poll_internal(JSContext *ctx, int timeout_ms, int flags)
         if (min_delay == 0)
             return 0; // expired timer
         if (min_delay < 0)
-            if (list_empty(&ts->os_rw_handlers) && list_empty(&ts->port_list))
+            if (!js_os_has_ref_handler(ts))
                 return -1; /* no more events */
     }
 
@@ -2982,7 +3029,7 @@ static int js_os_poll_internal(JSContext *ctx, int timeout_ms, int flags)
         if (min_delay == 0)
             return 0; // expired timer
         if (min_delay < 0)
-            if (list_empty(&ts->os_rw_handlers) && list_empty(&ts->port_list))
+            if (!js_os_has_ref_handler(ts))
                 return -1; /* no more events */
     }
 
@@ -3136,7 +3183,7 @@ static int js_os_poll_internal(JSContext *ctx, int timeout_ms, int flags)
         if (min_delay == 0)
             return 0; // expired timer
         if (min_delay < 0)
-            if (list_empty(&ts->os_rw_handlers) && list_empty(&ts->port_list))
+            if (!js_os_has_ref_handler(ts))
                 return -1; /* no more events */
     }
 
@@ -4694,6 +4741,7 @@ static const JSCFunctionListEntry js_os_funcs[] = {
     JS_CFUNC_DEF("rename", 2, js_os_rename ),
     JS_CFUNC_MAGIC_DEF("setReadHandler", 2, js_os_setReadHandler, 0 ),
     JS_CFUNC_MAGIC_DEF("setWriteHandler", 2, js_os_setReadHandler, 1 ),
+    JS_CFUNC_DEF("setHandlerRef", 2, js_os_setHandlerRef ),
     JS_CFUNC_DEF("signal", 2, js_os_signal ),
     OS_FLAG(SIGINT),
     OS_FLAG(SIGABRT),
@@ -5153,7 +5201,8 @@ int js_std_has_pending(JSContext *ctx)
         return 1;
     list_for_each(el, &ts->os_rw_handlers) {
         rh = list_entry(el, JSOSRWHandler, link);
-        if (!JS_IsNull(rh->rw_func[0]) || !JS_IsNull(rh->rw_func[1]))
+        if (rh->is_ref &&
+            (!JS_IsNull(rh->rw_func[0]) || !JS_IsNull(rh->rw_func[1])))
             return 1;
     }
 #ifdef USE_WORKER
@@ -5220,14 +5269,29 @@ JSValue js_std_await(JSContext *ctx, JSValue obj)
             JS_FreeValue(ctx, obj);
             break;
         } else if (state == JS_PROMISE_PENDING) {
+            JSRuntime *rt2 = JS_GetRuntime(ctx);
             JSContext *ctx1;
             int err;
-            err = JS_ExecutePendingJob(JS_GetRuntime(ctx), &ctx1);
+
+            /* Drain the whole job queue before polling, like js_std_loop
+               does. Running a single job and then polling lets an I/O
+               callback observe half-finished microtask state (for example
+               a stream whose flow was scheduled but has not run yet), and
+               such callbacks then see stale scheduling flags. */
+            for (;;) {
+                err = JS_ExecutePendingJob(rt2, &ctx1);
+                if (err <= 0)
+                    break;
+            }
             if (err < 0) {
                 js_std_dump_error(ctx1);
+                break;
             }
-            if (err == 0)
-                js_std_promise_rejection_check(ctx);
+            js_std_promise_rejection_check(ctx);
+
+            /* A job may have settled the promise; re-check before blocking. */
+            if (JS_PromiseState(ctx, obj) != JS_PROMISE_PENDING)
+                continue;
             if (ts->can_js_os_poll)
                 js_os_poll(ctx);
         } else {
