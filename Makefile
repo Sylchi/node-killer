@@ -140,10 +140,14 @@ test262-check: $(QJS)
 microbench: $(QJS)
 	$(QJS) tests/microbench.js
 
+netstack-test: $(BUILD_DIR)
+	cmake --build $(BUILD_DIR) --target netstack_test
+	$(BUILD_DIR)/netstack-test
+
 unicode_gen: $(BUILD_DIR)
 	cmake --build $(BUILD_DIR) --target unicode_gen
 
 libunicode-table.h: unicode_gen
 	$(BUILD_DIR)/unicode_gen unicode $@
 
-.PHONY: all amalgam ctest cxxtest debug fuzz jscheck install clean codegen distclean stats test test262 test262-update test262-check microbench unicode_gen $(QJS) $(QJSC)
+.PHONY: all amalgam ctest cxxtest debug fuzz jscheck install clean codegen distclean stats test test262 test262-update test262-check microbench netstack-test unicode_gen $(QJS) $(QJSC)

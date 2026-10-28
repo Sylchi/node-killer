@@ -464,6 +464,16 @@ add_executable(api-test
 target_compile_definitions(api-test PRIVATE ${qjs_defines})
 target_link_libraries(api-test PRIVATE qjs qjs-libc)
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # Owned TCP/IP stack prototype (docs/netstack.md).
+    add_library(netstack STATIC netstack.c)
+    add_executable(netstack_test tests/netstack_test.c)
+    set_target_properties(netstack_test PROPERTIES
+        OUTPUT_NAME "netstack-test"
+    )
+    target_link_libraries(netstack_test PRIVATE netstack)
+endif()
+
 add_executable(lre-test
     lre-test.c
     libregexp.c
