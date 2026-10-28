@@ -418,6 +418,10 @@ else()
     )
 endif()
 add_custom_target(node_bootstrap_header DEPENDS ${NODE_BOOTSTRAP_H})
+# node.c includes the generated header, but some generators do not pick up
+# generated headers from depfiles on the first build. Make the dependency
+# explicit so bootstrap edits always recompile node.c.
+set_source_files_properties(node.c PROPERTIES OBJECT_DEPENDS ${NODE_BOOTSTRAP_H})
 
 # The qnode executable: Node.js-compatible CLI.
 add_executable(qnode_exe qnode.c)

@@ -7654,13 +7654,22 @@ function npmRangeAtoms(range) {
   return atoms;
 }
 
+function npmIsAnyRange(range) {
+  const text = String(range === undefined || range === null ? "" : range)
+    .trim();
+  return text === "" || text === "*" || text === "x" || text === "X" ||
+    text === "latest";
+}
+
 function npmSatisfies(version, range) {
-  if (!range)
+  if (npmIsAnyRange(range))
     return true;
   const v = typeof version === "string" ? npmParseVersion(version) : version;
   if (!v)
     return false;
   for (const alt of String(range).split("||")) {
+    if (npmIsAnyRange(alt))
+      return true;
     const atoms = npmRangeAtoms(alt);
     if (atoms === null)
       continue;
