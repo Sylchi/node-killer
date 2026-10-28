@@ -1607,6 +1607,36 @@ static JSValue js_node_crc32(JSContext *ctx, JSValueConst this_val,
 
 #endif /* QNODE_HAVE_ZLIB */
 
+/* UTF-8 conversion. The engine already has a fast decoder, so expose it
+   instead of decoding byte by byte in JS (which costs ~300ns/byte). */
+static JSValue js_node_utf8_decode(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv)
+{
+    NodeBytes in;
+    JSValue r;
+
+    if (node_get_bytes(ctx, argv[0], &in))
+        return JS_EXCEPTION;
+    r = JS_NewStringLen(ctx, (const char *)in.data, in.len);
+    node_free_bytes(ctx, &in);
+    return r;
+}
+
+static JSValue js_node_utf8_encode(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv)
+{
+    const char *p;
+    size_t len;
+    JSValue r;
+
+    p = JS_ToCStringLen(ctx, &len, argv[0]);
+    if (!p)
+        return JS_EXCEPTION;
+    r = JS_NewUint8ArrayCopy(ctx, (const uint8_t *)p, len);
+    JS_FreeCString(ctx, p);
+    return r;
+}
+
 #ifdef QNODE_HAVE_OPENSSL
 
 #define NODE_TLS_MAX_CTX 256
@@ -2315,6 +2345,8 @@ static const JSCFunctionListEntry js_node_funcs[] = {
     JS_CFUNC_DEF("uname", 0, js_node_uname),
     JS_CFUNC_DEF("cpuCount", 0, js_node_cpu_count),
     JS_CFUNC_DEF("meminfo", 0, js_node_meminfo),
+    JS_CFUNC_DEF("utf8Decode", 1, js_node_utf8_decode),
+    JS_CFUNC_DEF("utf8Encode", 1, js_node_utf8_encode),
 
     JS_CFUNC_DEF("socket", 3, js_node_socket),
     JS_CFUNC_DEF("bind", 3, js_node_bind),

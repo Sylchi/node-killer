@@ -116,8 +116,18 @@ function check(res, syscall, path) {
 /* encodings                                                          */
 /* ------------------------------------------------------------------ */
 
-/* Encode a JS string to UTF-8 bytes, replacing lone surrogates. */
+/* Encode a JS string to UTF-8 bytes, replacing lone surrogates. The native
+   encoder works on the engine's UTF-8 form, which keeps lone surrogates as
+   WTF-8; Node replaces them with U+FFFD, so fall back to the JS encoder for
+   the (rare) strings that contain any surrogate code unit. */
 function utf8Encode(str) {
+  if (typeof str === "string" &&
+      !/[\uD800-\uDFFF]/.test(str))
+    return native.utf8Encode(str);
+  return utf8EncodeJS(str);
+}
+
+function utf8EncodeJS(str) {
   const out = [];
   const n = str.length;
   for (let i = 0; i < n; i++) {
@@ -146,8 +156,20 @@ function utf8Encode(str) {
   return out;
 }
 
-/* Decode UTF-8 bytes, replacing malformed sequences with U+FFFD. */
+/* Decode UTF-8 bytes, replacing malformed sequences with U+FFFD. The native
+   decoder is used for buffers; the JS path only handles plain arrays. */
 function utf8Decode(buf, start, end) {
+  if (start === undefined)
+    start = 0;
+  if (end === undefined)
+    end = buf.length;
+  if (buf instanceof Uint8Array)
+    return native.utf8Decode(start === 0 && end === buf.length
+      ? buf : buf.subarray(start, end));
+  return utf8DecodeJS(buf, start, end);
+}
+
+function utf8DecodeJS(buf, start, end) {
   let out = "", chunk = [];
   const push = (s) => {
     chunk.push(s);
@@ -8295,7 +8317,18 @@ function npmExtractTarball(buf, dest) {
   let tar = buf;
   if (buf.length > 2 && buf[0] === 0x1f && buf[1] === 0x8b)
     tar = zlib.gunzipSync(buf);
+  npmPkgCache.delete(dest);
   fsSync.mkdirSync(dest, { recursive: true });
+  const destBase = pathResolve(dest);
+  const destPrefix = destBase + "/";
+  const madeDirs = new Set([destBase]);
+  /* One mkdir per directory instead of one per extracted file. */
+  const ensureDir = (dir) => {
+    if (madeDirs.has(dir))
+      return;
+    fsSync.mkdirSync(dir, { recursive: true });
+    madeDirs.add(dir);
+  };
   let off = 0;
   let override = null;
   let count = 0;
@@ -8353,25 +8386,29 @@ function npmExtractTarball(buf, dest) {
     if (!rel)
       continue;
     const out = pathJoin(dest, rel);
-    const base = pathResolve(dest);
-    if (pathResolve(out) !== base && !pathResolve(out).startsWith(base + "/"))
+    const outResolved = pathResolve(out);
+    if (outResolved !== destBase && !outResolved.startsWith(destPrefix))
       continue;
     if (type === "5") {
-      fsSync.mkdirSync(out, { recursive: true });
+      ensureDir(outResolved);
       continue;
     }
     if (type === "2") {
       const link = npmTarField(header, 157, 100);
-      fsSync.mkdirSync(pathDirname(out), { recursive: true });
+      ensureDir(pathResolve(pathDirname(out)));
       try { fsSync.unlinkSync(out); } catch (e) { /* ignore */ }
       try { fsSync.symlinkSync(link, out); } catch (e) { /* ignore */ }
       continue;
     }
     if (type !== "0" && type !== "\0")
       continue;
-    fsSync.mkdirSync(pathDirname(out), { recursive: true });
+    ensureDir(pathResolve(pathDirname(out)));
     fsSync.writeFileSync(out, tar.subarray(dataOff, dataOff + size));
-    try { fsSync.chmodSync(out, mode & 0o777); } catch (e) { /* ignore */ }
+    /* 0644 is what writeFileSync already produces; only chmod the rest. */
+    const perm = mode & 0o777;
+    if (perm !== 0o644) {
+      try { fsSync.chmodSync(out, perm); } catch (e) { /* ignore */ }
+    }
     count++;
   }
   return count;
@@ -8412,12 +8449,24 @@ function npmPackageDir(root, name) {
   return pathJoin(root, "node_modules", ...name.split("/"));
 }
 
+/* Memoised: dependency resolution probes node_modules for every ancestor of
+   every dependency edge, which used to cost tens of thousands of stat/open
+   calls per install. Entries are dropped when a package directory is
+   (re)written. */
+const npmPkgCache = new Map();
+
 function npmReadPackageJson(dir) {
+  const cached = npmPkgCache.get(dir);
+  if (cached !== undefined)
+    return cached;
+  let pkg = null;
   try {
-    return JSON.parse(fsSync.readFileSync(pathJoin(dir, "package.json"), "utf8"));
+    pkg = JSON.parse(fsSync.readFileSync(pathJoin(dir, "package.json"), "utf8"));
   } catch (e) {
-    return null;
+    pkg = null;
   }
+  npmPkgCache.set(dir, pkg);
+  return pkg;
 }
 
 function npmFindExisting(fromDir, projectRoot, name, range) {
@@ -8502,6 +8551,20 @@ async function npmProcessDeps(projectRoot, dir, ctx, chain) {
 }
 
 async function npmInstallOne(projectRoot, fromDir, name, range, ctx, chain) {
+  /* npm aliases: "dep": "npm:real-name@^1.2.3" installs real-name into the
+     directory for dep. */
+  let sourceName = name;
+  if (typeof range === "string" && range.lastIndexOf("npm:", 0) === 0) {
+    const spec = range.slice(4);
+    const at = spec.lastIndexOf("@");
+    if (at > 0) {
+      sourceName = spec.slice(0, at);
+      range = spec.slice(at + 1);
+    } else {
+      sourceName = spec;
+      range = "*";
+    }
+  }
   const existing = npmFindExisting(fromDir, projectRoot, name, range);
   if (existing) {
     if (chain.has(existing.dir))
@@ -8514,10 +8577,10 @@ async function npmInstallOne(projectRoot, fromDir, name, range, ctx, chain) {
     return { name, version: existing.pkg.version, installed: false };
   }
 
-  const doc = await npmFetchPackument(ctx, name);
+  const doc = await npmFetchPackument(ctx, sourceName);
   const version = npmLatestVersion(doc, range);
   if (!version)
-    throw new Error("No matching version found for " + name + "@" + range);
+    throw new Error("No matching version found for " + sourceName + "@" + range);
   const info = (doc.versions || {})[version];
   if (!info || !info.dist || !info.dist.tarball)
     throw new Error("No tarball for " + name + "@" + version);
@@ -8631,6 +8694,7 @@ async function npmInstall(args) {
     for (const r of resolved)
       pkg.dependencies[r.name] = "^" + r.version;
     fsSync.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + "\n");
+    npmPkgCache.delete(cwd);
   }
 
   if (NPM_PROFILE) {
