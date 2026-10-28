@@ -2793,6 +2793,33 @@ static int js_os_run_timers(JSRuntime *rt, JSContext *ctx, JSThreadState *ts, in
     return 0;
 }
 
+/* Compute the delay until the next timer without running any callback.
+   min_delay is 0 when a timer is already due, -1 when no timers exist. */
+static void js_os_next_timer_delay(JSThreadState *ts, int *min_delay)
+{
+    JSOSTimer *th;
+    struct list_head *el;
+    int64_t cur_time, delay;
+
+    if (list_empty(&ts->os_timers)) {
+        *min_delay = -1;
+        return;
+    }
+
+    cur_time = js__hrtime_ms();
+    *min_delay = INT32_MAX;
+
+    list_for_each(el, &ts->os_timers) {
+        th = list_entry(el, JSOSTimer, link);
+        delay = th->timeout - cur_time;
+        if (delay <= 0) {
+            *min_delay = 0;
+            return;
+        }
+        *min_delay = min_int(*min_delay, delay);
+    }
+}
+
 #ifdef USE_WORKER
 
 #ifdef _WIN32
@@ -3110,7 +3137,7 @@ static int js_os_poll_internal(JSContext *ctx, int timeout_ms, int flags)
     ev_io *port_ios = NULL;
     int port_count = 0, n;
     ev_timer timer;
-    bool timer_started = false, timer_fired = false;
+    bool timer_started = false, timer_fired = false, timers_due = false;
     JSEvPollQueue *q = &ts->ev_queue;
     int dispatched = 0, i;
 
@@ -3134,10 +3161,8 @@ static int js_os_poll_internal(JSContext *ctx, int timeout_ms, int flags)
     }
 
     if (flags & JS_OS_POLL_RUN_TIMERS) {
-        if (js_os_run_timers(rt, ctx, ts, &min_delay))
-            return -1;
-        if (min_delay == 0)
-            return 0; // expired timer
+        js_os_next_timer_delay(ts, &min_delay);
+        timers_due = (min_delay == 0);
         if (min_delay < 0)
             if (!js_os_has_ref_handler(ts))
                 return -1; /* no more events */
@@ -3202,14 +3227,19 @@ static int js_os_poll_internal(JSContext *ctx, int timeout_ms, int flags)
     q->oom = false;
     qn_cb_this = 0;
 
-    if (min_delay >= 0) {
+    if (!timers_due && min_delay >= 0) {
         ev_timer_init(&timer, js_ev_poll_timer_cb, min_delay / 1000.0, 0.);
         timer.data = &timer_fired;
         ev_timer_start(loop, &timer);
         timer_started = true;
     }
 
-    ev_run(loop, 0);
+    /* A due timer must not run before I/O that is already ready: check the
+       fds without blocking first and only fire the timer if none fired. */
+    if (timers_due)
+        ev_run(loop, EVRUN_NOWAIT);
+    else
+        ev_run(loop, 0);
 
     if (timer_started)
         ev_timer_stop(loop, &timer);
@@ -3262,6 +3292,15 @@ static int js_os_poll_internal(JSContext *ctx, int timeout_ms, int flags)
 #ifdef USE_WORKER
 done:
 #endif
+    /* Ready I/O wins over an overdue timer. Defer the timer to the next
+       poll turn when at least one descriptor was dispatched. */
+    if (timers_due && dispatched == 0) {
+        int timer_delay;
+        if (js_os_run_timers(rt, ctx, ts, &timer_delay))
+            ret = -1;
+        else
+            timer_fired = true;
+    }
     qn_poll_iters++;
     qn_cb_total += qn_cb_this;
     if ((uint64_t)qn_cb_this > qn_cb_max)
@@ -3290,6 +3329,7 @@ static int js_os_poll_internal(JSContext *ctx, int timeout_ms, int flags)
     JSOSRWHandler *rh;
     struct list_head *el;
     struct pollfd *pfd, *pfds, pfds_local[64];
+    bool timers_due = false;
 
     min_delay = timeout_ms;
 
@@ -3311,10 +3351,8 @@ static int js_os_poll_internal(JSContext *ctx, int timeout_ms, int flags)
     }
 
     if (flags & JS_OS_POLL_RUN_TIMERS) {
-        if (js_os_run_timers(rt, ctx, ts, &min_delay))
-            return -1;
-        if (min_delay == 0)
-            return 0; // expired timer
+        js_os_next_timer_delay(ts, &min_delay);
+        timers_due = (min_delay == 0);
         if (min_delay < 0)
             if (!js_os_has_ref_handler(ts))
                 return -1; /* no more events */
@@ -3345,6 +3383,11 @@ static int js_os_poll_internal(JSContext *ctx, int timeout_ms, int flags)
             while (nanosleep(&ts_sleep, &ts_sleep)
                 && errno == EINTR
                 && mask == os_pending_signals);
+        }
+        if (timers_due) {
+            int timer_delay;
+            if (js_os_run_timers(rt, ctx, ts, &timer_delay))
+                return -1;
         }
         return 0;
     }
@@ -3421,6 +3464,12 @@ static int js_os_poll_internal(JSContext *ctx, int timeout_ms, int flags)
 done:
     if (pfds != pfds_local)
         js_free(ctx, pfds);
+    /* Ready I/O wins over an overdue timer. */
+    if (timers_due && nfds == 0 && ret == 0) {
+        int timer_delay;
+        if (js_os_run_timers(rt, ctx, ts, &timer_delay))
+            ret = -1;
+    }
     return ret;
 }
 
