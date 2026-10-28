@@ -21,6 +21,7 @@
 #include <sys/types.h>
 #include <sys/time.h>
 #include <sys/resource.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <sys/utsname.h>
@@ -31,23 +32,19 @@
 #include <netdb.h>
 #include <pwd.h>
 
-#ifdef QNODE_HAVE_ZLIB
 #include <zlib.h>
-#endif
-
-#ifdef QNODE_HAVE_OPENSSL
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 #include <openssl/pem.h>
 #include <openssl/bio.h>
-#endif
 
 #include "cutils.h"
 #include "quickjs.h"
 #include "quickjs-libc.h"
 #include "node.h"
+#include "qjs-wasm.h"
 
 #ifndef NODE_PATH_MAX
 #define NODE_PATH_MAX 4096
@@ -826,6 +823,21 @@ static JSValue js_node_read(JSContext *ctx, JSValueConst this_val,
     return node_ok(ctx, val);
 }
 
+/* poll(fd, events, 0): non-destructive readiness check, for diagnostics. */
+static JSValue js_node_poll1(JSContext *ctx, JSValueConst this_val,
+                             int argc, JSValueConst *argv)
+{
+    int32_t fd, events;
+    struct pollfd pfd;
+    if (JS_ToInt32(ctx, &fd, argv[0]) || JS_ToInt32(ctx, &events, argv[1]))
+        return JS_EXCEPTION;
+    pfd.fd = fd;
+    pfd.events = (short)events;
+    pfd.revents = 0;
+    int r = poll(&pfd, 1, 0);
+    return JS_NewInt32(ctx, r < 0 ? -errno : pfd.revents);
+}
+
 static JSValue js_node_write(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv)
 {
@@ -955,6 +967,52 @@ static JSValue js_node_cpu_count(JSContext *ctx, JSValueConst this_val,
 {
     long n = sysconf(_SC_NPROCESSORS_ONLN);
     return JS_NewInt32(ctx, n > 0 ? n : 1);
+}
+
+/* Real footprint of this process plus the engine's own accounting. */
+static JSValue js_node_memory_usage(JSContext *ctx, JSValueConst this_val,
+                                    int argc, JSValueConst *argv)
+{
+    JSMemoryUsage m;
+    uint64_t rss = 0;
+    FILE *f = fopen("/proc/self/statm", "r");
+    if (f) {
+        unsigned long vms = 0, res = 0;
+        if (fscanf(f, "%lu %lu", &vms, &res) == 2)
+            rss = (uint64_t)res * (uint64_t)sysconf(_SC_PAGESIZE);
+        fclose(f);
+    }
+    JS_ComputeMemoryUsage(JS_GetRuntime(ctx), &m);
+    JSValue arr = JS_NewArray(ctx);
+    JS_SetPropertyUint32(ctx, arr, 0, JS_NewFloat64(ctx, (double)rss));
+    JS_SetPropertyUint32(ctx, arr, 1, JS_NewFloat64(ctx, (double)m.malloc_size));
+    JS_SetPropertyUint32(ctx, arr, 2, JS_NewFloat64(ctx, (double)m.memory_used_size));
+    JS_SetPropertyUint32(ctx, arr, 3, JS_NewFloat64(ctx, (double)m.binary_object_size));
+    JS_SetPropertyUint32(ctx, arr, 4, JS_NewFloat64(ctx, (double)m.binary_object_size));
+    return arr;
+}
+
+/* getrusage(RUSAGE_SELF), in the units Node reports. */
+static JSValue js_node_rusage(JSContext *ctx, JSValueConst this_val,
+                              int argc, JSValueConst *argv)
+{
+    struct rusage ru;
+    JSValue arr;
+    if (getrusage(RUSAGE_SELF, &ru))
+        return node_err(ctx, JS_NULL, errno);
+    arr = JS_NewArray(ctx);
+    JS_SetPropertyUint32(ctx, arr, 0, JS_NewFloat64(ctx,
+        ru.ru_utime.tv_sec * 1e6 + ru.ru_utime.tv_usec));
+    JS_SetPropertyUint32(ctx, arr, 1, JS_NewFloat64(ctx,
+        ru.ru_stime.tv_sec * 1e6 + ru.ru_stime.tv_usec));
+    JS_SetPropertyUint32(ctx, arr, 2, JS_NewFloat64(ctx, (double)ru.ru_maxrss));
+    JS_SetPropertyUint32(ctx, arr, 3, JS_NewFloat64(ctx, (double)ru.ru_minflt));
+    JS_SetPropertyUint32(ctx, arr, 4, JS_NewFloat64(ctx, (double)ru.ru_majflt));
+    JS_SetPropertyUint32(ctx, arr, 5, JS_NewFloat64(ctx, (double)ru.ru_nvcsw));
+    JS_SetPropertyUint32(ctx, arr, 6, JS_NewFloat64(ctx, (double)ru.ru_nivcsw));
+    JS_SetPropertyUint32(ctx, arr, 7, JS_NewFloat64(ctx, (double)ru.ru_inblock));
+    JS_SetPropertyUint32(ctx, arr, 8, JS_NewFloat64(ctx, (double)ru.ru_oublock));
+    return arr;
 }
 
 static JSValue js_node_meminfo(JSContext *ctx, JSValueConst this_val,
@@ -1446,8 +1504,6 @@ static JSValue js_node_waitpid(JSContext *ctx, JSValueConst this_val,
     return node_ok(ctx, arr);
 }
 
-#ifdef QNODE_HAVE_ZLIB
-
 /* compress(data, windowBits, level, memLevel, strategy) */
 static JSValue js_node_zlib_compress(JSContext *ctx, JSValueConst this_val,
                                      int argc, JSValueConst *argv)
@@ -1605,8 +1661,6 @@ static JSValue js_node_crc32(JSContext *ctx, JSValueConst this_val,
     return JS_NewUint32(ctx, (uint32_t)crc);
 }
 
-#endif /* QNODE_HAVE_ZLIB */
-
 /* UTF-8 conversion. The engine already has a fast decoder, so expose it
    instead of decoding byte by byte in JS (which costs ~300ns/byte). */
 static JSValue js_node_utf8_decode(JSContext *ctx, JSValueConst this_val,
@@ -1636,8 +1690,6 @@ static JSValue js_node_utf8_encode(JSContext *ctx, JSValueConst this_val,
     JS_FreeCString(ctx, p);
     return r;
 }
-
-#ifdef QNODE_HAVE_OPENSSL
 
 #define NODE_TLS_MAX_CTX 256
 #define NODE_TLS_MAX_CONN 1024
@@ -2292,8 +2344,6 @@ static JSValue js_node_digest(JSContext *ctx, JSValueConst this_val,
     return val;
 }
 
-#endif /* QNODE_HAVE_OPENSSL */
-
 /* ---------------- native object ---------------- */
 
 static const JSCFunctionListEntry js_node_funcs[] = {
@@ -2334,6 +2384,7 @@ static const JSCFunctionListEntry js_node_funcs[] = {
     JS_CFUNC_DEF("open", 3, js_node_open),
     JS_CFUNC_DEF("read", 2, js_node_read),
     JS_CFUNC_DEF("write", 2, js_node_write),
+    JS_CFUNC_DEF("poll1", 2, js_node_poll1),
     JS_CFUNC_DEF("close", 1, js_node_close),
     JS_CFUNC_DEF("fsync", 1, js_node_fsync),
     JS_CFUNC_DEF("ftruncate", 2, js_node_ftruncate),
@@ -2345,6 +2396,8 @@ static const JSCFunctionListEntry js_node_funcs[] = {
     JS_CFUNC_DEF("uname", 0, js_node_uname),
     JS_CFUNC_DEF("cpuCount", 0, js_node_cpu_count),
     JS_CFUNC_DEF("meminfo", 0, js_node_meminfo),
+    JS_CFUNC_DEF("memoryUsage", 0, js_node_memory_usage),
+    JS_CFUNC_DEF("rusage", 0, js_node_rusage),
     JS_CFUNC_DEF("utf8Decode", 1, js_node_utf8_decode),
     JS_CFUNC_DEF("utf8Encode", 1, js_node_utf8_encode),
 
@@ -2363,12 +2416,9 @@ static const JSCFunctionListEntry js_node_funcs[] = {
     JS_CFUNC_DEF("spawn", 6, js_node_spawn),
     JS_CFUNC_DEF("waitpid", 2, js_node_waitpid),
     JS_CFUNC_DEF("requireEsm", 1, js_node_require_esm),
-#ifdef QNODE_HAVE_ZLIB
     JS_CFUNC_DEF("zlibCompress", 5, js_node_zlib_compress),
     JS_CFUNC_DEF("zlibDecompress", 2, js_node_zlib_decompress),
     JS_CFUNC_DEF("crc32", 2, js_node_crc32),
-#endif
-#ifdef QNODE_HAVE_OPENSSL
     JS_CFUNC_DEF("tlsClientInit", 5, js_node_tls_client_init),
     JS_CFUNC_DEF("tlsServerContext", 3, js_node_tls_server_context),
     JS_CFUNC_DEF("tlsAccept", 2, js_node_tls_accept),
@@ -2381,7 +2431,6 @@ static const JSCFunctionListEntry js_node_funcs[] = {
     JS_CFUNC_DEF("tlsPeerCert", 1, js_node_tls_peer_cert),
     JS_CFUNC_DEF("tlsInfo", 1, js_node_tls_info),
     JS_CFUNC_DEF("digest", 2, js_node_digest),
-#endif
 };
 
 /* ---------------- module loading ---------------- */
@@ -2660,6 +2709,9 @@ int js_node_init(JSContext *ctx, JSRuntime *rt)
     /* qjs: builtin modules used by the bootstrap */
     js_init_module_std(ctx, "qjs:std");
     js_init_module_os(ctx, "qjs:os");
+
+    if (js_wasm_init(ctx) < 0)
+        return -1;
 
     JSValue global = JS_GetGlobalObject(ctx);
 

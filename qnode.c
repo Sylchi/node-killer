@@ -14,6 +14,7 @@
 #include "quickjs.h"
 #include "quickjs-libc.h"
 #include "node.h"
+#include "qjs-wasm.h"
 
 #ifndef QNODE_VERSION
 #define QNODE_VERSION "0.1.0"
@@ -135,16 +136,25 @@ static void node_rejection_tracker(JSContext *ctx, JSValueConst promise,
                                    JSValueConst reason, bool is_handled,
                                    void *opaque)
 {
-    (void)promise;
-    if (is_handled)
-        return;
-    JSValue global = JS_GetGlobalObject(ctx);
-    JSValue fn = JS_GetPropertyStr(ctx, global, "__qnode_on_unhandled");
+    JSValue global, fn, args[3], r;
+
+    (void)opaque;
+    /* The tracker fires as soon as a promise is rejected, before a handler
+       can be attached in the same turn.  Let the bootstrap defer the report
+       to a microtask and cancel it when the promise becomes handled. */
+    global = JS_GetGlobalObject(ctx);
+    fn = JS_GetPropertyStr(ctx, global, "__qnode_track_rejection");
     if (JS_IsFunction(ctx, fn)) {
-        JSValue r = JS_Call(ctx, fn, JS_UNDEFINED, 1, &reason);
+        args[0] = JS_DupValue(ctx, promise);
+        args[1] = JS_DupValue(ctx, reason);
+        args[2] = JS_NewBool(ctx, is_handled);
+        r = JS_Call(ctx, fn, JS_UNDEFINED, 3, args);
         if (JS_IsException(r))
             js_std_dump_error(ctx);
         JS_FreeValue(ctx, r);
+        JS_FreeValue(ctx, args[0]);
+        JS_FreeValue(ctx, args[1]);
+        JS_FreeValue(ctx, args[2]);
     }
     JS_FreeValue(ctx, fn);
     JS_FreeValue(ctx, global);
@@ -292,6 +302,37 @@ int main(int argc, char **argv)
     if (js_node_start(ctx) < 0) {
         report_exception(ctx, &q);
         goto done;
+    }
+
+    /* A .wasm entry point is a WASI command, not a JS module. */
+    if (!install_mode && !eval_src && script) {
+        size_t slen = strlen(script);
+        if (slen > 5 && !strcmp(script + slen - 5, ".wasm")) {
+            int wargc = 1 + (argc - first_arg);
+            const char **wargv = malloc(sizeof(char *) * wargc);
+            JSValue r;
+            int i;
+            if (!wargv) {
+                fprintf(stderr, "qnode: out of memory\n");
+                q.exit_code = 1;
+                goto done;
+            }
+            wargv[0] = script;
+            for (i = 0; i < argc - first_arg; i++)
+                wargv[1 + i] = argv[first_arg + i];
+            r = js_wasm_run_file(ctx, script, wargc, wargv);
+            free(wargv);
+            if (JS_IsException(r)) {
+                report_exception(ctx, &q);
+                q.exit_code = 1;
+            } else {
+                int32_t code = 0;
+                JS_ToInt32(ctx, &code, r);
+                q.exit_code = code;
+            }
+            JS_FreeValue(ctx, r);
+            goto done;
+        }
     }
 
     /* process.argv = [execPath, script|"-e", ...args] */

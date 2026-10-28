@@ -1,0 +1,35 @@
+{
+  "qjs -c": {
+    "fib": 82.6,
+    "loop": 699.4,
+    "floatloop": 729.4,
+    "json": 642.6,
+    "regex": 250.6,
+    "sort": 190.8,
+    "array": 155.6,
+    "string": 31.2,
+    "object": 170.4
+  },
+  "qjsc+cc": {
+    "fib": 81.6,
+    "loop": 632.9,
+    "floatloop": 701.2,
+    "json": 581.0,
+    "regex": 295.4,
+    "sort": 192.9,
+    "array": 153.7,
+    "string": 29.2,
+    "object": 171.1
+  },
+  "qnode": {
+    "fib": 81.7,
+    "loop": 647.2,
+    "floatloop": 722.9,
+    "json": 614.2,
+    "regex": 235.9,
+    "sort": 193.6,
+    "array": 153.9,
+    "string": 29.5,
+    "object": 163.9
+  }
+}

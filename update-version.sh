@@ -23,10 +23,6 @@ sed -i.bak \
     -e "s/^#define QJS_VERSION_PATCH .*/#define QJS_VERSION_PATCH $PATCH/" \
     quickjs.h
 
-sed -i.bak \
-    -e "s/^  version: '.*'/  version: '$VERSION'/" \
-    meson.build
-
-rm -f quickjs.h.bak meson.build.bak
+rm -f quickjs.h.bak
 
 echo "Version updated to $VERSION"

@@ -12,7 +12,18 @@ mkdir -p "$dest"
 cd "$dest"
 
 repover="v3.24"
-arch="x86_64"
+if command -v apk >/dev/null 2>&1; then
+    arch="$(apk --print-arch)"
+else
+    case "$(uname -m)" in
+        x86_64|amd64) arch=x86_64 ;;
+        aarch64|arm64) arch=aarch64 ;;
+        armv7l|armv7) arch=armv7 ;;
+        i386|i486|i586|i686|x86) arch=x86 ;;
+        riscv64) arch=riscv64 ;;
+        *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+    esac
+fi
 base="https://dl-cdn.alpinelinux.org/alpine/$repover/main/$arch"
 
 zlib_ver="${ZLIB_STATIC_VERSION:-1.3.2-r1}"

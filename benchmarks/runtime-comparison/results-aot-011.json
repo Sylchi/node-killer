@@ -1,0 +1,23 @@
+{
+  "qjs0.11 -c": {
+    "fib": 197.9,
+    "loop": 2452.3,
+    "floatloop": 2539.7,
+    "json": 1141.6,
+    "regex": 671.4,
+    "sort": 307.9,
+    "array": 358.4,
+    "object": 333.3
+  },
+  "qjs0.11 interp": {
+    "fib": 199.6,
+    "loop": 2484.9,
+    "floatloop": 2368.1,
+    "json": 1344.3,
+    "regex": 705.6,
+    "sort": 340.9,
+    "array": 351.6,
+    "object": 445.8
+  },
+  "string": ">30s in 0.11 (both paths)"
+}

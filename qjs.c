@@ -35,6 +35,7 @@
 #include "cutils.h"
 #include "quickjs.h"
 #include "quickjs-libc.h"
+#include "qjs-wasm.h"
 
 #ifdef QJS_USE_MIMALLOC
 #include <mimalloc.h>
@@ -237,6 +238,9 @@ static JSContext *JS_NewCustomContext(JSRuntime *rt)
     js_init_module_std(ctx, "qjs:std");
     js_init_module_os(ctx, "qjs:os");
     js_init_module_bjson(ctx, "qjs:bjson");
+    js_init_module_wasm(ctx, "qjs:wasm");
+    if (js_wasm_init(ctx) < 0)
+        return NULL;
 
     JSValue global = JS_GetGlobalObject(ctx);
     JS_SetPropertyFunctionList(ctx, global, global_obj, countof(global_obj));

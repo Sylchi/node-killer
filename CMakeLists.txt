@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.13)
 
 project(quickjs LANGUAGES C)
 
@@ -10,54 +10,13 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS ON)
 set(CMAKE_C_STANDARD 11)
 
-macro(xoption OPTION_NAME OPTION_TEXT OPTION_DEFAULT)
-    option(${OPTION_NAME} ${OPTION_TEXT} ${OPTION_DEFAULT})
-    if(DEFINED ENV{${OPTION_NAME}})
-        # Allow setting the option through an environment variable.
-        set(${OPTION_NAME} $ENV{${OPTION_NAME}})
-    endif()
-    if(${OPTION_NAME})
-        add_definitions(-D${OPTION_NAME})
-    endif()
-    message(STATUS "  ${OPTION_NAME}: ${${OPTION_NAME}}")
-endmacro()
-
-# note: QJS_ENABLE_TSAN is currently incompatible with the other sanitizers but we
-# don't explicitly check for that because who knows what the future will bring?
-# QJS_ENABLE_MSAN only works with clang at the time of writing; also not checked
-# for the same reason
-xoption(BUILD_SHARED_LIBS "Build a shared library" OFF)
-# if we ever require CMake 3.21, we can automatically detect this setting by looking at PROJECT_IS_TOP_LEVEL
-# similar to how glslang does
-xoption(QJS_ENABLE_INSTALL "Enable quickjs installation" ON)
-xoption(QJS_BUILD_WERROR "Build with -Werror" OFF)
-xoption(QJS_BUILD_EXAMPLES "Build examples" OFF)
-xoption(QJS_BUILD_CLI_STATIC "Build a static qjs executable" OFF)
-xoption(QJS_BUILD_CLI_WITH_MIMALLOC "Build the qjs executable with mimalloc" OFF)
-xoption(QJS_BUILD_CLI_WITH_STATIC_MIMALLOC "Build the qjs executable with mimalloc (statically linked)" OFF)
-xoption(QJS_DISABLE_PARSER "Disable JS source code parser" OFF)
-xoption(QJS_ENABLE_ASAN "Enable AddressSanitizer (ASan)" OFF)
-xoption(QJS_ENABLE_MSAN "Enable MemorySanitizer (MSan)" OFF)
-xoption(QJS_ENABLE_TSAN "Enable ThreadSanitizer (TSan)" OFF)
-xoption(QJS_ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer (UBSan)" OFF)
-xoption(QJS_ENABLE_GC_STRESS "Force a full GC before every allocation (GC stress test)" OFF)
-
-# Use ccache for compilation when it is available. This keeps rebuilds fast
-# after touching headers and makes switching build options much cheaper.
-option(QJS_USE_CCACHE "Use ccache when available" ON)
-if(QJS_USE_CCACHE)
-    find_program(CCACHE_PROGRAM ccache)
-    if(CCACHE_PROGRAM)
-        set(CMAKE_C_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
-        set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
-        message(STATUS "  ccache: ${CCACHE_PROGRAM}")
-    else()
-        message(STATUS "  ccache: not found")
-    endif()
+if(NOT CMAKE_BUILD_TYPE)
+    message(STATUS "No build type selected, default to Release")
+    set(CMAKE_BUILD_TYPE "Release")
 endif()
 
-# Used to properly define JS_LIBC_EXTERN.
-add_compile_definitions(QUICKJS_NG_BUILD)
+message(STATUS "Building in ${CMAKE_BUILD_TYPE} mode")
+message(STATUS "Building with ${CMAKE_C_COMPILER_ID} ${CMAKE_C_COMPILER_VERSION} on ${CMAKE_SYSTEM}")
 
 # MINGW doesn't exist in older cmake versions, newer versions don't know
 # about CMAKE_COMPILER_IS_MINGW, and there is no unique CMAKE_C_COMPILER_ID
@@ -80,20 +39,11 @@ if(CMAKE_SYSTEM_NAME STREQUAL "watchOS")
 else()
     set(WATCHOS FALSE)
 endif()
-
 if(CMAKE_SYSTEM_NAME STREQUAL "SunOS")
     set(SUNOS TRUE)
 else()
     set(SUNOS FALSE)
 endif()
-
-if(NOT CMAKE_BUILD_TYPE)
-    message(STATUS "No build type selected, default to Release")
-    set(CMAKE_BUILD_TYPE "Release")
-endif()
-
-message(STATUS "Building in ${CMAKE_BUILD_TYPE} mode")
-message(STATUS "Building with ${CMAKE_C_COMPILER_ID} ${CMAKE_C_COMPILER_VERSION} on ${CMAKE_SYSTEM}")
 
 macro(xcheck_add_c_compiler_flag FLAG)
     string(REPLACE "-" "" FLAG_NO_HYPHEN ${FLAG})
@@ -105,9 +55,6 @@ endmacro()
 
 xcheck_add_c_compiler_flag(-Wall)
 if(NOT MSVC AND NOT IOS AND NOT TVOS AND NOT WATCHOS)
-    if(QJS_BUILD_WERROR)
-        xcheck_add_c_compiler_flag(-Werror)
-    endif()
     xcheck_add_c_compiler_flag(-Wextra)
 endif()
 xcheck_add_c_compiler_flag(-Wformat=2)
@@ -120,7 +67,7 @@ xcheck_add_c_compiler_flag(-Wno-unused-result)
 xcheck_add_c_compiler_flag(-Wno-stringop-truncation)
 xcheck_add_c_compiler_flag(-Wno-array-bounds)
 if(NOT SUNOS)
-xcheck_add_c_compiler_flag(-funsigned-char)
+    xcheck_add_c_compiler_flag(-funsigned-char)
 endif()
 
 # Clang on Windows without MSVC command line fails because the codebase uses
@@ -200,146 +147,84 @@ if(CMAKE_BUILD_TYPE MATCHES "Debug")
     xcheck_add_c_compiler_flag(-fno-omit-frame-pointer)
 endif()
 
-if(BUILD_SHARED_LIBS)
-    message(STATUS "Building a shared library")
-endif()
 
-if(QJS_ENABLE_ASAN)
-message(STATUS "Building with ASan")
-add_compile_options(
-    -fsanitize=address
-    -fno-sanitize-recover=all
-    -fno-omit-frame-pointer
-)
-add_link_options(
-    -fsanitize=address
-    -fno-sanitize-recover=all
-    -fno-omit-frame-pointer
-)
-endif()
-
-if(QJS_ENABLE_MSAN)
-message(STATUS "Building with MSan")
-add_compile_options(
-    -fsanitize=memory
-    -fno-sanitize-recover=all
-    -fno-omit-frame-pointer
-)
-add_link_options(
-    -fsanitize=memory
-    -fno-sanitize-recover=all
-    -fno-omit-frame-pointer
-)
-endif()
-
-if(QJS_ENABLE_TSAN)
-message(STATUS "Building with TSan")
-add_compile_options(
-    -fsanitize=thread
-    -fno-sanitize-recover=all
-    -fno-omit-frame-pointer
-)
-add_link_options(
-    -fsanitize=thread
-    -fno-sanitize-recover=all
-    -fno-omit-frame-pointer
-)
-endif()
-
-if(QJS_ENABLE_UBSAN)
-message(STATUS "Building with UBSan")
-add_compile_options(
-    -fsanitize=undefined
-    -fno-sanitize-recover=all
-    -fno-omit-frame-pointer
-)
-add_link_options(
-    -fsanitize=undefined
-    -fno-sanitize-recover=all
-    -fno-omit-frame-pointer
-)
-endif()
-
-if(QJS_ENABLE_GC_STRESS)
-message(STATUS "Building with GC stress (FORCE_GC_AT_MALLOC)")
-add_compile_definitions(FORCE_GC_AT_MALLOC)
-endif()
-
-
+#
 # QuickJS library
 #
-
-xoption(QJS_BUILD_LIBC "Build standard library modules as part of the library" OFF)
-macro(add_qjs_libc_if_needed target)
-    if(NOT QJS_BUILD_LIBC)
-        target_link_libraries(${target} PRIVATE qjs-libc)
-    endif()
-endmacro()
-macro(add_static_if_needed target)
-    if(QJS_BUILD_CLI_STATIC OR MINGW)
-        target_link_options(${target} PRIVATE -static)
-        if(MINGW)
-            target_link_options(${target} PRIVATE -static-libgcc)
-        endif()
-    endif()
-endmacro()
 
 set(qjs_sources
     dtoa.c
     libregexp.c
     libunicode.c
     quickjs.c
+    qjs-wasm.c
 )
+
+# wasm3 is vendored and always compiled in so WebAssembly.instantiate() and
+# WASI modules work without a separate runtime. The only exception is a build
+# that is itself WebAssembly.
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "WASI" AND NOT EMSCRIPTEN)
+    set(wasm3_sources
+        vendor/wasm3/source/m3_bind.c
+        vendor/wasm3/source/m3_code.c
+        vendor/wasm3/source/m3_compile.c
+        vendor/wasm3/source/m3_core.c
+        vendor/wasm3/source/m3_deterministic.c
+        vendor/wasm3/source/m3_env.c
+        vendor/wasm3/source/m3_exec.c
+        vendor/wasm3/source/m3_function.c
+        vendor/wasm3/source/m3_info.c
+        vendor/wasm3/source/m3_module.c
+        vendor/wasm3/source/m3_parse.c
+        vendor/wasm3/source/m3_snapshot.c
+        vendor/wasm3/source/m3_validate.c
+        vendor/wasm3/source/m3_xxh64.c
+        vendor/wasm3/source/m3_api_wasi.c
+    )
+    # An object library keeps the vendored objects inside libqjs without
+    # adding a second installable target to the export set.
+    add_library(wasm3 OBJECT ${wasm3_sources})
+    set_target_properties(wasm3 PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(wasm3 PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/vendor/wasm3/source
+    )
+    # The "simple" WASI backend talks to POSIX directly, so it does not pull in
+    # libuv/uvwasi. d_m3HasFloat is on by default but spelled out because the
+    # JS bridge assumes it.
+    target_compile_definitions(wasm3 PRIVATE
+        d_m3HasWASI
+        d_m3HasFloat=1
+        _GNU_SOURCE
+    )
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        # wasm3 is not built clean under every warning the host project turns on.
+        target_compile_options(wasm3 PRIVATE
+            -Wno-unused-parameter
+            -Wno-unused-function
+            -Wno-sign-compare
+        )
+    endif()
+    list(APPEND qjs_sources $<TARGET_OBJECTS:wasm3>)
+    set(QJS_WASM3 TRUE)
+    message(STATUS "  wasm3: vendored (static)")
+else()
+    set(QJS_WASM3 FALSE)
+endif()
 
 # libev is vendored and statically linked into the core library. It backs
 # quickjs-libc's event loop (io, timers, signals) on POSIX platforms.
 if(NOT WIN32 AND NOT CMAKE_SYSTEM_NAME STREQUAL "WASI" AND NOT EMSCRIPTEN)
     list(APPEND qjs_sources vendor/libev/ev.c)
     list(APPEND qjs_defines EV_STANDALONE QJS_HAVE_LIBEV)
-    set(QJS_HAVE_LIBEV TRUE)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        # libev only auto-selects epoll when it detects glibc; musl has
+        # epoll as well, so make it explicit instead of falling back to
+        # the O(n) poll backend on static musl builds.
+        list(APPEND qjs_defines EV_USE_EPOLL=1)
+    endif()
     message(STATUS "  libev: vendored (static)")
 endif()
 
-# Static zlib for the zlib module. scripts/fetch-static-libs.sh downloads the
-# Alpine static archives; a system libz.a is used as a fallback.
-find_library(QNODE_ZLIB_LIBRARY NAMES z
-    PATHS ${CMAKE_CURRENT_SOURCE_DIR}/vendor/static/usr/lib
-    NO_DEFAULT_PATH)
-if(NOT QNODE_ZLIB_LIBRARY)
-    find_library(QNODE_ZLIB_LIBRARY NAMES z)
-endif()
-if(QNODE_ZLIB_LIBRARY)
-    add_definitions(-DQNODE_HAVE_ZLIB)
-    message(STATUS "  zlib: ${QNODE_ZLIB_LIBRARY}")
-else()
-    message(STATUS "  zlib: not found (zlib module disabled)")
-endif()
-
-# Static OpenSSL for TLS (see scripts/fetch-static-libs.sh).
-find_library(QNODE_SSL_LIBRARY NAMES ssl
-    PATHS ${CMAKE_CURRENT_SOURCE_DIR}/vendor/static/usr/lib
-    NO_DEFAULT_PATH)
-find_library(QNODE_CRYPTO_LIBRARY NAMES crypto
-    PATHS ${CMAKE_CURRENT_SOURCE_DIR}/vendor/static/usr/lib
-    NO_DEFAULT_PATH)
-if(NOT QNODE_SSL_LIBRARY)
-    find_library(QNODE_SSL_LIBRARY NAMES ssl)
-endif()
-if(NOT QNODE_CRYPTO_LIBRARY)
-    find_library(QNODE_CRYPTO_LIBRARY NAMES crypto)
-endif()
-if(QNODE_SSL_LIBRARY AND QNODE_CRYPTO_LIBRARY)
-    add_definitions(-DQNODE_HAVE_OPENSSL)
-    message(STATUS "  openssl: ${QNODE_SSL_LIBRARY} ${QNODE_CRYPTO_LIBRARY}")
-else()
-    message(STATUS "  openssl: not found (TLS disabled)")
-endif()
-
-if(QJS_BUILD_LIBC)
-    list(APPEND qjs_sources quickjs-libc.c)
-    # The definition must be added to the entire project.
-    add_compile_definitions(QJS_BUILD_LIBC)
-endif()
 list(APPEND qjs_defines _GNU_SOURCE)
 if(WIN32)
     # NB: Windows 7 is EOL and we are only supporting in so far as it doesn't interfere with progress.
@@ -360,51 +245,26 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "WASI")
     list(APPEND qjs_libs ${CMAKE_THREAD_LIBS_INIT})
 endif()
 
-add_library(qjs ${qjs_sources})
+add_library(qjs STATIC ${qjs_sources})
 target_compile_definitions(qjs PRIVATE ${qjs_defines})
+if(QJS_WASM3)
+    target_compile_definitions(qjs PRIVATE QJS_BUILD_WASM3)
+endif()
 target_include_directories(qjs PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/vendor/libev>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/vendor/wasm3/source>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 target_link_libraries(qjs PUBLIC ${qjs_libs})
 
-# Pass a compiler definition so that Windows gets its declspec's right.
-get_target_property(QJS_LIB_TYPE qjs TYPE)
-if(QJS_LIB_TYPE STREQUAL "SHARED_LIBRARY")
-    target_compile_definitions(qjs
-        PRIVATE BUILDING_QJS_SHARED
-        PUBLIC  USING_QJS_SHARED
-    )
-endif()
+#
+# quickjs-libc
+#
 
-# An interface library for modules.
-add_library(qjs_module_lib INTERFACE)
-target_include_directories(qjs_module_lib INTERFACE
-    $<TARGET_PROPERTY:qjs,INTERFACE_INCLUDE_DIRECTORIES>
-)
-target_compile_definitions(qjs_module_lib INTERFACE
-    QUICKJS_NG_MODULE_BUILD
-    $<TARGET_PROPERTY:qjs,INTERFACE_COMPILE_DEFINITIONS>
-)
-if(WIN32)
-    # Since Windows cannot resolve symbols at load time, we need to
-    # explicitly link it to qjs.
-    target_link_libraries(qjs_module_lib INTERFACE
-        qjs
-    )
-endif()
-
-if(NOT QJS_BUILD_LIBC)
-    add_library(qjs-libc STATIC quickjs-libc.c node.c)
-    target_compile_definitions(qjs-libc PRIVATE ${qjs_defines})
-    target_link_libraries(qjs-libc PRIVATE ${qjs_libs} qjs ${QNODE_ZLIB_LIBRARY}
-        ${QNODE_SSL_LIBRARY} ${QNODE_CRYPTO_LIBRARY})
-    add_dependencies(qjs-libc node_bootstrap_header)
-    target_include_directories(qjs-libc PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
-else()
-    message(FATAL_ERROR "qnode requires QJS_BUILD_LIBC=OFF")
-endif()
+add_library(qjs-libc STATIC quickjs-libc.c)
+target_compile_definitions(qjs-libc PRIVATE ${qjs_defines})
+target_link_libraries(qjs-libc PRIVATE ${qjs_libs} qjs)
 
 # qnode embeds the JS bootstrap as a C array. xxd ships with vim; fall back
 # to a CMake-generated header when it is unavailable.
@@ -437,20 +297,106 @@ add_custom_target(node_bootstrap_header DEPENDS ${NODE_BOOTSTRAP_H})
 # explicit so bootstrap edits always recompile node.c.
 set_source_files_properties(node.c PROPERTIES OBJECT_DEPENDS ${NODE_BOOTSTRAP_H})
 
-# The qnode executable: Node.js-compatible CLI.
-add_executable(qnode_exe qnode.c)
-add_qjs_libc_if_needed(qnode_exe)
-add_static_if_needed(qnode_exe)
-set_target_properties(qnode_exe PROPERTIES
-    OUTPUT_NAME "qnode"
-    PDB_NAME "qnode"
-    COMPILE_PDB_NAME "qnode"
+#
+# qnode (Linux)
+#
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # zlib and OpenSSL are linked statically so qnode is self-contained.
+    # scripts/fetch-static-libs.sh populates vendor/static for Alpine/musl;
+    # system static archives are used as a fallback.
+    set(QNODE_STATIC_LIB_DIR ${CMAKE_CURRENT_SOURCE_DIR}/vendor/static/usr/lib)
+    set(_qnode_lib_suffixes ${CMAKE_FIND_LIBRARY_SUFFIXES})
+    set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
+
+    find_library(QNODE_ZLIB_LIBRARY NAMES z
+        PATHS ${QNODE_STATIC_LIB_DIR} NO_DEFAULT_PATH)
+    if(NOT QNODE_ZLIB_LIBRARY)
+        find_library(QNODE_ZLIB_LIBRARY NAMES z)
+    endif()
+
+    find_library(QNODE_SSL_LIBRARY NAMES ssl
+        PATHS ${QNODE_STATIC_LIB_DIR} NO_DEFAULT_PATH)
+    if(NOT QNODE_SSL_LIBRARY)
+        find_library(QNODE_SSL_LIBRARY NAMES ssl)
+    endif()
+
+    find_library(QNODE_CRYPTO_LIBRARY NAMES crypto
+        PATHS ${QNODE_STATIC_LIB_DIR} NO_DEFAULT_PATH)
+    if(NOT QNODE_CRYPTO_LIBRARY)
+        find_library(QNODE_CRYPTO_LIBRARY NAMES crypto)
+    endif()
+
+    set(CMAKE_FIND_LIBRARY_SUFFIXES ${_qnode_lib_suffixes})
+
+    if(NOT QNODE_ZLIB_LIBRARY OR NOT QNODE_SSL_LIBRARY OR NOT QNODE_CRYPTO_LIBRARY)
+        message(FATAL_ERROR
+            "qnode requires static zlib and OpenSSL libraries.\n"
+            "Run scripts/fetch-static-libs.sh or install the static\n"
+            "development packages for zlib and OpenSSL.")
+    endif()
+
+    add_library(qnode_core STATIC node.c)
+    target_compile_definitions(qnode_core PRIVATE ${qjs_defines})
+    target_include_directories(qnode_core PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+    target_link_libraries(qnode_core PRIVATE qjs qjs-libc
+        ${QNODE_ZLIB_LIBRARY} ${QNODE_SSL_LIBRARY} ${QNODE_CRYPTO_LIBRARY})
+    add_dependencies(qnode_core node_bootstrap_header)
+
+    add_executable(qnode_exe qnode.c)
+    set_target_properties(qnode_exe PROPERTIES
+        OUTPUT_NAME "qnode"
+        PDB_NAME "qnode"
+        COMPILE_PDB_NAME "qnode"
+    )
+    target_compile_definitions(qnode_exe PRIVATE ${qjs_defines})
+    target_link_libraries(qnode_exe PRIVATE qnode_core)
+    target_link_options(qnode_exe PRIVATE -static)
+endif()
+
+#
+# QuickJS bytecode compiler
+#
+
+add_executable(qjsc
+    qjsc.c
 )
-target_compile_definitions(qnode_exe PRIVATE ${qjs_defines})
-target_link_libraries(qnode_exe PRIVATE qjs)
+target_compile_definitions(qjsc PRIVATE ${qjs_defines})
+target_link_libraries(qjsc PRIVATE qjs qjs-libc)
+if(MINGW)
+    target_link_options(qjsc PRIVATE -static -static-libgcc)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_options(qjsc PRIVATE -static)
+endif()
+
+
+#
+# QuickJS CLI
+#
+
+add_executable(qjs_exe
+    gen/repl.c
+    gen/standalone.c
+    qjs.c
+)
+set_target_properties(qjs_exe PROPERTIES
+    OUTPUT_NAME "qjs"
+    PDB_NAME "qjs_cli"
+    COMPILE_PDB_NAME "qjs_cli"
+)
+target_compile_definitions(qjs_exe PRIVATE ${qjs_defines})
+target_link_libraries(qjs_exe PRIVATE qjs qjs-libc)
+if (NOT WIN32)
+    set_target_properties(qjs_exe PROPERTIES ENABLE_EXPORTS TRUE)
+endif()
+if(MINGW)
+    target_link_options(qjs_exe PRIVATE -static -static-libgcc)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_options(qjs_exe PRIVATE -static)
+endif()
 
 if(EMSCRIPTEN)
-    add_executable(qjs_wasm ${qjs_sources})
+    add_executable(qjs_wasm ${qjs_sources} quickjs-libc.c)
     target_link_options(qjs_wasm PRIVATE
         # in emscripten 3.x, this will be set to 16k which is too small for quickjs. #write sth. to force github rebuild
         -sSTACK_SIZE=2097152 # let it be 2m = 2 * 1024 * 1024 = 2097152, otherwise, stack overflow may be occured at bootstrap
@@ -463,42 +409,8 @@ if(EMSCRIPTEN)
         -sNO_DEFAULT_TO_CXX # this project is pure c project, no need for c plus plus handle
         -sEXPORTED_RUNTIME_METHODS=ccall,cwrap
     )
-    target_compile_definitions(qjs_wasm PRIVATE ${qjs_defines})
+    target_compile_definitions(qjs_wasm PRIVATE ${qjs_defines} QJS_BUILD_LIBC)
     target_link_libraries(qjs_wasm PRIVATE m)
-endif()
-
-
-# QuickJS bytecode compiler
-#
-
-add_executable(qjsc
-    qjsc.c
-)
-add_qjs_libc_if_needed(qjsc)
-add_static_if_needed(qjsc)
-target_compile_definitions(qjsc PRIVATE ${qjs_defines})
-target_link_libraries(qjsc PRIVATE qjs)
-
-
-# QuickJS CLI
-#
-
-add_executable(qjs_exe
-    gen/repl.c
-    gen/standalone.c
-    qjs.c
-)
-add_qjs_libc_if_needed(qjs_exe)
-add_static_if_needed(qjs_exe)
-set_target_properties(qjs_exe PROPERTIES
-    OUTPUT_NAME "qjs"
-    PDB_NAME "qjs_cli"
-    COMPILE_PDB_NAME "qjs_cli"
-)
-target_compile_definitions(qjs_exe PRIVATE ${qjs_defines})
-target_link_libraries(qjs_exe PRIVATE qjs)
-if (NOT WIN32)
-    set_target_properties(qjs_exe PROPERTIES ENABLE_EXPORTS TRUE)
 endif()
 
 # WASI Reactor
@@ -535,17 +447,6 @@ if(CMAKE_SYSTEM_NAME STREQUAL "WASI")
     endif()
 endif()
 
-if(QJS_BUILD_CLI_WITH_MIMALLOC OR QJS_BUILD_CLI_WITH_STATIC_MIMALLOC)
-    find_package(mimalloc REQUIRED)
-    target_compile_definitions(qjs_exe PRIVATE QJS_USE_MIMALLOC)
-    # Upstream mimalloc doesn't provide a way to know if both libraries are supported.
-    if(QJS_BUILD_CLI_WITH_STATIC_MIMALLOC)
-        target_link_libraries(qjs_exe PRIVATE mimalloc-static)
-    else()
-        target_link_libraries(qjs_exe PRIVATE mimalloc)
-    endif()
-endif()
-
 # Test262 runner
 #
 
@@ -553,9 +454,8 @@ if(NOT EMSCRIPTEN)
     add_executable(run-test262
         run-test262.c
     )
-    add_qjs_libc_if_needed(run-test262)
     target_compile_definitions(run-test262 PRIVATE ${qjs_defines})
-    target_link_libraries(run-test262 PRIVATE qjs)
+    target_link_libraries(run-test262 PRIVATE qjs qjs-libc)
 endif()
 
 # C API tests
@@ -565,8 +465,7 @@ add_executable(api-test
     api-test.c
 )
 target_compile_definitions(api-test PRIVATE ${qjs_defines})
-target_link_libraries(api-test PRIVATE qjs)
-add_qjs_libc_if_needed(api-test)
+target_link_libraries(api-test PRIVATE qjs qjs-libc)
 
 add_executable(lre-test
     lre-test.c
@@ -588,99 +487,35 @@ target_compile_definitions(unicode_gen PRIVATE ${qjs_defines})
 add_executable(function_source
     gen/function_source.c
 )
-add_qjs_libc_if_needed(function_source)
 target_include_directories(function_source PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_definitions(function_source PRIVATE ${qjs_defines})
-target_link_libraries(function_source PRIVATE qjs)
-
-# Examples
-#
-
-if(QJS_BUILD_EXAMPLES)
-    if(WIN32 AND NOT (QJS_LIB_TYPE STREQUAL "SHARED_LIBRARY"))
-        message(AUTHOR_WARNING
-            "Binary modules used with static qjs on Windows. There might be\n"
-            "runtime errors when the module is used due to two copies of qjs\n"
-            "in memory.\n"
-            "Please use \"-DBUILD_SHARED_LIBS=true\" if possible."
-        )
-    endif()
-
-    add_executable(hello
-        gen/hello.c
-    )
-    add_qjs_libc_if_needed(hello)
-    target_include_directories(hello PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-    target_compile_definitions(hello PRIVATE ${qjs_defines})
-    target_link_libraries(hello PRIVATE qjs)
-
-    add_executable(hello_module
-        gen/hello_module.c
-    )
-    add_qjs_libc_if_needed(hello_module)
-    target_include_directories(hello_module PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-    target_compile_definitions(hello_module PRIVATE ${qjs_defines})
-    target_link_libraries(hello_module PRIVATE qjs)
-
-    add_library(fib MODULE examples/fib.c)
-    set_target_properties(fib PROPERTIES
-        PREFIX ""
-    )
-    target_link_libraries(fib PRIVATE qjs_module_lib)
-    if(APPLE)
-        target_link_options(fib PRIVATE -undefined dynamic_lookup)
-    endif()
-
-    add_library(point MODULE examples/point.c)
-    set_target_properties(point PROPERTIES
-        PREFIX ""
-    )
-    target_link_libraries(point PRIVATE qjs_module_lib)
-    if(APPLE)
-        target_link_options(point PRIVATE -undefined dynamic_lookup)
-    endif()
-
-    add_executable(test_fib
-        gen/test_fib.c
-    )
-    add_qjs_libc_if_needed(test_fib)
-    target_include_directories(test_fib PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-    target_compile_definitions(test_fib PRIVATE ${qjs_defines})
-    target_link_libraries(test_fib PRIVATE qjs)
-    # Loads fib.so which depends on symbols from libqjs.
-    set_target_properties(test_fib PROPERTIES ENABLE_EXPORTS TRUE)
-endif()
+target_link_libraries(function_source PRIVATE qjs qjs-libc)
 
 # Install target
 #
 
-if (QJS_ENABLE_INSTALL)
-    file(STRINGS quickjs.h quickjs_h REGEX QJS_VERSION)
-    string(REGEX MATCH "QJS_VERSION_MAJOR ([0-9]*)" _ "${quickjs_h}")
-    set(QJS_VERSION_MAJOR ${CMAKE_MATCH_1})
-    string(REGEX MATCH "QJS_VERSION_MINOR ([0-9]*)" _ "${quickjs_h}")
-    set(QJS_VERSION_MINOR ${CMAKE_MATCH_1})
-    string(REGEX MATCH "QJS_VERSION_PATCH ([0-9]*)" _ "${quickjs_h}")
-    set(QJS_VERSION_PATCH ${CMAKE_MATCH_1})
-    set_target_properties(qjs PROPERTIES
-        VERSION ${QJS_VERSION_MAJOR}.${QJS_VERSION_MINOR}.${QJS_VERSION_PATCH}
-        SOVERSION ${QJS_VERSION_MAJOR}
-    )
-    install(FILES quickjs.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-    if(QJS_BUILD_LIBC)
-        install(FILES quickjs-libc.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-    endif()
-    if(NOT IOS AND NOT TVOS AND NOT WATCHOS)
-        install(TARGETS qjs_exe RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-        install(TARGETS qjsc RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-        install(FILES qjs.man DESTINATION ${CMAKE_INSTALL_DATADIR}/man/man1 RENAME qjs.1)
-        install(FILES qjsc.man DESTINATION ${CMAKE_INSTALL_DATADIR}/man/man1 RENAME qjsc.1)
-    endif()
-    install(TARGETS qjs EXPORT qjsConfig
-            RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-            LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-            ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
-    install(EXPORT qjsConfig DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/qjs)
-    install(FILES LICENSE DESTINATION ${CMAKE_INSTALL_DOCDIR})
-    install(DIRECTORY examples DESTINATION ${CMAKE_INSTALL_DOCDIR})
+file(STRINGS quickjs.h quickjs_h REGEX QJS_VERSION)
+string(REGEX MATCH "QJS_VERSION_MAJOR ([0-9]*)" _ "${quickjs_h}")
+set(QJS_VERSION_MAJOR ${CMAKE_MATCH_1})
+string(REGEX MATCH "QJS_VERSION_MINOR ([0-9]*)" _ "${quickjs_h}")
+set(QJS_VERSION_MINOR ${CMAKE_MATCH_1})
+string(REGEX MATCH "QJS_VERSION_PATCH ([0-9]*)" _ "${quickjs_h}")
+set(QJS_VERSION_PATCH ${CMAKE_MATCH_1})
+set_target_properties(qjs PROPERTIES
+    VERSION ${QJS_VERSION_MAJOR}.${QJS_VERSION_MINOR}.${QJS_VERSION_PATCH}
+    SOVERSION ${QJS_VERSION_MAJOR}
+)
+install(FILES quickjs.h qjs-wasm.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+if(NOT IOS AND NOT TVOS AND NOT WATCHOS)
+    install(TARGETS qjs_exe RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    install(TARGETS qjsc RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    install(FILES qjs.man DESTINATION ${CMAKE_INSTALL_DATADIR}/man/man1 RENAME qjs.1)
+    install(FILES qjsc.man DESTINATION ${CMAKE_INSTALL_DATADIR}/man/man1 RENAME qjsc.1)
 endif()
+install(TARGETS qjs EXPORT qjsConfig
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+install(EXPORT qjsConfig DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/qjs)
+install(FILES LICENSE DESTINATION ${CMAKE_INSTALL_DOCDIR})
+install(DIRECTORY examples DESTINATION ${CMAKE_INSTALL_DOCDIR})

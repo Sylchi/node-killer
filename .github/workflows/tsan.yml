@@ -22,10 +22,14 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: true
+      - name: install static dependencies
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev libssl-dev
       - name: build
         run: |
-          cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DQJS_BUILD_WERROR=ON -DQJS_ENABLE_TSAN=ON
-          cmake --build build -j`nproc`
+          cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_C_FLAGS="-fsanitize=thread -fno-omit-frame-pointer" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+          cmake --build build -j`nproc` --target run-test262
       - name: test
         run: |
           git submodule update --init --checkout --depth 1

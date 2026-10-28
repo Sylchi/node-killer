@@ -2837,37 +2837,39 @@ process.hrtime.bigint = function() {
 };
 process.uptime = () => (Date.now() - START_TIME) / 1000;
 process.memoryUsage = function() {
-  const r = native.meminfo();
-  const total = r[0], free = r[1];
-  const used = total - free;
+  const r = native.memoryUsage();
   return {
-    rss: used,
-    heapTotal: used,
-    heapUsed: used,
-    external: 0,
-    arrayBuffers: 0,
+    rss: r[0],
+    heapTotal: r[1],
+    heapUsed: r[2],
+    external: r[3],
+    arrayBuffers: r[4],
   };
 };
 process.memoryUsage.rss = () => process.memoryUsage().rss;
 process.cpuUsage = function(prev) {
-  const r = qjsos.gettimeofday ? null : null;
-  const t = native.hrtime();
-  const us = t[0] * 1e6 + t[1] / 1000;
-  let user = us, system = 0;
+  const r = native.rusage();
+  if (!r || typeof r[0] !== "number")
+    return { user: 0, system: 0 };
+  let user = r[0], system = r[1];
   if (prev) {
-    user = us - prev._us;
+    user -= prev.user;
+    system -= prev.system;
   }
-  const out = { user, system };
-  Object.defineProperty(out, "_us", { value: us, enumerable: false });
-  return out;
+  return { user, system };
 };
+
 process.resourceUsage = function() {
+  const r = native.rusage();
+  if (!r || typeof r[0] !== "number")
+    return null;
   return {
-    userCPUTime: 0, systemCPUTime: 0, maxRSS: 0, sharedMemorySize: 0,
-    unsharedDataSize: 0, unsharedStackSize: 0, minorPageFault: 0,
-    majorPageFault: 0, swappedOut: 0, fsRead: 0, fsWrite: 0,
-    ipcSent: 0, ipcReceived: 0, signalsCount: 0, voluntaryContextSwitches: 0,
-    involuntaryContextSwitches: 0,
+    userCPUTime: r[0], systemCPUTime: r[1], maxRSS: r[2],
+    sharedMemorySize: 0, unsharedDataSize: 0, unsharedStackSize: 0,
+    minorPageFault: r[3], majorPageFault: r[4],
+    swappedOut: 0, fsRead: r[7], fsWrite: r[8],
+    ipcSent: 0, ipcReceived: 0, signalsCount: 0, swapCount: 0,
+    voluntaryContextSwitches: r[5], involuntaryContextSwitches: r[6],
   };
 };
 process.nextTick = function(fn, ...args) {
@@ -4101,6 +4103,9 @@ function normalizeConnectArgs(args) {
   }
   return { options, cb };
 }
+
+/* Poll-loop counters for diagnostics (see qjsos.pollStats). */
+globalThis.__qps = () => qjsos.pollStats();
 
 class Socket extends Duplex {
   constructor(options) {
@@ -9036,6 +9041,26 @@ globalThis.__qnode_on_unhandled = function(reason) {
   const err = reason instanceof Error ? reason
     : new Error("Unhandled promise rejection: " + inspect(reason));
   reportError(err);
+};
+
+/* The C tracker fires the moment a promise is rejected.  Defer reporting to
+   a microtask so a handler attached in the same turn still counts. */
+const __qnode_pending_rejections = new Map();
+let __qnode_rejection_scheduled = false;
+globalThis.__qnode_track_rejection = function(promise, reason, handled) {
+  if (handled) {
+    __qnode_pending_rejections.delete(promise);
+    return;
+  }
+  __qnode_pending_rejections.set(promise, reason);
+  if (__qnode_rejection_scheduled) return;
+  __qnode_rejection_scheduled = true;
+  queueMicrotask(() => {
+    __qnode_rejection_scheduled = false;
+    const pending = Array.from(__qnode_pending_rejections.values());
+    __qnode_pending_rejections.clear();
+    for (const reason of pending) globalThis.__qnode_on_unhandled(reason);
+  });
 };
 
 
