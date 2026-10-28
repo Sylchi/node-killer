@@ -37,7 +37,7 @@ re-measured after that swap.
   than Node and ~5.8x slower than Bun.
 - **Feature coverage is the main gap.** qnode implements a useful Node
   subset (fs, http/https, net, tls, zlib, crypto, dns, child_process, streams,
-  ESM/CJS) but has no WebSocket, Web Streams, WebCrypto, HTTP/2, `node:test`,
+  Web Streams, ESM/CJS) but has no WebSocket, WebCrypto, HTTP/2, `node:test`,
   worker threads, native addons, or TypeScript.
 
 ## Features
@@ -55,7 +55,7 @@ Legend: ✅ available, ⚠️ partial/stub, ❌ not available.
 | JSX / TSX | ❌ | ✅ | ❌ |
 | `fetch`, `Headers`, `Request`, `Response` | ✅ | ✅ | ✅ |
 | `WebSocket` | ✅ | ✅ | ❌ |
-| Web Streams | ✅ | ✅ | ❌ |
+| Web Streams | ✅ | ✅ | ✅ |
 | Web Crypto (`crypto.subtle`) | ✅ | ✅ | ❌ (only `randomUUID`, `getRandomValues`) |
 | WebAssembly | ✅ | ✅ | ❌ |
 | HTTP/1.1 server and client | ✅ | ✅ | ✅ |
@@ -66,7 +66,7 @@ Legend: ✅ available, ⚠️ partial/stub, ❌ not available.
 | `child_process` | ✅ | ✅ | ✅ |
 | `cluster` | ✅ | ✅ | ❌ |
 | `dgram` (UDP) | ✅ | ✅ | ❌ |
-| `worker_threads` | ✅ | ✅ | ⚠️ module loads, `new Worker` throws |
+| `worker_threads` | ✅ | ✅ | ⚠️ module loads, `MessageChannel`/`MessagePort`/`BroadcastChannel` work, `new Worker` throws |
 | `node:test` | ✅ | ✅ (`bun:test`) | ❌ |
 | Watch mode | ✅ | ✅ | ❌ |
 | Bundler | ❌ | ✅ (`bun build`) | ❌ |
@@ -81,7 +81,8 @@ Legend: ✅ available, ⚠️ partial/stub, ❌ not available.
 ### Modules qnode does not provide
 
 `cluster`, `dgram`, `domain`, `http2`, `inspector`, `repl`, `test`, `wasi`,
-`sqlite`, `sea`. `worker_threads` resolves but is a stub.
+`sqlite`, `sea`. `worker_threads` resolves but only provides message channels,
+not worker threads.
 
 ### Language features
 
