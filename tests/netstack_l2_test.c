@@ -171,6 +171,98 @@ static void put16(uint8_t *p, uint16_t v)
     p[1] = (uint8_t)v;
 }
 
+static uint32_t csum_bytes(uint32_t sum, const uint8_t *p, size_t len)
+{
+    while (len > 1) {
+        sum += (uint16_t)((p[0] << 8) | p[1]);
+        p += 2;
+        len -= 2;
+    }
+    if (len)
+        sum += (uint16_t)(p[0] << 8);
+    return sum;
+}
+
+static uint16_t csum_fold(uint32_t sum)
+{
+    while (sum >> 16)
+        sum = (sum & 0xffff) + (sum >> 16);
+    return (uint16_t)~sum;
+}
+
+/* ICMPv6 checksum; returns 0 when the checksum field is valid. */
+static uint16_t icmp6_csum(const uint8_t *src, const uint8_t *dst,
+                           const uint8_t *msg, size_t len)
+{
+    uint8_t tail[4];
+    uint32_t sum = 0;
+
+    put16(tail, (uint16_t)(len >> 16));
+    put16(tail + 2, (uint16_t)len);
+    sum = csum_bytes(sum, src, 16);
+    sum = csum_bytes(sum, dst, 16);
+    sum = csum_bytes(sum, tail, sizeof(tail));
+    sum += 58; /* next header */
+    sum = csum_bytes(sum, msg, len);
+    return csum_fold(sum);
+}
+
+static void make_link_local(NsAddr *a, const uint8_t mac[NS_L2_MAC_LEN])
+{
+    memset(a, 0, sizeof(*a));
+    a->family = NS_AF_INET6;
+    a->b[0] = 0xfe;
+    a->b[1] = 0x80;
+    a->b[8] = (uint8_t)(mac[0] ^ 0x02);
+    a->b[9] = mac[1];
+    a->b[10] = mac[2];
+    a->b[11] = 0xff;
+    a->b[12] = 0xfe;
+    a->b[13] = mac[3];
+    a->b[14] = mac[4];
+    a->b[15] = mac[5];
+}
+
+/* Build an Ethernet/IPv6 router advertisement from `src`. */
+static size_t make_ra(uint8_t *frame, const uint8_t srcmac[NS_L2_MAC_LEN],
+                      const NsAddr *src, uint16_t lifetime, int with_slla)
+{
+    uint8_t *ip = frame + ETH_HDR;
+    uint8_t *icmp = ip + 40;
+    uint8_t dst6[16];
+    size_t plen = 16 + (with_slla ? 8 : 0);
+
+    memset(frame, 0, ETH_HDR + 40 + plen);
+    frame[0] = 0x33;
+    frame[1] = 0x33;
+    frame[5] = 0x01; /* 33:33:00:00:00:01, all-nodes multicast */
+    memcpy(frame + 6, srcmac, NS_L2_MAC_LEN);
+    put16(frame + 12, ETHERTYPE_IPV6);
+
+    memset(dst6, 0, sizeof(dst6));
+    dst6[0] = 0xff;
+    dst6[1] = 0x02;
+    dst6[15] = 0x01;
+    ip[0] = 0x60;
+    put16(ip + 4, (uint16_t)plen);
+    ip[6] = 58;
+    ip[7] = 255;
+    memcpy(ip + 8, src->b, 16);
+    memcpy(ip + 24, dst6, 16);
+
+    icmp[0] = 134; /* router advertisement */
+    icmp[1] = 0;
+    icmp[4] = 64; /* current hop limit */
+    put16(icmp + 6, lifetime);
+    if (with_slla) {
+        icmp[16] = 1; /* source link-layer address */
+        icmp[17] = 1;
+        memcpy(icmp + 18, srcmac, NS_L2_MAC_LEN);
+    }
+    put16(icmp + 2, icmp6_csum(ip + 8, dst6, icmp, plen));
+    return ETH_HDR + 40 + plen;
+}
+
 static void set_addr6_full(NsAddr *a, const uint8_t b[16])
 {
     memset(a, 0, sizeof(*a));
@@ -681,6 +773,157 @@ static void test_broadcast_and_multicast(void)
     ns_l2_free(a);
 }
 
+static void test_router_discovery(void)
+{
+    Sim sim;
+    NsL2 *a, *b;
+    NsAddr a_ll, b_ll, router, dst, zero, fake;
+    NsL2RouteInfo info;
+    const NsAddr *ll;
+    uint8_t frame[128];
+    uint8_t pkt[64];
+    uint8_t mac[NS_L2_MAC_LEN];
+    uint8_t rs_dst[16];
+    uint64_t tx;
+    size_t len;
+
+    memset(&sim, 0, sizeof(sim));
+    sim.now = 1000;
+    a = ns_l2_new(NULL, mac_a, sim_send, &sim);
+    b = ns_l2_new(NULL, mac_b, sim_send, &sim);
+    CHECK(a != NULL && b != NULL);
+    if (!a || !b)
+        return;
+    sim.a = a;
+    sim.b = b;
+
+    make_link_local(&a_ll, mac_a);
+    make_link_local(&b_ll, mac_b);
+    memset(&router, 0, sizeof(router));
+    memset(&zero, 0, sizeof(zero));
+    zero.family = NS_AF_INET6;
+    memset(&dst, 0, sizeof(dst));
+    dst.family = NS_AF_INET6;
+    dst.b[0] = 0x20;
+    dst.b[1] = 0x01;
+    dst.b[2] = 0x0d;
+    dst.b[3] = 0xb8;
+    dst.b[15] = 9;
+
+    CHECK(ns_l2_set_router_discovery(NULL, 1) == -NS_EINVAL);
+    CHECK(ns_l2_link_local6(a) == NULL);
+    CHECK(ns_l2_set_router_discovery(a, 1) == 0);
+    CHECK(ns_l2_set_router_discovery(a, 1) == 0); /* idempotent */
+    CHECK(ns_l2_set_router_discovery(b, 1) == 0);
+    ll = ns_l2_link_local6(a);
+    CHECK(ll != NULL);
+    CHECK(ll && memcmp(ll->b, a_ll.b, 16) == 0);
+
+    /* Link-local neighbours resolve through NDP with a link-local source. */
+    len = make_v6(pkt, &b_ll);
+    CHECK(ns_l2_send_ip(a, pkt, len) == 0);
+    CHECK(ns_l2_stats(a)->tx_ndp == 1);
+    CHECK(ns_l2_stats(b)->rx_ndp == 1);
+    CHECK(ns_l2_stats(b)->tx_ndp == 1);
+    CHECK(ns_l2_stats(a)->rx_ndp == 1);
+    CHECK(ns_l2_neighbor(a, &b_ll, mac) == 1);
+    CHECK(memcmp(mac, mac_b, NS_L2_MAC_LEN) == 0);
+
+    /* Three solicitations, one per second. */
+    sim.capture_on = 1;
+    ns_l2_tick(a, 1000);
+    CHECK(ns_l2_stats(a)->tx_rs == 1);
+    CHECK(sim.capture_len == ETH_HDR + 40 + 8 + 8);
+    CHECK(memcmp(sim.capture, "\x33\x33\x00\x00\x00\x02", 6) == 0);
+    CHECK(rd16(sim.capture + 12) == ETHERTYPE_IPV6);
+    CHECK(sim.capture[ETH_HDR + 6] == 58);
+    CHECK(sim.capture[ETH_HDR + 7] == 255);
+    CHECK(memcmp(sim.capture + ETH_HDR + 8, a_ll.b, 16) == 0);
+    memset(rs_dst, 0, sizeof(rs_dst));
+    rs_dst[0] = 0xff;
+    rs_dst[1] = 0x02;
+    rs_dst[15] = 0x02;
+    CHECK(memcmp(sim.capture + ETH_HDR + 24, rs_dst, 16) == 0);
+    CHECK(sim.capture[ETH_HDR + 40] == 133);
+    CHECK(icmp6_csum(sim.capture + ETH_HDR + 8, rs_dst,
+                     sim.capture + ETH_HDR + 40, 16) == 0);
+
+    ns_l2_tick(a, 1000);
+    CHECK(ns_l2_stats(a)->tx_rs == 1);
+    ns_l2_tick(a, 2000);
+    CHECK(ns_l2_stats(a)->tx_rs == 2);
+    ns_l2_tick(a, 3000);
+    CHECK(ns_l2_stats(a)->tx_rs == 3);
+    ns_l2_tick(a, 4000);
+    CHECK(ns_l2_stats(a)->tx_rs == 3);
+
+    /* Invalid advertisements are ignored: bad checksum, then a non-link-local
+       source. */
+    len = make_ra(frame, mac_b, &b_ll, 30, 0);
+    frame[ETH_HDR + 40 + 2] ^= 0xff;
+    ns_l2_input(a, frame, len);
+    CHECK(ns_l2_stats(a)->rx_ra == 0);
+    set_addr6(&fake, 9); /* fd00:51:4e::9, not link-local */
+    len = make_ra(frame, mac_b, &fake, 30, 0);
+    ns_l2_input(a, frame, len);
+    CHECK(ns_l2_stats(a)->rx_ra == 0);
+    CHECK(ns_l2_route_lookup(a, &dst, &info) == 0);
+
+    /* A router advertisement installs a default route and stops soliciting. */
+    router = b_ll;
+    len = make_ra(frame, mac_b, &router, 30, 1);
+    ns_l2_input(a, frame, len);
+    CHECK(ns_l2_stats(a)->rx_ra == 1);
+    CHECK(ns_l2_stats(a)->ra_routes == 1);
+    tx = ns_l2_stats(a)->tx_rs;
+    ns_l2_tick(a, 5000);
+    CHECK(ns_l2_stats(a)->tx_rs == tx);
+
+    CHECK(ns_l2_route_lookup(a, &dst, &info) == 1);
+    CHECK(info.prefix_len == 0);
+    CHECK(info.has_gateway == 1);
+    CHECK(memcmp(info.gateway.b, router.b, 16) == 0);
+
+    sim.capture_on = 1;
+    sim.capture_len = 0;
+    len = make_v6(pkt, &dst);
+    CHECK(ns_l2_send_ip(a, pkt, len) == 0);
+    CHECK(sim.capture_len > 0);
+    CHECK(memcmp(sim.capture, mac_b, NS_L2_MAC_LEN) == 0);
+
+    /* The learned default route expires with the advertised lifetime. */
+    CHECK(ns_l2_stats(a)->route_expired == 0);
+    ns_l2_tick(a, 34000);
+    CHECK(ns_l2_stats(a)->route_expired == 1);
+    CHECK(ns_l2_route_lookup(a, &dst, &info) == 0);
+
+    /* A zero lifetime withdraws the router. */
+    len = make_ra(frame, mac_b, &router, 30, 0);
+    ns_l2_input(a, frame, len);
+    CHECK(ns_l2_route_lookup(a, &dst, &info) == 1);
+    len = make_ra(frame, mac_b, &router, 0, 0);
+    ns_l2_input(a, frame, len);
+    CHECK(ns_l2_route_lookup(a, &dst, &info) == 0);
+
+    /* An explicitly configured default route is not replaced by an RA and
+       does not expire. */
+    CHECK(ns_l2_add_route(a, &zero, 0, &router) == 0);
+    len = make_ra(frame, mac_b, &router, 30, 0);
+    ns_l2_input(a, frame, len);
+    ns_l2_tick(a, 130000);
+    CHECK(ns_l2_route_lookup(a, &dst, &info) == 1);
+    CHECK(info.has_gateway == 1);
+
+    /* Disabling discovery drops the link-local address and learned routes. */
+    CHECK(ns_l2_del_route(a, &zero, 0) == 0);
+    CHECK(ns_l2_set_router_discovery(a, 0) == 0);
+    CHECK(ns_l2_link_local6(a) == NULL);
+    CHECK(ns_l2_route_lookup(a, &dst, &info) == 0);
+
+    ns_l2_free(a);
+    ns_l2_free(b);
+}
+
 int main(void)
 {
     test_arp_ipv4();
@@ -689,6 +932,7 @@ int main(void)
     test_local_delivery();
     test_broadcast_and_multicast();
     test_routing_table();
+    test_router_discovery();
 
     if (failures) {
         fprintf(stderr, "netstack_l2: %d check(s) failed\n", failures);

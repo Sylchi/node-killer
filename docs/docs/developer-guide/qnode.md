@@ -14,7 +14,7 @@ changes.
 | `node.h` | Entry points used by `qnode.c` and the worker hook |
 | `bootstrap/` | Node compatibility layer, split into ordered parts |
 | `netstack.c` | Owned IPv4/IPv6 TCP, UDP and ICMP engine (no kernel sockets) |
-| `netstack_l2.c` | Ethernet framing, ARP, IPv6 NDP and the neighbour cache |
+| `netstack_l2.c` | Ethernet framing, ARP, IPv6 NDP/router discovery and the neighbour cache |
 | `netstack_link.c` | Loopback, Linux TUN and Linux TAP links for the owned stack |
 | `vendor/` | zlib, mbedTLS, libsodium, libev, wasm3 |
 | `tests/` | Test262-compatible tests plus qnode-only tests |
@@ -89,7 +89,9 @@ that may be strings, `Buffer`s, typed arrays or `ArrayBuffer`s.
   route, the optional gateway becomes a default route, and
   `QNODE_NETSTACK_ROUTES` adds entries such as `10.9.0.0/16 via 10.254.0.2`.
   A next hop must be on-link. The default MAC is `02:51:4e:00:00:01` and is set
-  with `QNODE_NETSTACK_MAC`.
+  with `QNODE_NETSTACK_MAC`. Setting `QNODE_NETSTACK_RD=1` enables IPv6 router
+  discovery: the link derives a link-local address, solicits routers and
+  installs an expiring default route from advertisements.
 
 When a virtual socket binds, connects or sends to an address outside the
 managed prefix, the bridge creates a kernel socket, `dup2`s it onto the same

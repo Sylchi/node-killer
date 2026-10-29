@@ -21,6 +21,8 @@
 #define ICMP6_HDR 8
 #define ND_NS 135
 #define ND_NA 136
+#define ND_RS 133
+#define ND_RA 134
 #define ND_OPT_SOURCE_LL 1
 #define ND_OPT_TARGET_LL 2
 
@@ -31,6 +33,7 @@
 #define ROUTE_FREE 0
 #define ROUTE_STATIC 1
 #define ROUTE_CONNECTED 2
+#define ROUTE_RA 3
 
 typedef struct NsL2Pkt {
     struct NsL2Pkt *next;
@@ -45,8 +48,9 @@ typedef struct NsRoute {
     uint8_t family;
     uint8_t prefix_len;
     uint8_t has_gateway;
-    uint8_t kind;      /* ROUTE_STATIC or ROUTE_CONNECTED */
+    uint8_t kind;      /* ROUTE_STATIC, ROUTE_CONNECTED or ROUTE_RA */
     uint64_t used;
+    uint64_t expires;  /* 0 means no lifetime */
 } NsRoute;
 
 typedef struct NsNeigh {
@@ -73,6 +77,11 @@ struct NsL2 {
 
     int has6;
     NsAddr local6;
+    int has_link6;
+    NsAddr link6;
+    int router_discovery;
+    int rs_left;
+    uint64_t next_rs;
 
     NsRoute routes[NS_L2_MAX_ROUTES];
     NsNeigh neigh[NS_L2_MAX_NEIGHBORS];
@@ -84,6 +93,7 @@ struct NsL2 {
 
 static NsNeigh *neigh_find(const NsL2 *l2, const NsAddr *addr);
 static void pending_flush(NsL2 *l2, const NsAddr *addr, const uint8_t *mac);
+static void neigh_learn(NsL2 *l2, const NsAddr *addr, const uint8_t *mac);
 
 /* ---------------- byte order, addresses and checksums ---------------- */
 
@@ -185,6 +195,49 @@ static int addr_broadcast4(const NsAddr *a)
            a->b[1] == 0xff && a->b[2] == 0xff && a->b[3] == 0xff;
 }
 
+/* fe80::/10. */
+static int addr_link_local(const NsAddr *a)
+{
+    return ns_addr_family(a) == NS_AF_INET6 && a->b[0] == 0xfe &&
+           (a->b[1] & 0xc0) == 0x80;
+}
+
+static int ipv6_enabled(const NsL2 *l2)
+{
+    return l2->has6 || l2->has_link6;
+}
+
+static int is_local6(const NsL2 *l2, const NsAddr *addr)
+{
+    return (l2->has6 && addr_eq(addr, &l2->local6)) ||
+           (l2->has_link6 && addr_eq(addr, &l2->link6));
+}
+
+/* Build an EUI-64 link-local address from the interface MAC. */
+static void make_link_local6(const uint8_t mac[NS_L2_MAC_LEN], NsAddr *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->family = NS_AF_INET6;
+    out->b[0] = 0xfe;
+    out->b[1] = 0x80;
+    out->b[8] = (uint8_t)(mac[0] ^ 0x02); /* flip the universal/local bit */
+    out->b[9] = mac[1];
+    out->b[10] = mac[2];
+    out->b[11] = 0xff;
+    out->b[12] = 0xfe;
+    out->b[13] = mac[3];
+    out->b[14] = mac[4];
+    out->b[15] = mac[5];
+}
+
+static void make_link_local_net(NsAddr *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->family = NS_AF_INET6;
+    out->b[0] = 0xfe;
+    out->b[1] = 0x80;
+}
+
 static uint32_t mask4(int prefix_len)
 {
     if (prefix_len <= 0)
@@ -247,9 +300,9 @@ static NsRoute *route_find(NsL2 *l2, const NsAddr *dest, int prefix_len)
     return NULL;
 }
 
-/* Prefer a free slot, then evict the least recently used static route.
-   Connected routes are never evicted because neighbours need them to decide
-   whether a gateway is reachable. */
+/* Prefer a free slot, then evict the least recently used static or learned
+   route. Connected routes are never evicted because neighbours need them to
+   decide whether a gateway is reachable. */
 static NsRoute *route_alloc(NsL2 *l2)
 {
     NsRoute *victim = NULL;
@@ -260,7 +313,7 @@ static NsRoute *route_alloc(NsL2 *l2)
             return &l2->routes[i];
     for (i = 0; i < NS_L2_MAX_ROUTES; i++) {
         NsRoute *r = &l2->routes[i];
-        if (r->kind != ROUTE_STATIC)
+        if (r->kind == ROUTE_CONNECTED)
             continue;
         if (!victim || r->used < victim->used)
             victim = r;
@@ -311,6 +364,44 @@ static int route_add_internal(NsL2 *l2, const NsAddr *dest, int prefix_len,
         r->gateway.family = (uint8_t)family;
     }
     r->used = ++l2->next_used;
+    r->expires = 0;
+    return 0;
+}
+
+/* Add or refresh a default route learned from a router advertisement. An
+   explicitly configured route for the same prefix wins. Returns 0 on success
+   or a negative NsError. */
+static int route_add_ra(NsL2 *l2, const NsAddr *gateway, uint64_t lifetime_ms)
+{
+    NsAddr zero;
+    NsRoute *r;
+    int existed;
+    int changed;
+    int rc;
+
+    memset(&zero, 0, sizeof(zero));
+    zero.family = NS_AF_INET6;
+    r = route_find(l2, &zero, 0);
+    if (r && r->kind != ROUTE_RA)
+        return 0; /* keep an explicit default route */
+
+    if (lifetime_ms == 0) {
+        if (r)
+            memset(r, 0, sizeof(*r));
+        return 0;
+    }
+
+    existed = r != NULL;
+    changed = !r || !addr_eq(&r->gateway, gateway);
+    rc = route_add_internal(l2, &zero, 0, gateway, ROUTE_RA);
+    if (rc < 0)
+        return rc;
+    r = route_find(l2, &zero, 0);
+    if (!r)
+        return -NS_ENOSPC;
+    r->expires = l2->clock + lifetime_ms;
+    if (!existed || changed)
+        l2->stats.ra_routes++;
     return 0;
 }
 
@@ -374,6 +465,7 @@ static void route_flush_family(NsL2 *l2, int family)
 
     for (i = 0; i < NS_L2_MAX_ROUTES; i++)
         if (l2->routes[i].kind != ROUTE_FREE &&
+            l2->routes[i].kind != ROUTE_RA &&
             l2->routes[i].family == (uint8_t)family)
             memset(&l2->routes[i], 0, sizeof(l2->routes[i]));
 }
@@ -555,10 +647,17 @@ static int ndp_emit_ns(NsL2 *l2, const NsAddr *target)
     uint8_t dstmac[NS_L2_MAC_LEN];
     uint8_t *ip = pkt;
     uint8_t *icmp = pkt + IPV6_HDR;
+    const NsAddr *src;
     uint16_t csum;
 
-    if (!l2->has6)
+    if (!ipv6_enabled(l2))
         return -1;
+    if (addr_link_local(target) && l2->has_link6)
+        src = &l2->link6;
+    else if (l2->has6)
+        src = &l2->local6;
+    else
+        src = &l2->link6;
     memset(pkt, 0, sizeof(pkt));
     memset(dst6, 0, sizeof(dst6));
     dst6[0] = 0xff;
@@ -579,7 +678,7 @@ static int ndp_emit_ns(NsL2 *l2, const NsAddr *target)
     wr16(ip + 4, 24 + 8);
     ip[6] = 58;
     ip[7] = 255;
-    memcpy(ip + 8, l2->local6.b, 16);
+    memcpy(ip + 8, src->b, 16);
     memcpy(ip + 24, dst6, 16);
 
     icmp[0] = ND_NS;
@@ -626,6 +725,46 @@ static int ndp_emit_na(NsL2 *l2, const uint8_t *dstmac, const NsAddr *dst,
     return l2_emit(l2, dstmac, ETHERTYPE_IPV6, pkt, sizeof(pkt));
 }
 
+/* Send a router solicitation to the all-routers multicast group. */
+static int ndp_emit_rs(NsL2 *l2)
+{
+    uint8_t pkt[IPV6_HDR + 8 + 8];
+    uint8_t dst6[16];
+    uint8_t dstmac[NS_L2_MAC_LEN] = { 0x33, 0x33, 0, 0, 0, 2 };
+    uint8_t *ip = pkt;
+    uint8_t *icmp = pkt + IPV6_HDR;
+    size_t opt = l2->has_link6 ? 8 : 0;
+    size_t plen = 8 + opt;
+    uint16_t csum;
+
+    memset(pkt, 0, sizeof(pkt));
+    memset(dst6, 0, sizeof(dst6));
+    dst6[0] = 0xff;
+    dst6[1] = 0x02;
+    dst6[15] = 0x02;
+
+    ip[0] = 0x60;
+    wr16(ip + 4, (uint16_t)plen);
+    ip[6] = 58;
+    ip[7] = 255;
+    if (l2->has_link6)
+        memcpy(ip + 8, l2->link6.b, 16);
+    memcpy(ip + 24, dst6, 16);
+
+    icmp[0] = ND_RS;
+    icmp[1] = 0;
+    if (opt) {
+        icmp[8] = ND_OPT_SOURCE_LL;
+        icmp[9] = 1;
+        memcpy(icmp + 10, l2->mac, NS_L2_MAC_LEN);
+    }
+    csum = icmp6_checksum(ip + 8, dst6, icmp, plen);
+    wr16(icmp + 2, csum);
+
+    l2->stats.tx_rs++;
+    return l2_emit(l2, dstmac, ETHERTYPE_IPV6, pkt, IPV6_HDR + plen);
+}
+
 /* Find a link-layer option and return a pointer to its address bytes. */
 static const uint8_t *ndp_option(const uint8_t *opts, size_t len,
                                  uint8_t type)
@@ -645,6 +784,37 @@ static const uint8_t *ndp_option(const uint8_t *opts, size_t len,
     return NULL;
 }
 
+/* Consume a router advertisement. Only the default router is used; prefix
+   information options are ignored because SLAAC is not implemented. */
+static void ndp_ra_input(NsL2 *l2, const uint8_t *src,
+                         const uint8_t *icmp, size_t icmp_len,
+                         const uint8_t *srcmac)
+{
+    const uint8_t *slla;
+    const uint8_t *mac;
+    NsAddr router;
+    uint16_t lifetime;
+
+    if (!l2->router_discovery || icmp_len < 16)
+        return;
+    memset(&router, 0, sizeof(router));
+    router.family = NS_AF_INET6;
+    memcpy(router.b, src, 16);
+    if (addr_unspecified(&router) || !addr_link_local(&router))
+        return;
+
+    l2->stats.rx_ra++;
+    l2->rs_left = 0; /* a router answered; stop soliciting */
+
+    slla = ndp_option(icmp + 16, icmp_len - 16, ND_OPT_SOURCE_LL);
+    mac = slla ? slla : srcmac;
+    if (mac_usable(mac))
+        neigh_learn(l2, &router, mac);
+
+    lifetime = rd16(icmp + 6);
+    route_add_ra(l2, &router, (uint64_t)lifetime * 1000);
+}
+
 /* Return 1 when the message was consumed, 0 when it should be passed on as a
    normal IPv6 packet. */
 static int ndp_input(NsL2 *l2, const uint8_t *ip, size_t len,
@@ -657,6 +827,7 @@ static int ndp_input(NsL2 *l2, const uint8_t *ip, size_t len,
     size_t total;
     size_t icmp_len;
     size_t opt_len;
+    uint8_t type;
     NsAddr srcaddr, dstaddr, target;
 
     if (len < IPV6_HDR)
@@ -669,13 +840,21 @@ static int ndp_input(NsL2 *l2, const uint8_t *ip, size_t len,
         return 1;
     if (total < IPV6_HDR + 8)
         return 0;
-    if (ip[40] != ND_NS && ip[40] != ND_NA)
+    type = ip[40];
+    if (type != ND_NS && type != ND_NA && type != ND_RS && type != ND_RA)
         return 0;
-    if (total < IPV6_HDR + 24)
-        return 1;
     icmp = ip + IPV6_HDR;
     icmp_len = total - IPV6_HDR;
-    if (icmp6_checksum(src, dst, icmp, icmp_len) != 0)
+    if (icmp6_checksum(src, dst, icmp, icmp_len) != 0 || icmp[1] != 0)
+        return 1;
+
+    if (type == ND_RS)
+        return 1; /* we are a host, not a router */
+    if (type == ND_RA) {
+        ndp_ra_input(l2, src, icmp, icmp_len, srcmac);
+        return 1;
+    }
+    if (total < IPV6_HDR + 24)
         return 1;
     l2->stats.rx_ndp++;
 
@@ -694,10 +873,10 @@ static int ndp_input(NsL2 *l2, const uint8_t *ip, size_t len,
         const uint8_t *slla;
 
         /* DAD probes have no usable source and must not be answered. */
-        if (!l2->has6 || addr_unspecified(&srcaddr) ||
+        if (!ipv6_enabled(l2) || addr_unspecified(&srcaddr) ||
             addr_multicast(&srcaddr))
             return 1;
-        if (!addr_eq(&target, &l2->local6))
+        if (!is_local6(l2, &target))
             return 1;
         slla = ndp_option(opts, opt_len, ND_OPT_SOURCE_LL);
         ndp_emit_na(l2, slla ? slla : srcmac, &srcaddr, &target);
@@ -705,7 +884,7 @@ static int ndp_input(NsL2 *l2, const uint8_t *ip, size_t len,
     }
 
     /* Neighbour advertisement. */
-    if (!l2->has6 || addr_unspecified(&srcaddr))
+    if (!ipv6_enabled(l2) || addr_unspecified(&srcaddr))
         return 1;
     {
         const uint8_t *tlla = ndp_option(opts, opt_len, ND_OPT_TARGET_LL);
@@ -865,8 +1044,7 @@ static void neigh_learn(NsL2 *l2, const NsAddr *addr, const uint8_t *mac)
     if (addr_unspecified(addr) || addr_multicast(addr) ||
         addr_broadcast4(addr) || !mac_usable(mac))
         return;
-    if ((l2->has4 && addr_eq(addr, &l2->local4)) ||
-        (l2->has6 && addr_eq(addr, &l2->local6)))
+    if ((l2->has4 && addr_eq(addr, &l2->local4)) || is_local6(l2, addr))
         return;
 
     n = neigh_find(l2, addr);
@@ -1062,6 +1240,13 @@ int ns_l2_set_ipv6(NsL2 *l2, const NsAddr *local, int prefix_len,
     l2->has6 = 1;
 
     route_flush_family(l2, NS_AF_INET6);
+    if (l2->has_link6) {
+        NsAddr linknet;
+
+        make_link_local_net(&linknet);
+        if (route_add_internal(l2, &linknet, 64, NULL, ROUTE_CONNECTED) < 0)
+            return -NS_ENOSPC;
+    }
     if (route_add_internal(l2, &l2->local6, prefix_len, NULL,
                            ROUTE_CONNECTED) < 0)
         return -NS_ENOSPC;
@@ -1072,6 +1257,56 @@ int ns_l2_set_ipv6(NsL2 *l2, const NsAddr *local, int prefix_len,
             return -NS_ENOSPC;
     }
     return 0;
+}
+
+int ns_l2_set_router_discovery(NsL2 *l2, int enable)
+{
+    NsAddr linknet;
+    int had_link;
+    int i;
+
+    if (!l2)
+        return -NS_EINVAL;
+
+    if (enable) {
+        if (l2->router_discovery)
+            return 0;
+        make_link_local6(l2->mac, &l2->link6);
+        make_link_local_net(&linknet);
+        if (route_add_internal(l2, &linknet, 64, NULL, ROUTE_CONNECTED) < 0) {
+            memset(&l2->link6, 0, sizeof(l2->link6));
+            return -NS_ENOSPC;
+        }
+        l2->has_link6 = 1;
+        l2->router_discovery = 1;
+        l2->rs_left = NS_L2_RS_MAX;
+        l2->next_rs = l2->clock;
+        return 0;
+    }
+
+    had_link = l2->has_link6;
+    l2->router_discovery = 0;
+    l2->rs_left = 0;
+    l2->has_link6 = 0;
+    memset(&l2->link6, 0, sizeof(l2->link6));
+
+    make_link_local_net(&linknet);
+    for (i = 0; i < NS_L2_MAX_ROUTES; i++) {
+        NsRoute *r = &l2->routes[i];
+
+        if (r->kind == ROUTE_FREE)
+            continue;
+        if (r->kind == ROUTE_RA ||
+            (had_link && r->family == NS_AF_INET6 && r->prefix_len == 64 &&
+             addr_eq(&r->dest, &linknet)))
+            memset(r, 0, sizeof(*r));
+    }
+    return 0;
+}
+
+const NsAddr *ns_l2_link_local6(const NsL2 *l2)
+{
+    return l2 && l2->has_link6 ? &l2->link6 : NULL;
 }
 
 int ns_l2_add_route(NsL2 *l2, const NsAddr *dest, int prefix_len,
@@ -1178,13 +1413,13 @@ int ns_l2_send_ip(NsL2 *l2, const uint8_t *pkt, size_t len)
         }
         dst.family = NS_AF_INET6;
         memcpy(dst.b, pkt + 24, 16);
-        if (l2->has6 && addr_eq(&dst, &l2->local6)) {
+        if (is_local6(l2, &dst)) {
             l2->stats.local_delivered++;
             if (l2->stack)
                 ns_input(l2->stack, pkt, len);
             return 0;
         }
-        if (!l2->has6) {
+        if (!ipv6_enabled(l2)) {
             l2->stats.dropped++;
             return -1;
         }
@@ -1259,6 +1494,23 @@ void ns_l2_tick(NsL2 *l2, uint64_t now_ms)
     if (!l2)
         return;
     l2->clock = now_ms;
+
+    for (i = 0; i < NS_L2_MAX_ROUTES; i++) {
+        NsRoute *r = &l2->routes[i];
+
+        if (r->kind == ROUTE_FREE || r->expires == 0 ||
+            now_ms < r->expires)
+            continue;
+        memset(r, 0, sizeof(*r));
+        l2->stats.route_expired++;
+    }
+
+    if (l2->router_discovery && l2->rs_left > 0 && now_ms >= l2->next_rs) {
+        ndp_emit_rs(l2);
+        l2->rs_left--;
+        l2->next_rs = now_ms + NS_L2_RS_INTERVAL_MS;
+    }
+
     for (i = 0; i < NS_L2_MAX_NEIGHBORS; i++) {
         NsNeigh *n = &l2->neigh[i];
 

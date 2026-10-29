@@ -403,6 +403,15 @@ static int ns_init(void)
             ns_stack = NULL;
             return -1;
         }
+        env = getenv("QNODE_NETSTACK_RD");
+        if (env && env[0] && env[0] != '0' &&
+            ns_l2_set_router_discovery(ns_link_l2(ns_link), 1) < 0) {
+            ns_link_free(ns_link);
+            ns_link = NULL;
+            ns_stack_free(ns_stack);
+            ns_stack = NULL;
+            return -1;
+        }
     }
     ns_link_attach(ns_link);
     ns_ready = 1;

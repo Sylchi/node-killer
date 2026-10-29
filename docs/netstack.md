@@ -5,9 +5,10 @@ Status: integrated. `node:net` hands managed IPv4 and IPv6 TCP streams and
 kernel. The stack also answers IPv4 and IPv6 ICMP echo requests, reports
 unreachable UDP ports, fragments and reassembles IP packets, and learns path
 MTUs from ICMP errors. A separate link layer (`netstack_l2.c`) adds Ethernet
-framing, ARP for IPv4 and IPv6 neighbour discovery, so the stack can run on a
-Linux TAP device as a real Ethernet peer. Unmanaged addresses still use kernel
-sockets, and `netstack: false` restores the kernel path per socket.
+framing, ARP for IPv4, IPv6 neighbour discovery and optional IPv6 router
+discovery (default route only), so the stack can run on a Linux TAP device as a
+real Ethernet peer. Unmanaged addresses still use kernel sockets, and
+`netstack: false` restores the kernel path per socket.
 
 The kernel-backed sharded transport is still available and is documented in
 `docs/sharded-net.md`. The two features share the same `/64` address layout
@@ -30,7 +31,7 @@ sharded listeners use kernel TCP, the managed prefix uses the owned stack.
        loopback   Linux TUN   Linux TAP
                                   |
                             netstack_l2.c
-                       (Ethernet + ARP + NDP)
+                       (Ethernet + ARP + NDP + RD)
 ```
 
 - `netstack.c` is transport-agnostic. It consumes and emits complete IPv4 or
@@ -135,6 +136,7 @@ Environment variables:
 | `QNODE_NETSTACK_MAC` | Source MAC for a TAP link. Defaults to `02:51:4e:00:00:01`. |
 | `QNODE_NETSTACK_GATEWAY4` | Optional default IPv4 gateway; shorthand for a `0.0.0.0/0` route. |
 | `QNODE_NETSTACK_GATEWAY6` | Optional default IPv6 gateway; shorthand for a `::/0` route. |
+| `QNODE_NETSTACK_RD` | Enable IPv6 router discovery on a TAP link. Adds a link-local address, sends up to three router solicitations and installs an expiring default route from advertisements. |
 | `QNODE_NETSTACK_ROUTES` | Extra static routes for a TAP link, separated by `;` or `,`. Each entry is `DEST[/LEN]` for an on-link route or `DEST[/LEN] via GATEWAY`. |
 
 ## Links
@@ -213,6 +215,34 @@ least-recently-used when the 32-entry table is full, while connected routes are
 never evicted. There is still only one interface, so this is the routing table
 for that interface rather than a multi-interface router.
 
+### IPv6 router discovery
+
+Set `QNODE_NETSTACK_RD=1` on a TAP link to learn a default router instead of
+configuring `QNODE_NETSTACK_GATEWAY6` statically:
+
+```sh
+QNODE_NETSTACK=1 QNODE_NETSTACK_TAP=1 QNODE_NETSTACK_TAP_NAME=qn0 \
+QNODE_NETSTACK_RD=1 \
+  ./qnode app.js
+```
+
+Enabling discovery creates an EUI-64 link-local address from `QNODE_NETSTACK_MAC`
+(for example `fe80::ff:fe00:1`), adds the on-link `fe80::/64` route, and sends up
+to three router solicitations one second apart. The first valid advertisement
+from a link-local router stops solicitation, teaches the neighbour cache the
+router's MAC, and installs a `::/0` route through that router. The route expires
+with the advertised router lifetime; an advertisement with a zero lifetime
+withdraws it. An explicitly configured default route (from `GATEWAY6`,
+`QNODE_NETSTACK_ROUTES`, or the C API) takes precedence and is never expired by
+discovery.
+
+Discovery is host-side only. Prefix information options are ignored: there is
+no SLAAC address configuration, no duplicate address detection, and no router
+or prefix renumbering. Only one default router is tracked at a time; a later
+advertisement replaces it. Neighbour discovery for the link-local address still
+works through the normal NDP path, including answering solicitations for the
+interface's link-local address.
+
 ## Link layer: Ethernet, ARP and NDP
 
 `netstack_l2.c` is independent of the transport. Tests drive it over a
@@ -251,12 +281,16 @@ written to `/dev/net/tun`.
 `neighbors_created`, `neighbor_timeouts`, `queued`, `queue_dropped`, `dropped`,
 `no_route` and `gateway_unreachable`. `no_route` counts packets with no
 matching route; `gateway_unreachable` counts routes whose next hop is not
-reachable through an on-link route.
+reachable through an on-link route. Router discovery adds `rx_ra` (valid
+advertisements consumed), `tx_rs` (solicitations sent), `ra_routes` (default
+routes installed or changed) and `route_expired` (routes removed by lifetime).
 
 Current link-layer limits:
 
-- No router advertisements, SLAAC, duplicate address detection for the
-  interface address, or neighbour-unreachability detection beyond expiry.
+- Router discovery is opt-in and installs only a default route; there are no
+  router advertisements transmitted, no SLAAC, no duplicate address detection
+  for the interface address, no prefix-information processing, and no
+  neighbour-unreachability detection beyond expiry.
 - No IGMP/MLD membership; multicast and broadcast are framed and transmitted,
   but incoming multicast is only accepted for delivery to the IP engine.
 - One interface per stack. The route table has 32 entries per interface and
@@ -471,7 +505,10 @@ Ethernet segment. It checks ARP request/reply and cache learning, IPv6
 neighbour solicitation/advertisement, Ethernet framing and MAC selection,
 packet queueing while a gateway is unresolved, probe exhaustion and packet
 drop, local delivery without a frame, broadcast/subnet-broadcast and IPv6
-multicast MAC mapping, and neighbour expiry.
+multicast MAC mapping, and neighbour expiry. It also covers router discovery:
+the derived link-local address, solicitation timing and framing, advertisement
+validation, default-route installation and expiry, zero-lifetime withdrawal,
+explicit-route precedence, and NDP resolution of link-local neighbours.
 
 `tests/qnode/netstack_tap.sh` follows the TUN script but creates a TAP device
 with an explicit kernel MAC (`02:51:4e:00:00:02`) and runs qnode with

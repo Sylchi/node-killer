@@ -27,6 +27,8 @@
 #define NS_L2_PROBE_INTERVAL_MS 1000
 #define NS_L2_PROBE_MAX 3
 #define NS_L2_REACHABLE_MS 60000
+#define NS_L2_RS_MAX 3
+#define NS_L2_RS_INTERVAL_MS 1000
 #define NS_L2_MTU 1500
 
 typedef struct NsL2 NsL2;
@@ -53,6 +55,10 @@ typedef struct NsL2Stats {
     uint64_t dropped;         /* malformed, off-link or unroutable packets */
     uint64_t no_route;        /* packets with no matching route */
     uint64_t gateway_unreachable; /* route next hop has no on-link route */
+    uint64_t rx_ra;           /* router advertisements consumed */
+    uint64_t tx_rs;           /* router solicitations sent */
+    uint64_t ra_routes;       /* default routes installed from advertisements */
+    uint64_t route_expired;   /* routes removed by lifetime expiry */
 } NsL2Stats;
 
 /* One route-table entry. Returned by ns_l2_route_lookup(). */
@@ -86,6 +92,19 @@ int ns_l2_set_ipv4(NsL2 *l2, const NsAddr *local, int prefix_len,
                    const NsAddr *gateway);
 int ns_l2_set_ipv6(NsL2 *l2, const NsAddr *local, int prefix_len,
                    const NsAddr *gateway);
+
+/* Enable or disable IPv6 router discovery. Enabling creates the interface's
+   link-local address, adds an on-link fe80::/64 route and sends up to three
+   router solicitations. Advertised routers install a default route that
+   expires with the advertised router lifetime; a zero lifetime removes it.
+   An explicitly configured default route takes precedence. This does not
+   perform SLAAC or duplicate address detection. Returns 0, -NS_EINVAL or
+   -NS_ENOSPC. */
+int ns_l2_set_router_discovery(NsL2 *l2, int enable);
+
+/* The link-local IPv6 address derived from the MAC, or NULL when router
+   discovery is disabled. */
+const NsAddr *ns_l2_link_local6(const NsL2 *l2);
 
 /* Add or replace a route. `gateway` selects the next hop and must itself be
    reachable through an on-link route; NULL marks the destination as on-link.
