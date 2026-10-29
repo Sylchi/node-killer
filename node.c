@@ -42,6 +42,11 @@
 #include <mbedtls/md.h>
 #include <mbedtls/oid.h>
 #include <mbedtls/error.h>
+#include <mbedtls/pkcs5.h>
+#include <mbedtls/hkdf.h>
+#include <mbedtls/base64.h>
+#include <mbedtls/rsa.h>
+#include <mbedtls/ecp.h>
 #if MBEDTLS_VERSION_MAJOR >= 4
 #include <psa/crypto.h>
 #else
@@ -1740,12 +1745,14 @@ static JSValue js_node_zlib_decompress(JSContext *ctx, JSValueConst this_val,
 #define NODE_MAX_INFLATE_STREAMS 128
 
 /* Worker threads share the process address space but each runtime has its
-   own JSContext-backed z_streams, so keep one pool per OS thread. */
+   own JSContext-backed state, so keep per-thread structures. */
 #if defined(__GNUC__) || defined(__clang__)
-#define NODE_INFLATE_TLS __thread
+#define NODE_THREAD_LOCAL __thread
 #else
-#define NODE_INFLATE_TLS _Thread_local
+#define NODE_THREAD_LOCAL _Thread_local
 #endif
+
+#define NODE_INFLATE_TLS NODE_THREAD_LOCAL
 
 typedef struct {
     z_stream zs;
@@ -2851,6 +2858,1191 @@ static JSValue js_node_digest(JSContext *ctx, JSValueConst this_val,
     return val;
 }
 
+/* ---------------- crypto ---------------- */
+
+/* Each worker thread needs its own DRBG because the TLS one is process
+   global and is only safe on the main thread. */
+typedef struct {
+#if MBEDTLS_VERSION_MAJOR < 4
+    mbedtls_entropy_context entropy;
+    mbedtls_ctr_drbg_context drbg;
+#endif
+    int initialized;
+} NodeCryptoRng;
+
+static NODE_THREAD_LOCAL NodeCryptoRng node_crypto_rng;
+
+static int node_crypto_init(void)
+{
+    if (node_crypto_rng.initialized)
+        return 0;
+#if MBEDTLS_VERSION_MAJOR < 4
+    mbedtls_entropy_init(&node_crypto_rng.entropy);
+    mbedtls_ctr_drbg_init(&node_crypto_rng.drbg);
+    if (mbedtls_ctr_drbg_seed(&node_crypto_rng.drbg, mbedtls_entropy_func,
+                              &node_crypto_rng.entropy,
+                              (const unsigned char *)"qnode crypto", 12) != 0)
+        return -1;
+#endif
+    node_crypto_rng.initialized = 1;
+    return 0;
+}
+
+static int node_crypto_random(void *p_rng, unsigned char *buf, size_t len)
+{
+#if MBEDTLS_VERSION_MAJOR < 4
+    (void)p_rng;
+    return mbedtls_ctr_drbg_random(&node_crypto_rng.drbg, buf, len);
+#else
+    (void)p_rng;
+    (void)buf;
+    (void)len;
+    return -1;
+#endif
+}
+
+static mbedtls_md_type_t node_md_type(const char *name)
+{
+    if (!strcasecmp(name, "md5"))         return MBEDTLS_MD_MD5;
+    if (!strcasecmp(name, "sha1"))        return MBEDTLS_MD_SHA1;
+    if (!strcasecmp(name, "sha224"))      return MBEDTLS_MD_SHA224;
+    if (!strcasecmp(name, "sha256"))      return MBEDTLS_MD_SHA256;
+    if (!strcasecmp(name, "sha384"))      return MBEDTLS_MD_SHA384;
+    if (!strcasecmp(name, "sha512"))      return MBEDTLS_MD_SHA512;
+    return MBEDTLS_MD_NONE;
+}
+
+static int node_crypto_parse_key(JSContext *ctx, const uint8_t *data, size_t len,
+                                 const uint8_t *pwd, size_t pwdlen,
+                                 mbedtls_pk_context *pk, int *is_private)
+{
+    uint8_t *copy = NULL;
+    const unsigned char *in = data;
+    size_t inlen = len;
+    int ret;
+
+    if (node_crypto_init() != 0)
+        return -1;
+    mbedtls_pk_init(pk);
+
+    /* PEM parsers require a NUL-terminated buffer. */
+    if (len >= 10 && !memcmp(data, "-----BEGIN", 10)) {
+        copy = js_malloc(ctx, len + 1);
+        if (!copy)
+            return -1;
+        memcpy(copy, data, len);
+        copy[len] = '\0';
+        in = copy;
+        inlen = len + 1;
+    }
+
+    ret = mbedtls_pk_parse_key(pk, in, inlen, pwd, pwdlen,
+                               node_crypto_random, NULL);
+    if (ret == 0) {
+        *is_private = 1;
+    } else {
+        mbedtls_pk_free(pk);
+        mbedtls_pk_init(pk);
+        ret = mbedtls_pk_parse_public_key(pk, in, inlen);
+        if (ret == 0)
+            *is_private = 0;
+    }
+
+    if (copy)
+        js_free(ctx, copy);
+    if (ret != 0) {
+        mbedtls_pk_free(pk);
+        return -1;
+    }
+    return 0;
+}
+
+static const char *node_curve_name(mbedtls_ecp_group_id id)
+{
+    switch (id) {
+    case MBEDTLS_ECP_DP_SECP256R1: return "prime256v1";
+    case MBEDTLS_ECP_DP_SECP384R1: return "secp384r1";
+    case MBEDTLS_ECP_DP_SECP521R1: return "secp521r1";
+#ifdef MBEDTLS_ECP_DP_SECP256K1_ENABLED
+    case MBEDTLS_ECP_DP_SECP256K1: return "secp256k1";
+#endif
+    default: {
+        const mbedtls_ecp_curve_info *info =
+            mbedtls_ecp_curve_info_from_grp_id(id);
+        return info ? info->name : "unknown";
+    }
+    }
+}
+
+static mbedtls_ecp_group_id node_curve_id(const char *name)
+{
+    if (!strcasecmp(name, "prime256v1") || !strcasecmp(name, "secp256r1") ||
+        !strcasecmp(name, "p-256") || !strcasecmp(name, "p256"))
+        return MBEDTLS_ECP_DP_SECP256R1;
+    if (!strcasecmp(name, "secp384r1") || !strcasecmp(name, "p-384") ||
+        !strcasecmp(name, "p384"))
+        return MBEDTLS_ECP_DP_SECP384R1;
+    if (!strcasecmp(name, "secp521r1") || !strcasecmp(name, "p-521") ||
+        !strcasecmp(name, "p521"))
+        return MBEDTLS_ECP_DP_SECP521R1;
+#ifdef MBEDTLS_ECP_DP_SECP256K1_ENABLED
+    if (!strcasecmp(name, "secp256k1"))
+        return MBEDTLS_ECP_DP_SECP256K1;
+#endif
+    return MBEDTLS_ECP_DP_NONE;
+}
+
+static const uint8_t *node_curve_oid(mbedtls_ecp_group_id id, size_t *len)
+{
+    static const uint8_t p256[] = { 0x2a,0x86,0x48,0xce,0x3d,0x03,0x01,0x07 };
+    static const uint8_t p384[] = { 0x2b,0x81,0x04,0x00,0x22 };
+    static const uint8_t p521[] = { 0x2b,0x81,0x04,0x00,0x23 };
+#ifdef MBEDTLS_ECP_DP_SECP256K1_ENABLED
+    static const uint8_t k256[] = { 0x2b,0x81,0x04,0x00,0x0a };
+#endif
+    switch (id) {
+    case MBEDTLS_ECP_DP_SECP256R1: *len = sizeof(p256); return p256;
+    case MBEDTLS_ECP_DP_SECP384R1: *len = sizeof(p384); return p384;
+    case MBEDTLS_ECP_DP_SECP521R1: *len = sizeof(p521); return p521;
+#ifdef MBEDTLS_ECP_DP_SECP256K1_ENABLED
+    case MBEDTLS_ECP_DP_SECP256K1: *len = sizeof(k256); return k256;
+#endif
+    default: return NULL;
+    }
+}
+
+/* Small DER encoder used to wrap PKCS#1/SEC1 keys in PKCS#8. */
+static size_t node_der_len_size(size_t n)
+{
+    if (n < 0x80) return 1;
+    if (n <= 0xff) return 2;
+    if (n <= 0xffff) return 3;
+    return 4;
+}
+
+static size_t node_der_tlv_size(size_t n)
+{
+    return 1 + node_der_len_size(n) + n;
+}
+
+static uint8_t *node_der_write(uint8_t *p, uint8_t tag, size_t n)
+{
+    *p++ = tag;
+    if (n < 0x80) {
+        *p++ = (uint8_t)n;
+    } else if (n <= 0xff) {
+        *p++ = 0x81;
+        *p++ = (uint8_t)n;
+    } else if (n <= 0xffff) {
+        *p++ = 0x82;
+        *p++ = (uint8_t)(n >> 8);
+        *p++ = (uint8_t)n;
+    } else {
+        *p++ = 0x83;
+        *p++ = (uint8_t)(n >> 16);
+        *p++ = (uint8_t)(n >> 8);
+        *p++ = (uint8_t)n;
+    }
+    return p;
+}
+
+static uint8_t *node_der_write_oid(uint8_t *p, const uint8_t *oid, size_t len)
+{
+    p = node_der_write(p, 0x06, len);
+    memcpy(p, oid, len);
+    return p + len;
+}
+
+static int node_crypto_pkcs8_der(JSContext *ctx, mbedtls_pk_context *pk,
+                                 const uint8_t *keyder, size_t keylen,
+                                 uint8_t **out, size_t *outlen)
+{
+    static const uint8_t rsa_oid[] =
+        { 0x2a,0x86,0x48,0x86,0xf7,0x0d,0x01,0x01,0x01 };
+    static const uint8_t ec_oid[] =
+        { 0x2a,0x86,0x48,0xce,0x3d,0x02,0x01 };
+    mbedtls_pk_type_t type = mbedtls_pk_get_type(pk);
+    const uint8_t *alg_oid, *curve_oid = NULL;
+    size_t alg_oid_len, curve_len = 0, alg_len, seq_len, total;
+    uint8_t *buf, *p;
+
+    if (type == MBEDTLS_PK_RSA) {
+        alg_oid = rsa_oid;
+        alg_oid_len = sizeof(rsa_oid);
+    } else if (type == MBEDTLS_PK_ECKEY || type == MBEDTLS_PK_ECKEY_DH ||
+               type == MBEDTLS_PK_ECDSA) {
+        mbedtls_ecp_keypair *ec = mbedtls_pk_ec(*pk);
+        if (!ec)
+            return -1;
+        curve_oid = node_curve_oid(ec->MBEDTLS_PRIVATE(grp).id, &curve_len);
+        if (!curve_oid)
+            return -1;
+        alg_oid = ec_oid;
+        alg_oid_len = sizeof(ec_oid);
+    } else {
+        return -1;
+    }
+
+    alg_len = node_der_tlv_size(alg_oid_len) +
+              (type == MBEDTLS_PK_RSA ? 2 : node_der_tlv_size(curve_len));
+    seq_len = node_der_tlv_size(1) + node_der_tlv_size(alg_len) +
+              node_der_tlv_size(keylen);
+    total = node_der_tlv_size(seq_len);
+
+    buf = js_malloc(ctx, total);
+    if (!buf)
+        return -1;
+    p = node_der_write(buf, 0x30, seq_len);
+    p = node_der_write(p, 0x02, 1);
+    *p++ = 0;
+    p = node_der_write(p, 0x30, alg_len);
+    p = node_der_write_oid(p, alg_oid, alg_oid_len);
+    if (type == MBEDTLS_PK_RSA) {
+        *p++ = 0x05;
+        *p++ = 0x00;
+    } else {
+        p = node_der_write_oid(p, curve_oid, curve_len);
+    }
+    p = node_der_write(p, 0x04, keylen);
+    memcpy(p, keyder, keylen);
+    p += keylen;
+
+    *out = buf;
+    *outlen = (size_t)(p - buf);
+    return 0;
+}
+
+static JSValue node_pem_encode(JSContext *ctx, const char *label,
+                               const uint8_t *der, size_t derlen)
+{
+    size_t b64len = 0, i, len;
+    unsigned char *b64;
+    char begin[96], end[96], *out, *p;
+
+    if (mbedtls_base64_encode(NULL, 0, &b64len, der, derlen) !=
+        MBEDTLS_ERR_BASE64_BUFFER_TOO_SMALL) {
+        if (b64len == 0)
+            return JS_ThrowPlainError(ctx, "base64 encoding failed");
+    }
+    if (b64len == 0)
+        b64len = ((derlen + 2) / 3) * 4 + 1;
+    b64 = js_malloc(ctx, b64len);
+    if (!b64)
+        return JS_EXCEPTION;
+    if (mbedtls_base64_encode(b64, b64len, &len, der, derlen) != 0) {
+        js_free(ctx, b64);
+        return JS_ThrowPlainError(ctx, "base64 encoding failed");
+    }
+
+    snprintf(begin, sizeof(begin), "-----BEGIN %s-----\n", label);
+    snprintf(end, sizeof(end), "-----END %s-----\n", label);
+    out = js_malloc(ctx, strlen(begin) + len * 2 + 128);
+    if (!out) {
+        js_free(ctx, b64);
+        return JS_EXCEPTION;
+    }
+    p = out;
+    memcpy(p, begin, strlen(begin));
+    p += strlen(begin);
+    for (i = 0; i < len; i++) {
+        *p++ = (char)b64[i];
+        if ((i + 1) % 64 == 0)
+            *p++ = '\n';
+    }
+    if (len % 64 != 0)
+        *p++ = '\n';
+    memcpy(p, end, strlen(end));
+    p += strlen(end);
+
+    js_free(ctx, b64);
+    JSValue v = JS_NewStringLen(ctx, out, p - out);
+    js_free(ctx, out);
+    return v;
+}
+
+/* Extract the BIT STRING payload from a SubjectPublicKeyInfo. */
+static const uint8_t *node_der_tlv(const uint8_t *p, const uint8_t *end,
+                                   uint8_t *tag, size_t *len)
+{
+    size_t l;
+    int n;
+
+    if (p + 2 > end)
+        return NULL;
+    *tag = *p++;
+    l = *p++;
+    if (l & 0x80) {
+        n = (int)(l & 0x7f);
+        if (n == 0 || n > 4 || p + n > end)
+            return NULL;
+        l = 0;
+        while (n-- > 0)
+            l = (l << 8) | *p++;
+    }
+    if (p + l > end)
+        return NULL;
+    *len = l;
+    return p;
+}
+
+static const uint8_t *node_spki_to_pkcs1(const uint8_t *spki, size_t spki_len,
+                                         size_t *outlen)
+{
+    const uint8_t *end = spki + spki_len, *p, *q;
+    uint8_t tag;
+    size_t len, alen;
+
+    p = node_der_tlv(spki, end, &tag, &len);
+    if (!p || tag != 0x30)
+        return NULL;
+    end = p + len;
+    q = node_der_tlv(p, end, &tag, &alen);
+    if (!q || tag != 0x30)
+        return NULL;
+    q = node_der_tlv(q + alen, end, &tag, &len);
+    if (!q || tag != 0x03 || len < 1 || q[0] != 0)
+        return NULL;
+    *outlen = len - 1;
+    return q + 1;
+}
+
+static JSValue js_node_crypto_key_info(JSContext *ctx, JSValueConst this_val,
+                                       int argc, JSValueConst *argv)
+{
+    NodeBytes in, pwd;
+    mbedtls_pk_context pk;
+    int is_private = 0;
+    JSValue obj, details;
+    const uint8_t *pwd_data = NULL;
+    size_t pwd_len = 0;
+
+    if (node_get_bytes(ctx, argv[0], &in))
+        return JS_EXCEPTION;
+    memset(&pwd, 0, sizeof(pwd));
+    pwd.abuf = JS_UNDEFINED;
+    if (argc > 1 && !JS_IsUndefined(argv[1]) && !JS_IsNull(argv[1])) {
+        if (node_get_bytes(ctx, argv[1], &pwd)) {
+            node_free_bytes(ctx, &in);
+            return JS_EXCEPTION;
+        }
+        pwd_data = pwd.data;
+        pwd_len = pwd.len;
+    }
+    if (node_crypto_parse_key(ctx, in.data, in.len, pwd_data, pwd_len,
+                              &pk, &is_private)) {
+        node_free_bytes(ctx, &in);
+        node_free_bytes(ctx, &pwd);
+        return JS_ThrowTypeError(ctx, "Invalid key data");
+    }
+
+    obj = JS_NewObject(ctx);
+    details = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, obj, "type",
+                      JS_NewString(ctx, is_private ? "private" : "public"));
+
+    mbedtls_pk_type_t type = mbedtls_pk_get_type(&pk);
+    if (type == MBEDTLS_PK_RSA) {
+        mbedtls_rsa_context *rsa = mbedtls_pk_rsa(pk);
+        mbedtls_mpi E;
+        unsigned long exponent = 65537;
+
+        mbedtls_mpi_init(&E);
+        if (rsa && mbedtls_rsa_export(rsa, NULL, NULL, NULL, NULL, &E) == 0) {
+            size_t elen = mbedtls_mpi_size(&E);
+            uint8_t ebuf[8];
+            if (elen <= sizeof(ebuf)) {
+                if (mbedtls_mpi_write_binary(&E, ebuf, elen) == 0) {
+                    exponent = 0;
+                    for (size_t i = 0; i < elen; i++)
+                        exponent = (exponent << 8) | ebuf[i];
+                }
+            }
+        }
+        mbedtls_mpi_free(&E);
+        JS_SetPropertyStr(ctx, obj, "asymmetricKeyType", JS_NewString(ctx, "rsa"));
+        JS_SetPropertyStr(ctx, details, "modulusLength",
+                          JS_NewInt64(ctx, (int64_t)mbedtls_pk_get_bitlen(&pk)));
+        JS_SetPropertyStr(ctx, details, "publicExponent",
+                          JS_NewFloat64(ctx, (double)exponent));
+    } else if (type == MBEDTLS_PK_ECKEY || type == MBEDTLS_PK_ECKEY_DH ||
+               type == MBEDTLS_PK_ECDSA) {
+        mbedtls_ecp_keypair *ec = mbedtls_pk_ec(pk);
+        const char *name = ec ? node_curve_name(ec->MBEDTLS_PRIVATE(grp).id)
+                              : "unknown";
+        JS_SetPropertyStr(ctx, obj, "asymmetricKeyType", JS_NewString(ctx, "ec"));
+        JS_SetPropertyStr(ctx, details, "namedCurve", JS_NewString(ctx, name));
+    } else {
+        JS_SetPropertyStr(ctx, obj, "asymmetricKeyType",
+                          JS_NewString(ctx, mbedtls_pk_get_name(&pk)));
+    }
+    JS_SetPropertyStr(ctx, obj, "details", details);
+
+    mbedtls_pk_free(&pk);
+    node_free_bytes(ctx, &in);
+    node_free_bytes(ctx, &pwd);
+    return obj;
+}
+
+static JSValue js_node_crypto_export_key(JSContext *ctx, JSValueConst this_val,
+                                         int argc, JSValueConst *argv)
+{
+    NodeBytes in, pwd;
+    mbedtls_pk_context pk;
+    const char *kind;
+    const uint8_t *pwd_data = NULL;
+    size_t pwd_len = 0;
+    int is_private = 0, ret = -1;
+    uint8_t *buf = NULL;
+    size_t bufsize, len = 0;
+    JSValue result = JS_EXCEPTION;
+
+    if (node_get_bytes(ctx, argv[0], &in))
+        return JS_EXCEPTION;
+    memset(&pwd, 0, sizeof(pwd));
+    pwd.abuf = JS_UNDEFINED;
+    if (argc > 1 && !JS_IsUndefined(argv[1]) && !JS_IsNull(argv[1])) {
+        if (node_get_bytes(ctx, argv[1], &pwd)) {
+            node_free_bytes(ctx, &in);
+            return JS_EXCEPTION;
+        }
+        pwd_data = pwd.data;
+        pwd_len = pwd.len;
+    }
+    kind = node_cstr(ctx, argv[2]);
+    if (!kind) {
+        node_free_bytes(ctx, &in);
+        node_free_bytes(ctx, &pwd);
+        return JS_EXCEPTION;
+    }
+    if (node_crypto_parse_key(ctx, in.data, in.len, pwd_data, pwd_len,
+                              &pk, &is_private)) {
+        JS_FreeCString(ctx, kind);
+        node_free_bytes(ctx, &in);
+        node_free_bytes(ctx, &pwd);
+        return JS_ThrowTypeError(ctx, "Invalid key data");
+    }
+
+    {
+        mbedtls_pk_type_t kt = mbedtls_pk_get_type(&pk);
+        int is_rsa = kt == MBEDTLS_PK_RSA;
+        int is_ec = kt == MBEDTLS_PK_ECKEY || kt == MBEDTLS_PK_ECKEY_DH ||
+                    kt == MBEDTLS_PK_ECDSA;
+        if (strncmp(kind, "pkcs1", 5) == 0 && !is_rsa) {
+            JS_ThrowTypeError(ctx, "Key is not an RSA key");
+            goto done;
+        }
+        if (strncmp(kind, "sec1", 4) == 0 && !is_ec) {
+            JS_ThrowTypeError(ctx, "Key is not an EC key");
+            goto done;
+        }
+    }
+
+    bufsize = (mbedtls_pk_get_bitlen(&pk) / 8) * 6 + 4096;
+
+    if (!strcmp(kind, "pkcs8-der") || !strcmp(kind, "pkcs8-pem") ||
+        !strcmp(kind, "pkcs1-der") || !strcmp(kind, "pkcs1-pem") ||
+        !strcmp(kind, "sec1-der") || !strcmp(kind, "sec1-pem")) {
+        if (!is_private) {
+            JS_ThrowTypeError(ctx, "Private key required");
+            goto done;
+        }
+    }
+
+    if (!strcmp(kind, "spki-der") || !strcmp(kind, "spki-pem") ||
+        !strcmp(kind, "pkcs1-public-der") || !strcmp(kind, "pkcs1-public-pem")) {
+        uint8_t *der;
+        size_t der_size;
+
+        buf = js_malloc(ctx, bufsize);
+        if (!buf)
+            goto done;
+        ret = mbedtls_pk_write_pubkey_der(&pk, buf, bufsize);
+        if (ret < 0)
+            goto done;
+        der = buf + bufsize - ret;
+        der_size = (size_t)ret;
+
+        if (!strcmp(kind, "spki-der")) {
+            result = JS_NewUint8ArrayCopy(ctx, der, der_size);
+        } else if (!strcmp(kind, "spki-pem")) {
+            result = node_pem_encode(ctx, "PUBLIC KEY", der, der_size);
+        } else {
+            const uint8_t *inner = node_spki_to_pkcs1(der, der_size, &len);
+            if (!inner) {
+                JS_ThrowTypeError(ctx, "Key is not an RSA key");
+                goto done;
+            }
+            if (!strcmp(kind, "pkcs1-public-der"))
+                result = JS_NewUint8ArrayCopy(ctx, inner, len);
+            else
+                result = node_pem_encode(ctx, "RSA PUBLIC KEY", inner, len);
+        }
+        goto done;
+    }
+
+    buf = js_malloc(ctx, bufsize);
+    if (!buf)
+        goto done;
+    if (!strcmp(kind, "pkcs1-der") || !strcmp(kind, "sec1-der")) {
+        ret = mbedtls_pk_write_key_der(&pk, buf, bufsize);
+        if (ret < 0)
+            goto done;
+        result = JS_NewUint8ArrayCopy(ctx, buf + bufsize - ret, (size_t)ret);
+    } else if (!strcmp(kind, "pkcs1-pem") || !strcmp(kind, "sec1-pem")) {
+        ret = mbedtls_pk_write_key_pem(&pk, buf, bufsize);
+        if (ret < 0)
+            goto done;
+        result = JS_NewString(ctx, (const char *)buf);
+    } else {
+        uint8_t *der = NULL;
+        size_t derlen = 0;
+        uint8_t *wrapped = NULL;
+        size_t wrappedlen = 0;
+
+        ret = mbedtls_pk_write_key_der(&pk, buf, bufsize);
+        if (ret < 0)
+            goto done;
+        der = buf + bufsize - ret;
+        derlen = (size_t)ret;
+        if (node_crypto_pkcs8_der(ctx, &pk, der, derlen,
+                                  &wrapped, &wrappedlen) != 0) {
+            JS_ThrowTypeError(ctx, "Unsupported key type");
+            goto done;
+        }
+        if (!strcmp(kind, "pkcs8-der"))
+            result = JS_NewUint8ArrayCopy(ctx, wrapped, wrappedlen);
+        else
+            result = node_pem_encode(ctx, "PRIVATE KEY", wrapped, wrappedlen);
+        js_free(ctx, wrapped);
+    }
+
+done:
+    JS_FreeCString(ctx, kind);
+    if (buf)
+        js_free(ctx, buf);
+    mbedtls_pk_free(&pk);
+    node_free_bytes(ctx, &in);
+    node_free_bytes(ctx, &pwd);
+    return result;
+}
+
+static JSValue js_node_crypto_generate_key_pair(JSContext *ctx,
+                                                JSValueConst this_val,
+                                                int argc, JSValueConst *argv)
+{
+    const char *type = node_cstr(ctx, argv[0]);
+    int32_t bits = 2048;
+    uint32_t exponent = 65537;
+    const char *curve = "prime256v1";
+    mbedtls_pk_context pk;
+    uint8_t *buf = NULL, *priv = NULL, *pub = NULL;
+    size_t bufsize, privlen = 0, publen = 0;
+    JSValue obj = JS_EXCEPTION;
+
+    if (!type)
+        return JS_EXCEPTION;
+    if (argc > 1 && !JS_IsUndefined(argv[1]))
+        JS_ToInt32(ctx, &bits, argv[1]);
+    if (argc > 2 && !JS_IsUndefined(argv[2]))
+        JS_ToUint32(ctx, &exponent, argv[2]);
+    if (argc > 3 && !JS_IsUndefined(argv[3])) {
+        curve = node_cstr(ctx, argv[3]);
+        if (!curve) {
+            JS_FreeCString(ctx, type);
+            return JS_EXCEPTION;
+        }
+    }
+
+    if (node_crypto_init() != 0) {
+        JS_ThrowPlainError(ctx, "Failed to initialize RNG");
+        goto out;
+    }
+    mbedtls_pk_init(&pk);
+
+    if (!strcasecmp(type, "rsa")) {
+        if (bits < 512 || bits > 16384) {
+            JS_ThrowRangeError(ctx, "Invalid modulus length");
+            goto out_pk;
+        }
+        if (mbedtls_pk_setup(&pk,
+                             mbedtls_pk_info_from_type(MBEDTLS_PK_RSA)) != 0) {
+            JS_ThrowPlainError(ctx, "Failed to create RSA key");
+            goto out_pk;
+        }
+        if (mbedtls_rsa_gen_key(mbedtls_pk_rsa(pk), node_crypto_random, NULL,
+                                (unsigned int)bits, exponent) != 0) {
+            JS_ThrowPlainError(ctx, "Failed to generate RSA key");
+            goto out_pk;
+        }
+    } else if (!strcasecmp(type, "ec")) {
+        mbedtls_ecp_group_id gid = node_curve_id(curve);
+        if (gid == MBEDTLS_ECP_DP_NONE) {
+            JS_ThrowTypeError(ctx, "Invalid named curve: %s", curve);
+            goto out_pk;
+        }
+        if (mbedtls_pk_setup(&pk,
+                             mbedtls_pk_info_from_type(MBEDTLS_PK_ECKEY)) != 0) {
+            JS_ThrowPlainError(ctx, "Failed to create EC key");
+            goto out_pk;
+        }
+        if (mbedtls_ecp_gen_key(gid, mbedtls_pk_ec(pk), node_crypto_random,
+                                NULL) != 0) {
+            JS_ThrowPlainError(ctx, "Failed to generate EC key");
+            goto out_pk;
+        }
+    } else {
+        JS_ThrowTypeError(ctx, "Unsupported key type: %s", type);
+        goto out_pk;
+    }
+
+    bufsize = (mbedtls_pk_get_bitlen(&pk) / 8) * 6 + 4096;
+    buf = js_malloc(ctx, bufsize);
+    if (!buf) {
+        JS_ThrowOutOfMemory(ctx);
+        goto out_pk;
+    }
+    int n = mbedtls_pk_write_key_der(&pk, buf, bufsize);
+    if (n < 0) {
+        JS_ThrowPlainError(ctx, "Failed to export private key");
+        goto out_pk;
+    }
+    if (node_crypto_pkcs8_der(ctx, &pk, buf + bufsize - n, (size_t)n,
+                              &priv, &privlen) != 0) {
+        JS_ThrowPlainError(ctx, "Failed to export private key");
+        goto out_pk;
+    }
+    n = mbedtls_pk_write_pubkey_der(&pk, buf, bufsize);
+    if (n < 0) {
+        JS_ThrowPlainError(ctx, "Failed to export public key");
+        goto out_pk;
+    }
+    pub = js_malloc(ctx, (size_t)n);
+    if (!pub) {
+        JS_ThrowOutOfMemory(ctx);
+        goto out_pk;
+    }
+    memcpy(pub, buf + bufsize - n, (size_t)n);
+    publen = (size_t)n;
+
+    obj = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, obj, "privateKey",
+                      JS_NewUint8ArrayCopy(ctx, priv, privlen));
+    JS_SetPropertyStr(ctx, obj, "publicKey",
+                      JS_NewUint8ArrayCopy(ctx, pub, publen));
+
+out_pk:
+    mbedtls_pk_free(&pk);
+out:
+    if (buf) js_free(ctx, buf);
+    if (priv) js_free(ctx, priv);
+    if (pub) js_free(ctx, pub);
+    if (argc > 3 && !JS_IsUndefined(argv[3]))
+        JS_FreeCString(ctx, curve);
+    JS_FreeCString(ctx, type);
+    return obj;
+}
+
+static int node_crypto_digest_data(JSContext *ctx, const char *mdname,
+                                   const NodeBytes *data,
+                                   mbedtls_md_type_t *md_type,
+                                   const mbedtls_md_info_t **md_info,
+                                   unsigned char **hash, size_t *hash_len)
+{
+    mbedtls_md_type_t type = node_md_type(mdname);
+    const mbedtls_md_info_t *info;
+    unsigned char *out;
+
+    if (type == MBEDTLS_MD_NONE) {
+        JS_ThrowTypeError(ctx, "Digest method not supported: %s", mdname);
+        return -1;
+    }
+    info = mbedtls_md_info_from_type(type);
+    if (!info) {
+        JS_ThrowTypeError(ctx, "Digest method not supported: %s", mdname);
+        return -1;
+    }
+    *hash_len = mbedtls_md_get_size(info);
+    out = js_malloc(ctx, *hash_len);
+    if (!out) {
+        JS_ThrowOutOfMemory(ctx);
+        return -1;
+    }
+    if (mbedtls_md(info, data->data, data->len, out) != 0) {
+        js_free(ctx, out);
+        JS_ThrowPlainError(ctx, "Digest failed");
+        return -1;
+    }
+    *md_type = type;
+    *md_info = info;
+    *hash = out;
+    return 0;
+}
+
+static JSValue js_node_crypto_sign(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv)
+{
+    const char *mdname;
+    NodeBytes data, key;
+    mbedtls_pk_context pk;
+    mbedtls_md_type_t md_type;
+    const mbedtls_md_info_t *md_info = NULL;
+    unsigned char *hash = NULL;
+    size_t hash_len = 0, sig_size, sig_len = 0;
+    unsigned char *sig = NULL;
+    int is_private = 0, pss = 0;
+    JSValue result = JS_EXCEPTION;
+
+    mdname = node_cstr(ctx, argv[0]);
+    if (!mdname)
+        return JS_EXCEPTION;
+    if (node_get_bytes(ctx, argv[1], &data)) {
+        JS_FreeCString(ctx, mdname);
+        return JS_EXCEPTION;
+    }
+    if (node_get_bytes(ctx, argv[2], &key)) {
+        JS_FreeCString(ctx, mdname);
+        node_free_bytes(ctx, &data);
+        return JS_EXCEPTION;
+    }
+    if (argc > 3 && JS_ToBool(ctx, argv[3]) > 0)
+        pss = 1;
+
+    if (node_crypto_parse_key(ctx, key.data, key.len, NULL, 0,
+                              &pk, &is_private)) {
+        JS_ThrowTypeError(ctx, "Invalid key data");
+        goto out;
+    }
+    if (!is_private) {
+        JS_ThrowTypeError(ctx, "Private key required");
+        goto out_pk;
+    }
+    if (node_crypto_digest_data(ctx, mdname, &data, &md_type, &md_info,
+                                &hash, &hash_len) != 0)
+        goto out_pk;
+
+    sig_size = MBEDTLS_PK_SIGNATURE_MAX_SIZE;
+    if (sig_size < mbedtls_pk_get_len(&pk) + 16)
+        sig_size = mbedtls_pk_get_len(&pk) + 16;
+    sig = js_malloc(ctx, sig_size);
+    if (!sig) {
+        JS_ThrowOutOfMemory(ctx);
+        goto out_pk;
+    }
+
+    int ret;
+    if (pss) {
+        ret = mbedtls_pk_sign_ext(MBEDTLS_PK_RSASSA_PSS, &pk, md_type,
+                                  hash, hash_len, sig, sig_size, &sig_len,
+                                  node_crypto_random, NULL);
+    } else {
+        ret = mbedtls_pk_sign(&pk, md_type, hash, hash_len, sig, sig_size,
+                              &sig_len, node_crypto_random, NULL);
+    }
+    if (ret != 0) {
+        JS_ThrowPlainError(ctx, "Signing failed");
+        goto out_pk;
+    }
+    result = JS_NewUint8ArrayCopy(ctx, sig, sig_len);
+
+out_pk:
+    mbedtls_pk_free(&pk);
+out:
+    if (sig) js_free(ctx, sig);
+    if (hash) js_free(ctx, hash);
+    JS_FreeCString(ctx, mdname);
+    node_free_bytes(ctx, &data);
+    node_free_bytes(ctx, &key);
+    return result;
+}
+
+static JSValue js_node_crypto_verify(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv)
+{
+    const char *mdname;
+    NodeBytes data, key, sigb;
+    mbedtls_pk_context pk;
+    mbedtls_md_type_t md_type;
+    const mbedtls_md_info_t *md_info = NULL;
+    unsigned char *hash = NULL;
+    size_t hash_len = 0;
+    int is_private = 0, pss = 0, ok = 0;
+    JSValue result = JS_FALSE;
+
+    mdname = node_cstr(ctx, argv[0]);
+    if (!mdname)
+        return JS_EXCEPTION;
+    if (node_get_bytes(ctx, argv[1], &data)) {
+        JS_FreeCString(ctx, mdname);
+        return JS_EXCEPTION;
+    }
+    if (node_get_bytes(ctx, argv[2], &key)) {
+        JS_FreeCString(ctx, mdname);
+        node_free_bytes(ctx, &data);
+        return JS_EXCEPTION;
+    }
+    if (node_get_bytes(ctx, argv[3], &sigb)) {
+        JS_FreeCString(ctx, mdname);
+        node_free_bytes(ctx, &data);
+        node_free_bytes(ctx, &key);
+        return JS_EXCEPTION;
+    }
+    if (argc > 4 && JS_ToBool(ctx, argv[4]) > 0)
+        pss = 1;
+
+    if (node_crypto_parse_key(ctx, key.data, key.len, NULL, 0,
+                              &pk, &is_private)) {
+        JS_ThrowTypeError(ctx, "Invalid key data");
+        goto out;
+    }
+    if (node_crypto_digest_data(ctx, mdname, &data, &md_type, &md_info,
+                                &hash, &hash_len) != 0)
+        goto out_pk;
+
+    if (pss) {
+        mbedtls_pk_rsassa_pss_options opts;
+        opts.mgf1_hash_id = md_type;
+        opts.expected_salt_len = MBEDTLS_RSA_SALT_LEN_ANY;
+        ok = mbedtls_pk_verify_ext(MBEDTLS_PK_RSASSA_PSS, &opts, &pk, md_type,
+                                   hash, hash_len, sigb.data, sigb.len) == 0;
+    } else {
+        ok = mbedtls_pk_verify(&pk, md_type, hash, hash_len,
+                               sigb.data, sigb.len) == 0;
+    }
+    result = JS_NewBool(ctx, ok);
+
+out_pk:
+    mbedtls_pk_free(&pk);
+out:
+    if (hash) js_free(ctx, hash);
+    JS_FreeCString(ctx, mdname);
+    node_free_bytes(ctx, &data);
+    node_free_bytes(ctx, &key);
+    node_free_bytes(ctx, &sigb);
+    return result;
+}
+
+static JSValue js_node_crypto_pbkdf2(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv)
+{
+    NodeBytes password, salt;
+    const char *digest;
+    int32_t iterations, keylen;
+    mbedtls_md_type_t type;
+    const mbedtls_md_info_t *info;
+    unsigned char *out;
+    JSValue result;
+
+    if (node_get_bytes(ctx, argv[0], &password))
+        return JS_EXCEPTION;
+    if (node_get_bytes(ctx, argv[1], &salt)) {
+        node_free_bytes(ctx, &password);
+        return JS_EXCEPTION;
+    }
+    digest = node_cstr(ctx, argv[4]);
+    if (!digest) {
+        node_free_bytes(ctx, &password);
+        node_free_bytes(ctx, &salt);
+        return JS_EXCEPTION;
+    }
+    if (JS_ToInt32(ctx, &iterations, argv[2]) ||
+        JS_ToInt32(ctx, &keylen, argv[3])) {
+        JS_FreeCString(ctx, digest);
+        node_free_bytes(ctx, &password);
+        node_free_bytes(ctx, &salt);
+        return JS_EXCEPTION;
+    }
+    if (iterations < 1 || keylen < 1) {
+        JS_FreeCString(ctx, digest);
+        node_free_bytes(ctx, &password);
+        node_free_bytes(ctx, &salt);
+        return JS_ThrowRangeError(ctx, "Invalid PBKDF2 parameters");
+    }
+    type = node_md_type(digest);
+    info = type == MBEDTLS_MD_NONE ? NULL : mbedtls_md_info_from_type(type);
+    if (!info) {
+        JSValue err = JS_ThrowTypeError(ctx, "Digest method not supported: %s",
+                                        digest);
+        JS_FreeCString(ctx, digest);
+        node_free_bytes(ctx, &password);
+        node_free_bytes(ctx, &salt);
+        return err;
+    }
+    out = js_malloc(ctx, (size_t)keylen);
+    if (!out) {
+        JS_FreeCString(ctx, digest);
+        node_free_bytes(ctx, &password);
+        node_free_bytes(ctx, &salt);
+        return JS_ThrowOutOfMemory(ctx);
+    }
+    if (mbedtls_pkcs5_pbkdf2_hmac_ext(type, password.data, password.len,
+                                      salt.data, salt.len,
+                                      (uint32_t)iterations, (uint32_t)keylen,
+                                      out) != 0) {
+        js_free(ctx, out);
+        JS_FreeCString(ctx, digest);
+        node_free_bytes(ctx, &password);
+        node_free_bytes(ctx, &salt);
+        return JS_ThrowPlainError(ctx, "PBKDF2 failed");
+    }
+    result = JS_NewUint8ArrayCopy(ctx, out, (size_t)keylen);
+    js_free(ctx, out);
+    JS_FreeCString(ctx, digest);
+    node_free_bytes(ctx, &password);
+    node_free_bytes(ctx, &salt);
+    return result;
+}
+
+static JSValue js_node_crypto_hkdf(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv)
+{
+    NodeBytes ikm, salt, info_b;
+    const char *digest;
+    int32_t keylen;
+    mbedtls_md_type_t type;
+    const mbedtls_md_info_t *info;
+    unsigned char *out;
+    JSValue result;
+    const uint8_t *saltp = NULL, *infop = NULL;
+    size_t saltlen = 0, infolen = 0;
+
+    memset(&salt, 0, sizeof(salt));
+    salt.abuf = JS_UNDEFINED;
+    memset(&info_b, 0, sizeof(info_b));
+    info_b.abuf = JS_UNDEFINED;
+
+    if (node_get_bytes(ctx, argv[1], &ikm))
+        return JS_EXCEPTION;
+    if (argc > 2 && !JS_IsUndefined(argv[2]) && !JS_IsNull(argv[2])) {
+        if (node_get_bytes(ctx, argv[2], &salt)) {
+            node_free_bytes(ctx, &ikm);
+            return JS_EXCEPTION;
+        }
+        saltp = salt.data;
+        saltlen = salt.len;
+    }
+    if (argc > 3 && !JS_IsUndefined(argv[3]) && !JS_IsNull(argv[3])) {
+        if (node_get_bytes(ctx, argv[3], &info_b)) {
+            node_free_bytes(ctx, &ikm);
+            node_free_bytes(ctx, &salt);
+            return JS_EXCEPTION;
+        }
+        infop = info_b.data;
+        infolen = info_b.len;
+    }
+    digest = node_cstr(ctx, argv[0]);
+    if (!digest) {
+        node_free_bytes(ctx, &ikm);
+        node_free_bytes(ctx, &salt);
+        node_free_bytes(ctx, &info_b);
+        return JS_EXCEPTION;
+    }
+    if (JS_ToInt32(ctx, &keylen, argv[4]) || keylen < 1) {
+        JS_FreeCString(ctx, digest);
+        node_free_bytes(ctx, &ikm);
+        node_free_bytes(ctx, &salt);
+        node_free_bytes(ctx, &info_b);
+        return JS_ThrowRangeError(ctx, "Invalid HKDF key length");
+    }
+    type = node_md_type(digest);
+    info = type == MBEDTLS_MD_NONE ? NULL : mbedtls_md_info_from_type(type);
+    if (!info) {
+        JSValue err = JS_ThrowTypeError(ctx, "Digest method not supported: %s",
+                                        digest);
+        JS_FreeCString(ctx, digest);
+        node_free_bytes(ctx, &ikm);
+        node_free_bytes(ctx, &salt);
+        node_free_bytes(ctx, &info_b);
+        return err;
+    }
+    out = js_malloc(ctx, (size_t)keylen);
+    if (!out) {
+        JS_FreeCString(ctx, digest);
+        node_free_bytes(ctx, &ikm);
+        node_free_bytes(ctx, &salt);
+        node_free_bytes(ctx, &info_b);
+        return JS_ThrowOutOfMemory(ctx);
+    }
+    if (mbedtls_hkdf(info, saltp, saltlen, ikm.data, ikm.len,
+                     infop, infolen, out, (size_t)keylen) != 0) {
+        js_free(ctx, out);
+        JS_FreeCString(ctx, digest);
+        node_free_bytes(ctx, &ikm);
+        node_free_bytes(ctx, &salt);
+        node_free_bytes(ctx, &info_b);
+        return JS_ThrowPlainError(ctx, "HKDF failed");
+    }
+    result = JS_NewUint8ArrayCopy(ctx, out, (size_t)keylen);
+    js_free(ctx, out);
+    JS_FreeCString(ctx, digest);
+    node_free_bytes(ctx, &ikm);
+    node_free_bytes(ctx, &salt);
+    node_free_bytes(ctx, &info_b);
+    return result;
+}
+
+/* ---- scrypt (Salsa20/8 + PBKDF2-HMAC-SHA256, RFC 7914) ---- */
+
+static uint32_t node_rotl32(uint32_t x, int n)
+{
+    return (x << n) | (x >> (32 - n));
+}
+
+static void node_salsa20_8(uint32_t out[16], const uint32_t in[16])
+{
+    uint32_t x[16];
+    int i;
+
+    memcpy(x, in, sizeof(x));
+    for (i = 0; i < 8; i += 2) {
+        x[ 4] ^= node_rotl32(x[ 0] + x[12],  7);
+        x[ 8] ^= node_rotl32(x[ 4] + x[ 0],  9);
+        x[12] ^= node_rotl32(x[ 8] + x[ 4], 13);
+        x[ 0] ^= node_rotl32(x[12] + x[ 8], 18);
+        x[ 9] ^= node_rotl32(x[ 5] + x[ 1],  7);
+        x[13] ^= node_rotl32(x[ 9] + x[ 5],  9);
+        x[ 1] ^= node_rotl32(x[13] + x[ 9], 13);
+        x[ 5] ^= node_rotl32(x[ 1] + x[13], 18);
+        x[14] ^= node_rotl32(x[10] + x[ 6],  7);
+        x[ 2] ^= node_rotl32(x[14] + x[10],  9);
+        x[ 6] ^= node_rotl32(x[ 2] + x[14], 13);
+        x[10] ^= node_rotl32(x[ 6] + x[ 2], 18);
+        x[ 3] ^= node_rotl32(x[15] + x[11],  7);
+        x[ 7] ^= node_rotl32(x[ 3] + x[15],  9);
+        x[11] ^= node_rotl32(x[ 7] + x[ 3], 13);
+        x[15] ^= node_rotl32(x[11] + x[ 7], 18);
+        x[ 1] ^= node_rotl32(x[ 0] + x[ 3],  7);
+        x[ 2] ^= node_rotl32(x[ 1] + x[ 0],  9);
+        x[ 3] ^= node_rotl32(x[ 2] + x[ 1], 13);
+        x[ 0] ^= node_rotl32(x[ 3] + x[ 2], 18);
+        x[ 6] ^= node_rotl32(x[ 5] + x[ 4],  7);
+        x[ 7] ^= node_rotl32(x[ 6] + x[ 5],  9);
+        x[ 4] ^= node_rotl32(x[ 7] + x[ 6], 13);
+        x[ 5] ^= node_rotl32(x[ 4] + x[ 7], 18);
+        x[11] ^= node_rotl32(x[10] + x[ 9],  7);
+        x[ 8] ^= node_rotl32(x[11] + x[10],  9);
+        x[ 9] ^= node_rotl32(x[ 8] + x[11], 13);
+        x[10] ^= node_rotl32(x[ 9] + x[ 8], 18);
+        x[12] ^= node_rotl32(x[15] + x[14],  7);
+        x[13] ^= node_rotl32(x[12] + x[15],  9);
+        x[14] ^= node_rotl32(x[13] + x[12], 13);
+        x[15] ^= node_rotl32(x[14] + x[13], 18);
+    }
+    for (i = 0; i < 16; i++)
+        out[i] = x[i] + in[i];
+}
+
+static void node_scrypt_blockmix(uint32_t *B, uint32_t *Y, uint32_t r)
+{
+    uint32_t X[16], T[16];
+    uint32_t i, j;
+
+    memcpy(X, B + (2 * r - 1) * 16, sizeof(X));
+    for (i = 0; i < 2 * r; i++) {
+        for (j = 0; j < 16; j++)
+            X[j] ^= B[i * 16 + j];
+        node_salsa20_8(T, X);
+        memcpy(X, T, sizeof(X));
+        memcpy(Y + i * 16, X, sizeof(X));
+    }
+    for (i = 0; i < r; i++) {
+        memcpy(B + i * 16, Y + (2 * i) * 16, sizeof(X));
+        memcpy(B + (i + r) * 16, Y + (2 * i + 1) * 16, sizeof(X));
+    }
+}
+
+static void node_scrypt_romix(uint32_t *X, uint32_t *V, uint32_t *Y,
+                              uint32_t N, uint32_t r)
+{
+    uint32_t blocks = 2 * r, words = blocks * 16;
+    uint32_t i, j, k;
+
+    for (i = 0; i < N; i++) {
+        memcpy(V + (size_t)i * words, X, (size_t)words * sizeof(uint32_t));
+        node_scrypt_blockmix(X, Y, r);
+    }
+    for (i = 0; i < N; i++) {
+        j = X[(blocks - 1) * 16] % N;
+        for (k = 0; k < words; k++)
+            X[k] ^= V[(size_t)j * words + k];
+        node_scrypt_blockmix(X, Y, r);
+    }
+}
+
+static JSValue js_node_crypto_scrypt(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv)
+{
+    NodeBytes password, salt;
+    int32_t keylen, N, r, p, maxmem;
+    uint8_t *B = NULL, *out = NULL;
+    uint32_t *V = NULL, *Y = NULL;
+    size_t blocklen, blen, vlen;
+    JSValue result = JS_EXCEPTION;
+
+    if (node_get_bytes(ctx, argv[0], &password))
+        return JS_EXCEPTION;
+    if (node_get_bytes(ctx, argv[1], &salt)) {
+        node_free_bytes(ctx, &password);
+        return JS_EXCEPTION;
+    }
+    if (JS_ToInt32(ctx, &keylen, argv[2]) ||
+        JS_ToInt32(ctx, &N, argv[3]) ||
+        JS_ToInt32(ctx, &r, argv[4]) ||
+        JS_ToInt32(ctx, &p, argv[5]) ||
+        JS_ToInt32(ctx, &maxmem, argv[6])) {
+        node_free_bytes(ctx, &password);
+        node_free_bytes(ctx, &salt);
+        return JS_EXCEPTION;
+    }
+    if (keylen < 1 || N < 2 || (N & (N - 1)) != 0 || r < 1 || p < 1 ||
+        maxmem < 1) {
+        node_free_bytes(ctx, &password);
+        node_free_bytes(ctx, &salt);
+        return JS_ThrowRangeError(ctx, "Invalid scrypt parameters");
+    }
+    blocklen = 128u * (size_t)r;
+    blen = blocklen * (size_t)p;
+    vlen = blocklen * (size_t)N;
+    if (vlen > (size_t)maxmem) {
+        node_free_bytes(ctx, &password);
+        node_free_bytes(ctx, &salt);
+        return JS_ThrowRangeError(ctx, "scrypt memory limit exceeded");
+    }
+
+    B = js_malloc(ctx, blen);
+    V = js_malloc(ctx, vlen);
+    Y = js_malloc(ctx, blocklen);
+    out = js_malloc(ctx, (size_t)keylen);
+    if (!B || !V || !Y || !out) {
+        JS_ThrowOutOfMemory(ctx);
+        goto done;
+    }
+    if (mbedtls_pkcs5_pbkdf2_hmac_ext(MBEDTLS_MD_SHA256, password.data,
+                                      password.len, salt.data, salt.len, 1,
+                                      (uint32_t)blen, B) != 0) {
+        JS_ThrowPlainError(ctx, "scrypt failed");
+        goto done;
+    }
+    for (int i = 0; i < p; i++)
+        node_scrypt_romix((uint32_t *)(B + (size_t)i * blocklen), V, Y,
+                          (uint32_t)N, (uint32_t)r);
+    if (mbedtls_pkcs5_pbkdf2_hmac_ext(MBEDTLS_MD_SHA256, password.data,
+                                      password.len, B, blen, 1,
+                                      (uint32_t)keylen, out) != 0) {
+        JS_ThrowPlainError(ctx, "scrypt failed");
+        goto done;
+    }
+    result = JS_NewUint8ArrayCopy(ctx, out, (size_t)keylen);
+
+done:
+    if (B) js_free(ctx, B);
+    if (V) js_free(ctx, V);
+    if (Y) js_free(ctx, Y);
+    if (out) js_free(ctx, out);
+    node_free_bytes(ctx, &password);
+    node_free_bytes(ctx, &salt);
+    return result;
+}
+
 /* ---------------- native object ---------------- */
 
 /* Request that the current worker stop its event loop. Unlike qjsstd.exit()
@@ -2955,6 +4147,14 @@ static const JSCFunctionListEntry js_node_funcs[] = {
     JS_CFUNC_DEF("tlsPeerCert", 1, js_node_tls_peer_cert),
     JS_CFUNC_DEF("tlsInfo", 1, js_node_tls_info),
     JS_CFUNC_DEF("digest", 2, js_node_digest),
+    JS_CFUNC_DEF("cryptoKeyInfo", 2, js_node_crypto_key_info),
+    JS_CFUNC_DEF("cryptoExportKey", 3, js_node_crypto_export_key),
+    JS_CFUNC_DEF("cryptoGenerateKeyPair", 4, js_node_crypto_generate_key_pair),
+    JS_CFUNC_DEF("cryptoSign", 4, js_node_crypto_sign),
+    JS_CFUNC_DEF("cryptoVerify", 5, js_node_crypto_verify),
+    JS_CFUNC_DEF("cryptoPbkdf2", 5, js_node_crypto_pbkdf2),
+    JS_CFUNC_DEF("cryptoHkdf", 5, js_node_crypto_hkdf),
+    JS_CFUNC_DEF("cryptoScrypt", 7, js_node_crypto_scrypt),
     JS_CFUNC_DEF("workerExit", 1, js_node_worker_exit),
 };
 

@@ -6553,6 +6553,420 @@ function createHmac(algorithm, key) {
   return new Hash(alg, Buffer.from(key));
 }
 
+/* ------------------------------------------------------------------ */
+/* crypto: key objects, signatures and KDFs                           */
+/* ------------------------------------------------------------------ */
+
+const CRYPTO_CONSTANTS = {
+  RSA_PKCS1_PADDING: 1,
+  RSA_PKCS1_OAEP_PADDING: 4,
+  RSA_PKCS1_PSS_PADDING: 6,
+  RSA_PSS_SALTLEN_DIGEST: -1,
+  RSA_PSS_SALTLEN_AUTO: -2,
+  RSA_PSS_SALTLEN_MAX_SIGN: -3,
+  RSA_PSS_SALTLEN_MAX: -3,
+};
+
+function normalizeCryptoAlgorithm(algorithm) {
+  let a = String(algorithm).toLowerCase();
+  let pss = false;
+  if (a.endsWith("-pss")) {
+    pss = true;
+    a = a.slice(0, -4);
+  }
+  if (a === "rsa-pss") {
+    pss = true;
+    a = "sha1";
+  }
+  if (a.startsWith("rsa-"))
+    a = a.slice(4);
+  if (a.startsWith("ecdsa-with-"))
+    a = a.slice(11);
+  else if (a.startsWith("ecdsa-"))
+    a = a.slice(6);
+  a = HASH_ALIASES[a] || a;
+  return { digest: a, pss };
+}
+
+function cryptoKeyBytes(key) {
+  if (typeof key === "string")
+    return Buffer.from(key, "utf8");
+  if (Buffer.isBuffer(key))
+    return key;
+  return Buffer.from(toBytes(key));
+}
+
+function cryptoKeyOptions(key) {
+  if (key instanceof KeyObject)
+    return { keyObject: key };
+  if (key && typeof key === "object" && !ArrayBuffer.isView(key) &&
+      !(key instanceof ArrayBuffer) && "key" in key) {
+    if (key.key instanceof KeyObject)
+      return { keyObject: key.key, options: key };
+    return { data: cryptoKeyBytes(key.key), passphrase: key.passphrase,
+             format: key.format, options: key };
+  }
+  return { data: cryptoKeyBytes(key) };
+}
+
+class KeyObject {
+  constructor(type, data, info) {
+    this._type = type;
+    this._data = Buffer.from(data);
+    this._info = info || {};
+  }
+  get type() { return this._type; }
+  get asymmetricKeyType() { return this._info.asymmetricKeyType; }
+  get asymmetricKeyDetails() { return this._info.details; }
+  get symmetricKeySize() {
+    return this._type === "secret" ? this._data.length : undefined;
+  }
+  export(options) {
+    options = options || {};
+    if (this._type === "secret") {
+      const format = options.format || "buffer";
+      if (format === "buffer")
+        return Buffer.from(this._data);
+      throw new TypeError("Invalid format for secret key: " + format);
+    }
+    const format = options.format || "pem";
+    if (format !== "pem" && format !== "der")
+      throw new TypeError("Invalid key format: " + format);
+    const type = options.type ||
+      (this._type === "private" ? "pkcs8" : "spki");
+    let kind;
+    if (this._type === "private") {
+      if (type === "pkcs8") kind = "pkcs8-" + format;
+      else if (type === "pkcs1") kind = "pkcs1-" + format;
+      else if (type === "sec1") kind = "sec1-" + format;
+      else throw new TypeError("Invalid key type: " + type);
+    } else {
+      if (type === "spki") kind = "spki-" + format;
+      else if (type === "pkcs1") kind = "pkcs1-public-" + format;
+      else throw new TypeError("Invalid key type: " + type);
+    }
+    const out = Buffer.from(native.cryptoExportKey(this._data, "", kind));
+    return format === "pem" ? out.toString("utf8") : out;
+  }
+  equals(other) {
+    return other instanceof KeyObject && other._type === this._type &&
+      other._data.equals(this._data);
+  }
+  toCryptoKey() {
+    throw new Error("KeyObject.toCryptoKey is not supported");
+  }
+}
+KeyObject.from = function(key) {
+  if (key instanceof KeyObject)
+    return key;
+  return createSecretKey(key);
+};
+
+function createPrivateKey(key) {
+  const ex = cryptoKeyOptions(key);
+  if (ex.keyObject) {
+    if (ex.keyObject.type !== "private")
+      throw new TypeError("Key is not a private key");
+    return ex.keyObject;
+  }
+  const info = native.cryptoKeyInfo(ex.data, ex.passphrase);
+  if (info.type !== "private")
+    throw new TypeError("Key is not a private key");
+  const der = native.cryptoExportKey(ex.data, ex.passphrase, "pkcs8-der");
+  return new KeyObject("private", der, info);
+}
+
+function createPublicKey(key) {
+  const ex = cryptoKeyOptions(key);
+  if (ex.keyObject && ex.keyObject.type === "public")
+    return ex.keyObject;
+  let data, passphrase;
+  if (ex.keyObject) {
+    data = ex.keyObject._data;
+    passphrase = undefined;
+  } else {
+    data = ex.data;
+    passphrase = ex.passphrase;
+  }
+  const der = native.cryptoExportKey(data, passphrase, "spki-der");
+  const info = native.cryptoKeyInfo(der);
+  return new KeyObject("public", der, info);
+}
+
+function createSecretKey(key, encoding) {
+  let data;
+  if (typeof key === "string")
+    data = Buffer.from(key, encoding || "utf8");
+  else
+    data = Buffer.from(toBytes(key));
+  return new KeyObject("secret", data, {});
+}
+
+function cryptoSignOptions(key) {
+  if (key && typeof key === "object" && !(key instanceof KeyObject) &&
+      !ArrayBuffer.isView(key) && !(key instanceof ArrayBuffer))
+    return key;
+  return {};
+}
+
+function cryptoCurveBytes(name) {
+  switch (name) {
+  case "prime256v1":
+  case "secp256r1":
+  case "secp256k1":
+    return 32;
+  case "secp384r1":
+    return 48;
+  case "secp521r1":
+    return 66;
+  default:
+    return 0;
+  }
+}
+
+function readDerLength(buf, pos) {
+  let len = buf[pos++];
+  if (len & 0x80) {
+    let n = len & 0x7f;
+    if (n === 0 || n > 4)
+      throw new Error("Invalid DER length");
+    len = 0;
+    while (n--)
+      len = (len << 8) | buf[pos++];
+  }
+  return { len, pos };
+}
+
+function ecdsaDerToP1363(der, size) {
+  if (der[0] !== 0x30)
+    throw new Error("Invalid ECDSA signature");
+  let pos = readDerLength(der, 1).pos;
+  const out = Buffer.alloc(size * 2);
+  for (let i = 0; i < 2; i++) {
+    if (der[pos] !== 0x02)
+      throw new Error("Invalid ECDSA signature");
+    const r = readDerLength(der, pos + 1);
+    let value = der.subarray(r.pos, r.pos + r.len);
+    while (value.length > size && value[0] === 0)
+      value = value.subarray(1);
+    if (value.length > size)
+      throw new Error("Invalid ECDSA signature");
+    out.set(value, i * size + size - value.length);
+    pos = r.pos + r.len;
+  }
+  return out;
+}
+
+function ecdsaP1363ToDer(raw) {
+  if (raw.length % 2 !== 0)
+    throw new Error("Invalid ECDSA signature");
+  const size = raw.length / 2;
+  const encodeInt = (value) => {
+    let i = 0;
+    while (i < value.length - 1 && value[i] === 0)
+      i++;
+    value = value.subarray(i);
+    if (value[0] & 0x80)
+      value = Buffer.concat([Buffer.from([0]), value]);
+    return Buffer.concat([Buffer.from([0x02, value.length]), value]);
+  };
+  const body = Buffer.concat([
+    encodeInt(raw.subarray(0, size)),
+    encodeInt(raw.subarray(size)),
+  ]);
+  let header;
+  if (body.length < 128)
+    header = Buffer.from([0x30, body.length]);
+  else if (body.length <= 255)
+    header = Buffer.from([0x30, 0x81, body.length]);
+  else
+    header = Buffer.from([0x30, 0x82, body.length >> 8, body.length & 0xff]);
+  return Buffer.concat([header, body]);
+}
+
+function sign(algorithm, data, key) {
+  const algo = normalizeCryptoAlgorithm(algorithm);
+  const options = cryptoSignOptions(key);
+  const ko = key instanceof KeyObject ? key : createPrivateKey(key);
+  if (ko.type !== "private")
+    throw new TypeError("Private key required");
+  const pss = algo.pss ||
+    options.padding === CRYPTO_CONSTANTS.RSA_PKCS1_PSS_PADDING;
+  let sig = Buffer.from(native.cryptoSign(algo.digest, toBytes(data), ko._data,
+                                          pss));
+  if (options.dsaEncoding === "ieee-p1363" &&
+      ko.asymmetricKeyType === "ec") {
+    const size = cryptoCurveBytes(ko.asymmetricKeyDetails.namedCurve);
+    if (!size)
+      throw new Error("Unsupported curve");
+    sig = ecdsaDerToP1363(sig, size);
+  }
+  return sig;
+}
+
+function verify(algorithm, data, key, signature) {
+  const algo = normalizeCryptoAlgorithm(algorithm);
+  const options = cryptoSignOptions(key);
+  const ko = key instanceof KeyObject ? key : createPublicKey(key);
+  const pss = algo.pss ||
+    options.padding === CRYPTO_CONSTANTS.RSA_PKCS1_PSS_PADDING;
+  let sig = toBytes(signature);
+  if (options.dsaEncoding === "ieee-p1363" &&
+      ko.asymmetricKeyType === "ec")
+    sig = ecdsaP1363ToDer(sig);
+  return native.cryptoVerify(algo.digest, toBytes(data), ko._data, sig, pss);
+}
+
+class Sign {
+  constructor(algorithm) {
+    this._algorithm = algorithm;
+    this._parts = [];
+  }
+  update(data, encoding) {
+    this._parts.push(Buffer.from(toBytes(data, encoding)));
+    return this;
+  }
+  sign(key, outputEncoding) {
+    const sig = sign(this._algorithm, Buffer.concat(this._parts), key);
+    if (typeof outputEncoding === "string")
+      return sig.toString(outputEncoding);
+    return sig;
+  }
+}
+
+class Verify {
+  constructor(algorithm) {
+    this._algorithm = algorithm;
+    this._parts = [];
+  }
+  update(data, encoding) {
+    this._parts.push(Buffer.from(toBytes(data, encoding)));
+    return this;
+  }
+  verify(key, signature, signatureEncoding) {
+    let sig = signature;
+    if (typeof sig === "string")
+      sig = Buffer.from(sig, signatureEncoding || "hex");
+    return verify(this._algorithm, Buffer.concat(this._parts), key,
+                  toBytes(sig));
+  }
+}
+
+function pbkdf2Sync(password, salt, iterations, keylen, digest) {
+  digest = digest || "sha1";
+  return Buffer.from(native.cryptoPbkdf2(toBytes(password), toBytes(salt),
+                                         iterations, keylen, digest));
+}
+
+function pbkdf2(password, salt, iterations, keylen, digest, callback) {
+  if (typeof digest === "function") {
+    callback = digest;
+    digest = "sha1";
+  }
+  if (typeof callback !== "function")
+    throw new TypeError("Callback must be a function");
+  queueMicrotask(() => {
+    try {
+      callback(null, pbkdf2Sync(password, salt, iterations, keylen, digest));
+    } catch (e) {
+      callback(e);
+    }
+  });
+}
+
+function scryptSync(password, salt, keylen, options) {
+  options = options || {};
+  const N = options.N !== undefined ? options.N
+    : (options.cost !== undefined ? options.cost : 16384);
+  const r = options.r !== undefined ? options.r
+    : (options.blockSize !== undefined ? options.blockSize : 8);
+  const p = options.p !== undefined ? options.p
+    : (options.parallelization !== undefined ? options.parallelization : 1);
+  const maxmem = options.maxmem !== undefined
+    ? options.maxmem : 32 * 1024 * 1024;
+  return Buffer.from(native.cryptoScrypt(toBytes(password), toBytes(salt),
+                                         keylen, N, r, p, maxmem));
+}
+
+function scrypt(password, salt, keylen, options, callback) {
+  if (typeof options === "function") {
+    callback = options;
+    options = {};
+  }
+  if (typeof callback !== "function")
+    throw new TypeError("Callback must be a function");
+  queueMicrotask(() => {
+    try {
+      callback(null, scryptSync(password, salt, keylen, options));
+    } catch (e) {
+      callback(e);
+    }
+  });
+}
+
+function hkdfSync(digest, ikm, salt, info, keylen) {
+  return Buffer.from(native.cryptoHkdf(digest, toBytes(ikm),
+    salt === undefined || salt === null ? undefined : toBytes(salt),
+    info === undefined || info === null ? undefined : toBytes(info),
+    keylen));
+}
+
+function hkdf(digest, ikm, salt, info, keylen, callback) {
+  if (typeof callback !== "function")
+    throw new TypeError("Callback must be a function");
+  queueMicrotask(() => {
+    try {
+      callback(null, hkdfSync(digest, ikm, salt, info, keylen));
+    } catch (e) {
+      callback(e);
+    }
+  });
+}
+
+function generateKeyPairSync(type, options) {
+  options = options || {};
+  const t = String(type).toLowerCase();
+  let bits, exponent, curve;
+  if (t === "rsa" || t === "rsa-pss") {
+    bits = options.modulusLength || 2048;
+    exponent = options.publicExponent === undefined
+      ? 65537 : Number(options.publicExponent);
+  } else if (t === "ec") {
+    curve = options.namedCurve || "prime256v1";
+  } else {
+    throw new TypeError("Unsupported key type: " + type);
+  }
+  const r = native.cryptoGenerateKeyPair(t === "rsa-pss" ? "rsa" : t,
+                                         bits, exponent, curve);
+  const privBytes = Buffer.from(r.privateKey);
+  const pubBytes = Buffer.from(r.publicKey);
+  const pubInfo = native.cryptoKeyInfo(pubBytes);
+  const privInfo = { type: "private",
+                     asymmetricKeyType: pubInfo.asymmetricKeyType,
+                     details: pubInfo.details };
+  return {
+    publicKey: new KeyObject("public", pubBytes, pubInfo),
+    privateKey: new KeyObject("private", privBytes, privInfo),
+  };
+}
+
+function generateKeyPair(type, options, callback) {
+  if (typeof options === "function") {
+    callback = options;
+    options = {};
+  }
+  if (typeof callback !== "function")
+    throw new TypeError("Callback must be a function");
+  queueMicrotask(() => {
+    try {
+      const pair = generateKeyPairSync(type, options);
+      callback(null, pair.publicKey, pair.privateKey);
+    } catch (e) {
+      callback(e);
+    }
+  });
+}
+
 const crypto = {
   createHash,
   createHmac(algorithm, key) {
@@ -6568,6 +6982,23 @@ const crypto = {
     };
     return self;
   },
+  KeyObject,
+  createPrivateKey,
+  createPublicKey,
+  createSecretKey,
+  sign,
+  verify,
+  createSign(algorithm) { return new Sign(algorithm); },
+  createVerify(algorithm) { return new Verify(algorithm); },
+  generateKeyPair,
+  generateKeyPairSync,
+  pbkdf2,
+  pbkdf2Sync,
+  scrypt,
+  scryptSync,
+  hkdf,
+  hkdfSync,
+  constants: CRYPTO_CONSTANTS,
   randomBytes(size, cb) {
     const b = Buffer.from(native.randomBytes(size));
     if (cb) { queueMicrotask(() => cb(null, b)); return undefined; }
