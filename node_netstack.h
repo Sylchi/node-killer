@@ -29,6 +29,14 @@ int node_netstack_connect(int fd, const struct sockaddr *sa, socklen_t len);
 
 ssize_t node_netstack_read(int fd, void *buf, size_t len);
 ssize_t node_netstack_write(int fd, const void *buf, size_t len);
+/* Datagram I/O. sendto() may transparently replace the eventfd with a kernel
+   socket when the destination is outside the managed prefixes. recvfrom()
+   returns one queued datagram and its source address. */
+ssize_t node_netstack_sendto(int fd, const struct sockaddr *sa, socklen_t len,
+                             const void *buf, size_t buflen);
+ssize_t node_netstack_recvfrom(int fd, void *buf, size_t len,
+                               struct sockaddr *sa, socklen_t *salen);
+int node_netstack_disconnect(int fd);
 int node_netstack_close(int fd);
 int node_netstack_shutdown(int fd, int how);
 

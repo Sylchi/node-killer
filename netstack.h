@@ -17,6 +17,9 @@
 #define NS_MAX_LISTENERS 64
 #define NS_MAX_PACKET 2048
 #define NS_RCVBUF_SIZE 65536
+#define NS_MAX_UDP_SOCKETS 256
+#define NS_UDP_QUEUE_MAX 64
+#define NS_UDP_QUEUE_BYTES (256 * 1024)
 
 typedef struct NsStack NsStack;
 
@@ -42,6 +45,8 @@ enum {
     NS_EMSGSIZE = 3,
     NS_ECLOSED = 4,
     NS_EINVAL = 5,
+    NS_EADDRINUSE = 6,
+    NS_EDESTADDRREQ = 7,
 };
 
 /* Connection states, in the order used by ns_conn_state(). */
@@ -146,6 +151,27 @@ int ns_conn_state(NsStack *s, uint64_t id);
 int ns_conn_peer_closed(NsStack *s, uint64_t id);
 int ns_conn_addr(NsStack *s, uint64_t id, NsAddr *local, uint16_t *lport,
                  NsAddr *remote, uint16_t *rport);
+
+/* UDP sockets. A UDP socket is opened bound to a local address/port; pass
+   port 0 for an ephemeral port. A zero address (or a NULL local) is the
+   wildcard bind. The returned id is separate from the TCP connection id
+   space and 0 means failure. */
+uint64_t ns_udp_open(NsStack *s, const NsAddr *local, uint16_t port, int reuse);
+int ns_udp_connect(NsStack *s, uint64_t id, const NsAddr *remote,
+                   uint16_t rport);
+int ns_udp_disconnect(NsStack *s, uint64_t id);
+int ns_udp_sendto(NsStack *s, uint64_t id, const NsAddr *dst, uint16_t dport,
+                  const void *buf, size_t len);
+/* Returns the datagram length, or -NS_EAGAIN when the queue is empty. */
+int ns_udp_recvfrom(NsStack *s, uint64_t id, void *buf, size_t len,
+                    NsAddr *src, uint16_t *sport);
+int ns_udp_close(NsStack *s, uint64_t id);
+int ns_udp_readable(NsStack *s, uint64_t id);
+int ns_udp_bound_addr(NsStack *s, uint64_t id, NsAddr *local,
+                      uint16_t *lport);
+int ns_udp_peer_addr(NsStack *s, uint64_t id, NsAddr *remote,
+                     uint16_t *rport);
+int ns_udp_is_connected(NsStack *s, uint64_t id);
 
 int ns_shard_pending(NsStack *s, int shard);
 const NsStats *ns_stats(NsStack *s);

@@ -951,6 +951,7 @@ function registerBuiltins() {
   builtins.constants = fsConstants;
   builtins.crypto = crypto;
   builtins.diagnostics_channel = diagnosticsChannel;
+  builtins.dgram = dgram;
   builtins.dns = dns;
   builtins["dns/promises"] = dns.promises;
   builtins.events = EventEmitter;

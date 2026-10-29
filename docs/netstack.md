@@ -1,9 +1,9 @@
 # Owned TCP/IP stack (`netstack`)
 
-Status: integrated. `node:net` now hands managed IPv4 and IPv6 TCP streams to
-the in-process stack in `netstack.c` instead of the kernel. UDP and unmanaged
-addresses still use kernel sockets, and `netstack: false` restores the kernel
-path per socket.
+Status: integrated. `node:net` hands managed IPv4 and IPv6 TCP streams and
+`node:dgram` UDP sockets to the in-process stack in `netstack.c` instead of the
+kernel. Unmanaged addresses still use kernel sockets, and `netstack: false`
+restores the kernel path per socket.
 
 The kernel-backed sharded transport is still available and is documented in
 `docs/sharded-net.md`. The two features share the same `/64` address layout
@@ -13,13 +13,13 @@ sharded listeners use kernel TCP, the managed prefix uses the owned stack.
 ## Architecture
 
 ```
-  node:net / http / WebSocket
+  node:net / node:dgram / http / WebSocket
              |
-       native.socket/read/write/...
+       native.socket/read/write/sendto/recvfrom
              |
    node_netstack.c  (virtual fd bridge)
       |            |
-   eventfd      netstack.c  (IPv4/IPv6 + TCP state machine)
+   eventfd      netstack.c  (IPv4/IPv6 + TCP state machine + UDP sockets)
                    |
               netstack_link.c
               /             \
@@ -28,8 +28,8 @@ sharded listeners use kernel TCP, the managed prefix uses the owned stack.
 
 - `netstack.c` is transport-agnostic. It consumes and emits complete IPv4 or
   IPv6 packets; it never opens a kernel socket. IPv4 and IPv6 share the TCP
-  state machine and differ only in header encode/decode, checksum
-  pseudo-headers and dispatch.
+  state machine and the UDP socket table and differ only in header
+  encode/decode, checksum pseudo-headers and dispatch.
 - `netstack_link.c` is the link: an in-process loopback or a Linux TUN device.
 - `node_netstack.c` exposes the stack as descriptors. Each virtual fd is an
   `eventfd`; `node.c` routes socket natives to the bridge when the descriptor
@@ -58,12 +58,16 @@ const kernelSocket = net.connect({ host: "...", port: 80, netstack: false });
 
 The default is automatic:
 
-- An IPv4 or IPv6 stream socket whose bind or connect address lies inside the
-  matching managed prefix stays on the owned stack.
+- An IPv4 or IPv6 socket whose bind or connect address lies inside the
+  matching managed prefix stays on the owned stack. This applies to both TCP
+  streams and UDP datagrams.
 - Any other address is converted to a real kernel socket in place, so the
-  descriptor number and the JS `Socket` object stay valid.
-- UDP sockets, `shards`/`subnet` listeners, and sockets created when the stack
-  could not be initialised still use the kernel.
+  descriptor number and the JS `Socket`/`dgram.Socket` object stay valid.
+- A UDP socket that sends first is placed on the owned engine when the
+  destination is managed (or when forced); otherwise it falls back to the
+  kernel. A wildcard bind on an unforced UDP socket also stays on the kernel.
+- `shards`/`subnet` listeners, and sockets created when the stack could not be
+  initialised, still use the kernel.
 - `netstack: true` keeps the socket on the owned stack even when the address
   is outside the managed prefix (for example `127.0.0.1`).
 
@@ -169,8 +173,8 @@ Implemented:
 
 Current limits:
 
-- TCP only. UDP, ICMP, IPv4/IPv6 fragmentation and reassembly are not
-  implemented; those packets are dropped, and UDP stays on the kernel path.
+- No ICMP, IPv4/IPv6 fragmentation or reassembly. UDP datagrams larger than
+  the link MTU are rejected instead of being fragmented.
 - No out-of-order reassembly, SACK, window scaling, congestion control or
   delayed ACK. The receive window is a fixed 64 KiB ring; peers that exceed it
   are retransmitted into after the application reads.
@@ -181,6 +185,44 @@ Current limits:
   dedicated regression test yet.
 - IPv4 is plain-only. There is no shard byte in an IPv4 header, so sharded
   listener allocation remains an IPv6 feature.
+
+## UDP behaviour
+
+The UDP engine shares the IP layer and the virtual-fd bridge with TCP. A UDP
+socket is identified separately from a TCP connection and is opened with
+`ns_udp_open()`, which binds immediately (port 0 picks an ephemeral port in
+the 49152–65535 range). The engine supports:
+
+- IPv4 and IPv6 headers and pseudo-header checksums;
+- exact-address and wildcard binds in one family; an exact bind wins over a
+  wildcard bind for the same port;
+- `SO_REUSEADDR` between datagram sockets, modelled as "both sockets asked
+  for it", matching the usual Linux bind rule;
+- connected sockets that filter input by peer address and port and allow
+  `send()`/`sendto(NULL)` without repeating the destination;
+- `connect()`, `disconnect()`, `send()`, `send(offset, length, ...)`,
+  `bind()`, `address()`, `remoteAddress()`, `close()` and the usual
+  `message`/`listening`/`connect`/`close`/`error` events in `node:dgram`.
+
+Limits and errors:
+
+- At most 256 UDP sockets per stack, 64 queued datagrams and 256 KiB of
+  queued payload per socket. Datagrams that arrive for a full queue or for no
+  matching socket are counted as drops.
+- `NS_EMSGSIZE`/`EMSGSIZE` when the payload does not fit in one link frame:
+  1472 bytes for IPv4 and 1452 bytes for IPv6, i.e. `1500 - IP header - 8`.
+- `EADDRINUSE` on a conflicting bind; `EDESTADDRREQ` when an unconnected
+  socket sends without a destination; `ENOTCONN` for a disconnected peer
+  query. A receive buffer smaller than the datagram truncates it.
+- Every transmitted datagram carries a checksum; a computed zero is sent as
+  `0xffff`, as required for IPv6. Incoming IPv6 datagrams with a zero checksum
+  are dropped.
+
+The `dgram` module is implemented in `bootstrap/55-dgram.js`. It uses the same
+`native.socket(..., SOCK_DGRAM, ...)`, `bind`, `sendto`, `recvfrom`, `connect`
+and `disconnect` primitives as the TCP path. Broadcast and multicast
+membership setters are accepted as no-ops for API compatibility; the engine
+does not implement multicast or broadcast delivery.
 
 ## Sharded transport relationship
 
@@ -193,22 +235,32 @@ connection-address allocation.
 ## Testing
 
 ```sh
-make netstack-test       # C engine: handshake, data, close, retransmit, dispatch
+make netstack-test       # C engine: TCP, UDP, dispatch, retransmit, limits
 make netstack-tun-test   # optional TUN path in a private user+network namespace
-make qnode-test          # includes tests/qnode/netstack_socket.js
+make qnode-test          # includes netstack_socket.js and netstack_dgram.js
 ```
 
-`tests/qnode/netstack_socket.js` runs the JS integration end to end over
+`tests/netstack_test.c` covers IPv4 and IPv6 datagram round-trips, ephemeral
+ports, wildcard and exact binds, reuse rules, connected sockets, disconnect,
+queue ordering, truncation, checksum handling and the oversize error.
+
+`tests/qnode/netstack_socket.js` runs the TCP integration end to end over
 loopback: explicit and automatic netstack selection for both families,
 concurrent connections, IPv6 and IPv4 binary echoes spanning multiple MSS,
-forced IPv4 on `127.0.0.1`, and kernel fallback for unmanaged addresses. The
-WebSocket suite in `tests/qnode/websocket.js` also runs over `node:net` and
-can be pointed at managed addresses for manual testing.
+forced IPv4 on `127.0.0.1`, and kernel fallback for unmanaged addresses.
+
+`tests/qnode/netstack_dgram.js` does the same for UDP: owned IPv4 and IPv6
+datagrams, auto-selection by address, send-first auto-binding, queued
+messages, connected sockets and peer filtering, `disconnect()`, kernel
+fallback, forced `127.0.0.1`, the `ERR_SOCKET_DGRAM_*` errors, `EADDRINUSE`
+and `EMSGSIZE`. The WebSocket suite
+in `tests/qnode/websocket.js` also runs over `node:net` and can be pointed at
+managed addresses for manual testing.
 
 `tests/qnode/netstack_tun.sh` starts a TUN-backed stack in `unshare -rn`, adds
-IPv6 and IPv4 host-side addresses, and connects to both with kernel clients.
-It skips (and succeeds) when user namespaces, `ip(8)` or `/dev/net/tun` are
-unavailable.
+IPv6 and IPv4 host-side addresses, and exchanges TCP streams and UDP
+datagrams with kernel clients over both families. It skips (and succeeds) when
+user namespaces, `ip(8)` or `/dev/net/tun` are unavailable.
 
 The C test is `tests/netstack_test.c`; it links the stack directly and needs no
 runtime or privileges.

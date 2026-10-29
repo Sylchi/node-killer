@@ -15,6 +15,8 @@
 #define NS_IPV4_HDR 20
 #define NS_IPV6_HDR 40
 #define NS_TCP_HDR 20
+#define NS_UDP_HDR 8
+#define NS_MTU 1500
 #define NS_MSS 1400
 #define NS_RTO_MS 200
 #define NS_MAX_RETRIES 6
@@ -87,6 +89,30 @@ typedef struct NsShard {
     uint16_t next_port;
 } NsShard;
 
+typedef struct NsDgram {
+    struct NsDgram *next;
+    NsAddr src;
+    uint16_t sport;
+    uint16_t len;
+    uint8_t data[];
+} NsDgram;
+
+typedef struct NsUdp {
+    struct NsUdp *next;
+    uint64_t id;
+    NsAddr local;
+    NsAddr remote;
+    uint16_t lport;
+    uint16_t rport;
+    uint8_t has_local;
+    uint8_t connected;
+    uint8_t reuse;
+    NsDgram *qhead;
+    NsDgram *qtail;
+    int qlen;
+    size_t qbytes;
+} NsUdp;
+
 typedef struct NsListener {
     NsAddr addr;
     uint16_t port;
@@ -101,6 +127,10 @@ struct NsStack {
     void *opaque;
     NsListener listeners[NS_MAX_LISTENERS];
     int nlisteners;
+    NsUdp *udp;
+    int nudp;
+    uint64_t next_udp_seq;
+    uint16_t next_udp_port;
     int plain;
     NsAddr plain_addr4;
     NsAddr plain_addr6;
@@ -113,6 +143,8 @@ struct NsStack {
     uint8_t dispatch_log[NS_DISPATCH_LOG_MAX];
     int dispatch_log_len;
 };
+
+static void udp_free(NsUdp *u);
 
 /* ---------------- byte order and checksums ---------------- */
 
@@ -160,8 +192,9 @@ static uint16_t csum_fold(uint32_t sum)
     return (uint16_t)~sum;
 }
 
-static uint16_t tcp_checksum(const uint8_t *src, const uint8_t *dst,
-                             int family, const uint8_t *tcp, size_t tcp_len)
+static uint16_t l4_checksum(const uint8_t *src, const uint8_t *dst,
+                            int family, uint8_t proto, const uint8_t *seg,
+                            size_t seg_len)
 {
     uint32_t sum = 0;
 
@@ -170,20 +203,35 @@ static uint16_t tcp_checksum(const uint8_t *src, const uint8_t *dst,
         memcpy(pseudo, src, 4);
         memcpy(pseudo + 4, dst, 4);
         pseudo[8] = 0;
-        pseudo[9] = 6;
-        wr16(pseudo + 10, (uint16_t)tcp_len);
+        pseudo[9] = proto;
+        wr16(pseudo + 10, (uint16_t)seg_len);
         sum = csum_add(sum, pseudo, sizeof(pseudo));
     } else {
         uint8_t tail[4];
-        uint8_t next[4] = { 0, 0, 0, 6 };
+        uint8_t next[4] = { 0, 0, 0, proto };
         sum = csum_add(sum, src, 16);
         sum = csum_add(sum, dst, 16);
-        wr32(tail, (uint32_t)tcp_len);
+        wr32(tail, (uint32_t)seg_len);
         sum = csum_add(sum, tail, sizeof(tail));
         sum = csum_add(sum, next, sizeof(next));
     }
-    sum = csum_add(sum, tcp, tcp_len);
+    sum = csum_add(sum, seg, seg_len);
     return csum_fold(sum);
+}
+
+static uint16_t tcp_checksum(const uint8_t *src, const uint8_t *dst,
+                             int family, const uint8_t *tcp, size_t tcp_len)
+{
+    return l4_checksum(src, dst, family, 6, tcp, tcp_len);
+}
+
+/* A computed zero is transmitted as 0xffff: zero means "no checksum" in
+   IPv4 and is invalid in IPv6. */
+static uint16_t udp_checksum(const uint8_t *src, const uint8_t *dst,
+                             int family, const uint8_t *udp, size_t udp_len)
+{
+    uint16_t c = l4_checksum(src, dst, family, 17, udp, udp_len);
+    return c ? c : 0xffff;
 }
 
 static uint16_t ipv4_checksum(const uint8_t *hdr, size_t len)
@@ -261,6 +309,15 @@ static int addr_eq(const NsAddr *a, const NsAddr *b)
            memcmp(a->b, b->b, sizeof(a->b)) == 0;
 }
 
+static int addr_unspecified(const NsAddr *a)
+{
+    int i;
+    for (i = 0; i < NS_ADDR_LEN; i++)
+        if (a->b[i])
+            return 0;
+    return 1;
+}
+
 static int is_service_addr(const NsAddr *a)
 {
     int i;
@@ -291,6 +348,7 @@ NsStack *ns_stack_new(const uint8_t prefix[NS_PREFIX_LEN], int nshards,
     s->opaque = opaque;
     s->clock = 1;
     s->rnd = 0x9e3779b9u ^ (uint32_t)nshards;
+    s->next_udp_port = (uint16_t)(49152 + nshards * 31);
     for (i = 0; i < nshards; i++) {
         s->shards[i].stack = s;
         s->shards[i].index = i;
@@ -329,6 +387,14 @@ void ns_stack_free(NsStack *s)
             NsConn *next = c->next;
             conn_free(c);
             c = next;
+        }
+    }
+    {
+        NsUdp *u = s->udp;
+        while (u) {
+            NsUdp *next = u->next;
+            udp_free(u);
+            u = next;
         }
     }
     free(s);
@@ -865,6 +931,428 @@ static NsConn *server_accept_syn(NsShard *sh, const NsAddr *src,
     return c;
 }
 
+/* ---------------- UDP ---------------- */
+
+static void udp_free(NsUdp *u)
+{
+    NsDgram *d = u->qhead;
+    while (d) {
+        NsDgram *next = d->next;
+        free(d);
+        d = next;
+    }
+    free(u);
+}
+
+static NsUdp *udp_by_id(NsStack *s, uint64_t id)
+{
+    NsUdp *u;
+
+    if (!s || (id >> 63) == 0)
+        return NULL;
+    for (u = s->udp; u; u = u->next)
+        if (u->id == id)
+            return u;
+    return NULL;
+}
+
+/* Two binds overlap when they share a port and family and either one is the
+   wildcard or both name the same local address. SO_REUSEADDR is modelled as
+   "both sockets asked for it". */
+static int udp_port_conflict(const NsStack *s, const NsAddr *local,
+                             int has_local, uint16_t port, int family,
+                             int reuse)
+{
+    NsUdp *u;
+
+    for (u = s->udp; u; u = u->next) {
+        if (u->lport != port || u->local.family != family)
+            continue;
+        if (has_local && u->has_local && !addr_eq(&u->local, local))
+            continue;
+        if (reuse && u->reuse)
+            continue;
+        return 1;
+    }
+    return 0;
+}
+
+static NsUdp *udp_find(NsStack *s, const NsAddr *dst, uint16_t dport,
+                       const NsAddr *src, uint16_t sport)
+{
+    NsUdp *u;
+    NsUdp *best = NULL;
+    int best_exact = -1;
+
+    for (u = s->udp; u; u = u->next) {
+        int exact;
+
+        if (u->lport != dport ||
+            u->local.family != (uint8_t)ns_addr_family(dst))
+            continue;
+        if (u->connected &&
+            (u->rport != sport || !addr_eq(&u->remote, src)))
+            continue;
+        if (u->has_local) {
+            if (!addr_eq(&u->local, dst))
+                continue;
+            exact = 1;
+        } else {
+            exact = 0;
+        }
+        if (exact > best_exact) {
+            best = u;
+            best_exact = exact;
+        }
+    }
+    return best;
+}
+
+static int udp_emit(NsStack *s, const NsAddr *src, const NsAddr *dst,
+                    uint16_t sport, uint16_t dport, const void *buf,
+                    size_t len)
+{
+    uint8_t pkt[NS_MAX_PACKET];
+    int family = ns_addr_family(dst);
+    size_t ip_hdr = family == NS_AF_INET ? NS_IPV4_HDR : NS_IPV6_HDR;
+    size_t udp_len = NS_UDP_HDR + len;
+    size_t total = ip_hdr + udp_len;
+    uint8_t *udp;
+
+    if (!s->send || family != ns_addr_family(src) ||
+        len > NS_MTU - ip_hdr - NS_UDP_HDR || total > sizeof(pkt) ||
+        udp_len > 65535)
+        return -NS_EMSGSIZE;
+
+    if (family == NS_AF_INET) {
+        memset(pkt, 0, NS_IPV4_HDR);
+        pkt[0] = 0x45;
+        wr16(pkt + 2, (uint16_t)total);
+        wr16(pkt + 4, ++s->ip_id);
+        wr16(pkt + 6, 0x4000); /* DF */
+        pkt[8] = 64;           /* TTL */
+        pkt[9] = 17;           /* UDP */
+        memcpy(pkt + 12, src->b, 4);
+        memcpy(pkt + 16, dst->b, 4);
+        wr16(pkt + 10, ipv4_checksum(pkt, NS_IPV4_HDR));
+    } else {
+        memset(pkt, 0, NS_IPV6_HDR);
+        pkt[0] = 0x60;
+        wr16(pkt + 4, (uint16_t)udp_len);
+        pkt[6] = 17; /* UDP */
+        pkt[7] = 64; /* hop limit */
+        memcpy(pkt + 8, src->b, 16);
+        memcpy(pkt + 24, dst->b, 16);
+    }
+
+    udp = pkt + ip_hdr;
+    wr16(udp, sport);
+    wr16(udp + 2, dport);
+    wr16(udp + 4, (uint16_t)udp_len);
+    wr16(udp + 6, 0);
+    if (len)
+        memcpy(udp + NS_UDP_HDR, buf, len);
+    wr16(udp + 6, udp_checksum(src->b, dst->b, family, udp, udp_len));
+
+    s->stats.tx_packets++;
+    s->send(s, pkt, total, s->opaque);
+    return 0;
+}
+
+uint64_t ns_udp_open(NsStack *s, const NsAddr *local, uint16_t port, int reuse)
+{
+    NsAddr la;
+    NsUdp *u;
+    uint16_t p;
+    int family;
+    int has_local;
+    int tries;
+
+    if (!s || s->nudp >= NS_MAX_UDP_SOCKETS)
+        return 0;
+
+    if (local) {
+        family = ns_addr_family(local);
+        la = *local;
+        la.family = (uint8_t)family;
+        has_local = !addr_unspecified(&la);
+    } else {
+        if (ns_stack_local_family(s, NS_AF_INET6))
+            family = NS_AF_INET6;
+        else if (ns_stack_local_family(s, NS_AF_INET))
+            family = NS_AF_INET;
+        else
+            family = NS_AF_INET6;
+        memset(&la, 0, sizeof(la));
+        la.family = (uint8_t)family;
+        has_local = 0;
+    }
+    if (!has_local)
+        memset(la.b, 0, sizeof(la.b));
+
+    if (port) {
+        if (udp_port_conflict(s, &la, has_local, port, family, reuse))
+            return 0;
+        p = port;
+    } else {
+        p = s->next_udp_port;
+        if (p < 1024)
+            p = 49152;
+        for (tries = 0; tries < 65535; tries++) {
+            if (p == 0)
+                p = 49152;
+            if (!udp_port_conflict(s, &la, has_local, p, family, reuse))
+                break;
+            p++;
+        }
+        if (tries >= 65535)
+            return 0;
+        s->next_udp_port = (uint16_t)(p + 1);
+    }
+
+    u = calloc(1, sizeof(*u));
+    if (!u)
+        return 0;
+    u->id = (1ULL << 63) | (++s->next_udp_seq);
+    u->local = la;
+    u->lport = p;
+    u->has_local = (uint8_t)(has_local != 0);
+    u->reuse = (uint8_t)(reuse != 0);
+    u->next = s->udp;
+    s->udp = u;
+    s->nudp++;
+    return u->id;
+}
+
+int ns_udp_connect(NsStack *s, uint64_t id, const NsAddr *remote,
+                   uint16_t rport)
+{
+    NsUdp *u = udp_by_id(s, id);
+    int family;
+
+    if (!u)
+        return -NS_ENOTCONN;
+    if (!remote || rport == 0 || addr_unspecified(remote))
+        return -NS_EINVAL;
+    family = ns_addr_family(remote);
+    if (family != (int)u->local.family)
+        return -NS_EINVAL;
+    u->remote = *remote;
+    u->remote.family = (uint8_t)family;
+    u->rport = rport;
+    u->connected = 1;
+    return 0;
+}
+
+int ns_udp_disconnect(NsStack *s, uint64_t id)
+{
+    NsUdp *u = udp_by_id(s, id);
+
+    if (!u)
+        return -NS_ENOTCONN;
+    u->connected = 0;
+    u->rport = 0;
+    memset(&u->remote, 0, sizeof(u->remote));
+    return 0;
+}
+
+int ns_udp_sendto(NsStack *s, uint64_t id, const NsAddr *dst, uint16_t dport,
+                  const void *buf, size_t len)
+{
+    NsUdp *u = udp_by_id(s, id);
+    const NsAddr *src;
+    const NsAddr *rdst;
+    uint16_t rport;
+    int family;
+
+    if (!u)
+        return -NS_ENOTCONN;
+    if (!dst) {
+        if (!u->connected)
+            return -NS_EDESTADDRREQ;
+        rdst = &u->remote;
+        rport = u->rport;
+    } else {
+        if (dport == 0 || addr_unspecified(dst))
+            return -NS_EINVAL;
+        rdst = dst;
+        rport = dport;
+    }
+    family = ns_addr_family(rdst);
+
+    if (u->has_local) {
+        if (ns_addr_family(&u->local) != family)
+            return -NS_EINVAL;
+        src = &u->local;
+    } else {
+        if (u->local.family && (int)u->local.family != family)
+            return -NS_EINVAL;
+        src = ns_stack_local_family(s, family);
+        if (!src)
+            return -NS_EINVAL;
+    }
+
+    if (udp_emit(s, src, rdst, u->lport, rport, buf, len) != 0)
+        return -NS_EMSGSIZE;
+    return (int)len;
+}
+
+int ns_udp_recvfrom(NsStack *s, uint64_t id, void *buf, size_t len,
+                    NsAddr *src, uint16_t *sport)
+{
+    NsUdp *u = udp_by_id(s, id);
+    NsDgram *d;
+    size_t n;
+
+    if (!u)
+        return -NS_ENOTCONN;
+    d = u->qhead;
+    if (!d)
+        return -NS_EAGAIN;
+    u->qhead = d->next;
+    if (!u->qhead)
+        u->qtail = NULL;
+    u->qlen--;
+    u->qbytes -= d->len;
+
+    n = len < d->len ? len : d->len;
+    if (n)
+        memcpy(buf, d->data, n);
+    if (src)
+        *src = d->src;
+    if (sport)
+        *sport = d->sport;
+    free(d);
+    return (int)n;
+}
+
+int ns_udp_close(NsStack *s, uint64_t id)
+{
+    NsUdp **pp;
+    NsUdp *u;
+
+    if (!s)
+        return -NS_EINVAL;
+    for (pp = &s->udp; (u = *pp) != NULL; pp = &u->next) {
+        if (u->id != id)
+            continue;
+        *pp = u->next;
+        s->nudp--;
+        udp_free(u);
+        return 0;
+    }
+    return -NS_ENOTCONN;
+}
+
+int ns_udp_readable(NsStack *s, uint64_t id)
+{
+    NsUdp *u = udp_by_id(s, id);
+
+    if (!u)
+        return 1;
+    return u->qhead != NULL;
+}
+
+int ns_udp_bound_addr(NsStack *s, uint64_t id, NsAddr *local,
+                      uint16_t *lport)
+{
+    NsUdp *u = udp_by_id(s, id);
+
+    if (!u)
+        return -NS_ENOTCONN;
+    if (local)
+        *local = u->local;
+    if (lport)
+        *lport = u->lport;
+    return 0;
+}
+
+int ns_udp_peer_addr(NsStack *s, uint64_t id, NsAddr *remote,
+                     uint16_t *rport)
+{
+    NsUdp *u = udp_by_id(s, id);
+
+    if (!u || !u->connected)
+        return -NS_ENOTCONN;
+    if (remote)
+        *remote = u->remote;
+    if (rport)
+        *rport = u->rport;
+    return 0;
+}
+
+int ns_udp_is_connected(NsStack *s, uint64_t id)
+{
+    NsUdp *u = udp_by_id(s, id);
+    return u ? u->connected : 0;
+}
+
+static void udp_input(NsShard *sh, const uint8_t *pkt, size_t len)
+{
+    NsStack *s = sh->stack;
+    int family = (pkt[0] >> 4) == 4 ? NS_AF_INET : NS_AF_INET6;
+    size_t ip_hdr = family == NS_AF_INET
+                        ? (size_t)(pkt[0] & 0x0f) * 4 : NS_IPV6_HDR;
+    size_t addr_len = family == NS_AF_INET ? 4 : 16;
+    const uint8_t *udp;
+    uint16_t sport, dport, ulen;
+    size_t dlen;
+    const uint8_t *data;
+    NsAddr sa, da;
+    NsUdp *u;
+    NsDgram *d;
+
+    if (len < ip_hdr + NS_UDP_HDR) {
+        s->stats.dropped++;
+        return;
+    }
+    udp = pkt + ip_hdr;
+    sport = rd16(udp);
+    dport = rd16(udp + 2);
+    ulen = rd16(udp + 4);
+    if (ulen < NS_UDP_HDR || ulen > len - ip_hdr) {
+        s->stats.dropped++;
+        return;
+    }
+    dlen = ulen - NS_UDP_HDR;
+    data = udp + NS_UDP_HDR;
+
+    memset(&sa, 0, sizeof(sa));
+    memset(&da, 0, sizeof(da));
+    sa.family = da.family = (uint8_t)family;
+    memcpy(sa.b, family == NS_AF_INET ? pkt + 12 : pkt + 8, addr_len);
+    memcpy(da.b, family == NS_AF_INET ? pkt + 16 : pkt + 24, addr_len);
+
+    u = udp_find(s, &da, dport, &sa, sport);
+    if (!u) {
+        s->stats.dropped++;
+        return;
+    }
+    if (u->qlen >= NS_UDP_QUEUE_MAX ||
+        u->qbytes + dlen > NS_UDP_QUEUE_BYTES) {
+        s->stats.dropped++;
+        return;
+    }
+    d = malloc(sizeof(*d) + dlen);
+    if (!d) {
+        s->stats.dropped++;
+        return;
+    }
+    d->next = NULL;
+    d->src = sa;
+    d->sport = sport;
+    d->len = (uint16_t)dlen;
+    if (dlen)
+        memcpy(d->data, data, dlen);
+    if (u->qtail)
+        u->qtail->next = d;
+    else
+        u->qhead = d;
+    u->qtail = d;
+    u->qlen++;
+    u->qbytes += dlen;
+}
+
 static void shard_process(NsShard *sh, NsPacket *p)
 {
     const uint8_t *pkt = p->data;
@@ -873,21 +1361,38 @@ static void shard_process(NsShard *sh, NsPacket *p)
                         ? (size_t)(pkt[0] & 0x0f) * 4 : NS_IPV6_HDR;
     const uint8_t *src = family == NS_AF_INET ? pkt + 12 : pkt + 8;
     const uint8_t *dst = family == NS_AF_INET ? pkt + 16 : pkt + 24;
+    uint8_t proto = family == NS_AF_INET ? pkt[9] : pkt[6];
     size_t addr_len = family == NS_AF_INET ? 4 : 16;
-    const uint8_t *tcp = pkt + ip_hdr;
-    uint16_t tcp_len = (uint16_t)(p->len - ip_hdr);
-    size_t off = (size_t)(tcp[12] >> 4) * 4;
-    const uint8_t *payload = tcp + off;
-    size_t plen = tcp_len - off;
+    const uint8_t *tcp;
+    uint16_t tcp_len;
+    size_t off;
+    const uint8_t *payload;
+    size_t plen;
     NsAddr sa, da;
-    uint16_t sport = rd16(tcp);
-    uint16_t dport = rd16(tcp + 2);
-    uint32_t seq = rd32(tcp + 4);
-    uint32_t ack = rd32(tcp + 8);
-    uint8_t flags = tcp[13];
+    uint16_t sport, dport;
+    uint32_t seq, ack;
+    uint8_t flags;
     NsStack *s = sh->stack;
     uint64_t now = s->clock;
     NsConn *c;
+
+    /* UDP packets are not TCP segments; do not decode a TCP header until
+       after this check, since a short datagram may end before tcp[12]. */
+    if (proto == 17) {
+        udp_input(sh, pkt, p->len);
+        return;
+    }
+
+    tcp = pkt + ip_hdr;
+    tcp_len = (uint16_t)(p->len - ip_hdr);
+    off = (size_t)(tcp[12] >> 4) * 4;
+    payload = tcp + off;
+    plen = tcp_len - off;
+    sport = rd16(tcp);
+    dport = rd16(tcp + 2);
+    seq = rd32(tcp + 4);
+    ack = rd32(tcp + 8);
+    flags = tcp[13];
 
     memset(&sa, 0, sizeof(sa));
     memset(&da, 0, sizeof(da));
@@ -965,11 +1470,12 @@ void ns_input(NsStack *s, const uint8_t *pkt, size_t len)
     NsPacket *p;
     int shard;
     int family;
+    int proto;
     size_t ip_hdr;
     const uint8_t *src;
     const uint8_t *dst;
-    const uint8_t *tcp;
-    size_t tcp_len;
+    const uint8_t *l4;
+    size_t l4_len;
     size_t off;
 
     if (!s || len < 1) {
@@ -980,8 +1486,14 @@ void ns_input(NsStack *s, const uint8_t *pkt, size_t len)
     family = (pkt[0] >> 4) == 4 ? NS_AF_INET : NS_AF_INET6;
     if (family == NS_AF_INET) {
         uint16_t frag;
+        uint16_t total;
 
-        if (len < NS_IPV4_HDR || pkt[0] == 0 || pkt[9] != 6) {
+        if (len < NS_IPV4_HDR || pkt[0] == 0) {
+            s->stats.dropped++;
+            return;
+        }
+        proto = pkt[9];
+        if (proto != 6 && proto != 17) {
             s->stats.dropped++;
             return;
         }
@@ -990,11 +1502,12 @@ void ns_input(NsStack *s, const uint8_t *pkt, size_t len)
             s->stats.dropped++;
             return;
         }
-        if (rd16(pkt + 2) < ip_hdr || rd16(pkt + 2) > len) {
+        total = rd16(pkt + 2);
+        if (total < ip_hdr || total > len) {
             s->stats.dropped++;
             return;
         }
-        len = rd16(pkt + 2);
+        len = total;
         /* Reassembly is not implemented; DF is fine, MF and fragments
            are not. */
         frag = rd16(pkt + 6);
@@ -1008,19 +1521,31 @@ void ns_input(NsStack *s, const uint8_t *pkt, size_t len)
         }
         src = pkt + 12;
         dst = pkt + 16;
-        tcp = pkt + ip_hdr;
-        tcp_len = len - ip_hdr;
+        l4 = pkt + ip_hdr;
+        l4_len = len - ip_hdr;
         /* IPv4 has no shard byte. The node integration always uses a
            plain stack; route every IPv4 packet to shard 0. */
         shard = 0;
     } else {
-        if (len < NS_IPV6_HDR + NS_TCP_HDR || (pkt[0] >> 4) != 6 ||
-            pkt[6] != 6) {
+        int body;
+        size_t min_hdr;
+
+        if ((pkt[0] >> 4) != 6 || len < NS_IPV6_HDR) {
             s->stats.dropped++;
             return;
         }
-        int body = rd16(pkt + 4);
-        if (body < NS_TCP_HDR || (size_t)body + NS_IPV6_HDR > len) {
+        proto = pkt[6];
+        if (proto != 6 && proto != 17) {
+            s->stats.dropped++;
+            return;
+        }
+        min_hdr = proto == 6 ? NS_TCP_HDR : NS_UDP_HDR;
+        if (len < NS_IPV6_HDR + min_hdr) {
+            s->stats.dropped++;
+            return;
+        }
+        body = rd16(pkt + 4);
+        if (body < (int)min_hdr || (size_t)body + NS_IPV6_HDR > len) {
             s->stats.dropped++;
             return;
         }
@@ -1028,20 +1553,52 @@ void ns_input(NsStack *s, const uint8_t *pkt, size_t len)
         ip_hdr = NS_IPV6_HDR;
         src = pkt + 8;
         dst = pkt + 24;
-        tcp = pkt + NS_IPV6_HDR;
-        tcp_len = len - NS_IPV6_HDR;
+        l4 = pkt + NS_IPV6_HDR;
+        l4_len = len - NS_IPV6_HDR;
         shard = s->plain ? 0 : pkt[24 + 8];
     }
 
-    if (shard < 0 || shard >= s->nshards || tcp_len < NS_TCP_HDR) {
+    if (shard < 0 || shard >= s->nshards) {
         s->stats.dropped++;
         return;
     }
-    off = (size_t)(tcp[12] >> 4) * 4;
-    if (off < NS_TCP_HDR || off > tcp_len ||
-        tcp_checksum(src, dst, family, tcp, tcp_len) != 0) {
-        s->stats.dropped++;
-        return;
+
+    if (proto == 17) {
+        uint16_t ulen;
+
+        if (l4_len < NS_UDP_HDR) {
+            s->stats.dropped++;
+            return;
+        }
+        ulen = rd16(l4 + 4);
+        if (ulen < NS_UDP_HDR || ulen > l4_len) {
+            s->stats.dropped++;
+            return;
+        }
+        /* Trim any padding so the queued packet matches the UDP length. */
+        len = ip_hdr + ulen;
+        l4_len = ulen;
+        if (rd16(l4 + 6) == 0) {
+            /* No checksum is only legal for IPv4. */
+            if (family != NS_AF_INET) {
+                s->stats.dropped++;
+                return;
+            }
+        } else if (l4_checksum(src, dst, family, 17, l4, l4_len) != 0) {
+            s->stats.dropped++;
+            return;
+        }
+    } else {
+        if (l4_len < NS_TCP_HDR) {
+            s->stats.dropped++;
+            return;
+        }
+        off = (size_t)(l4[12] >> 4) * 4;
+        if (off < NS_TCP_HDR || off > l4_len ||
+            tcp_checksum(src, dst, family, l4, l4_len) != 0) {
+            s->stats.dropped++;
+            return;
+        }
     }
 
     sh = &s->shards[shard];

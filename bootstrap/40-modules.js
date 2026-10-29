@@ -469,9 +469,10 @@ class Module {
   static _cache = cjsCache;
   static builtinModules = [
     "assert", "buffer", "child_process", "console", "constants", "crypto",
-    "dns", "events", "fs", "http", "https", "module", "net", "os", "path",
-    "process", "punycode", "querystring", "readline", "stream", "string_decoder",
-    "timers", "tls", "tty", "url", "util", "vm", "worker_threads", "zlib",
+    "dgram", "dns", "events", "fs", "http", "https", "module", "net", "os",
+    "path", "process", "punycode", "querystring", "readline", "stream",
+    "string_decoder", "timers", "tls", "tty", "url", "util", "vm",
+    "worker_threads", "zlib",
   ];
   static wrap(source) {
     return "(function (exports, require, module, __filename, __dirname) {" +

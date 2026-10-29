@@ -26,6 +26,7 @@ enum {
     VFD_UNBOUND,
     VFD_LISTEN,
     VFD_CONN,
+    VFD_DGRAM,
 };
 
 typedef struct VfdOpt {
@@ -38,8 +39,10 @@ typedef struct Vfd {
     int fd;
     int kind;
     int domain;
+    int type;             /* SOCK_STREAM or SOCK_DGRAM */
     int force;            /* 1 = explicitly requested netstack */
     uint64_t conn;        /* netstack connection id */
+    uint64_t udp;         /* netstack datagram socket id */
     NsAddr local;
     NsAddr remote;
     uint16_t lport;
@@ -259,7 +262,7 @@ int node_netstack_is_vfd(int fd)
     return vfd_find(fd) != NULL;
 }
 
-static Vfd *vfd_alloc(int domain, int force)
+static Vfd *vfd_alloc(int domain, int type, int force)
 {
     int i;
     int fd;
@@ -277,6 +280,7 @@ static Vfd *vfd_alloc(int domain, int force)
             v->fd = fd;
             v->kind = VFD_UNBOUND;
             v->domain = domain;
+            v->type = type;
             v->force = force;
             return v;
         }
@@ -333,15 +337,29 @@ static void vfd_signal_all(void)
                      (ns_conn_established(ns_stack, v->conn) ||
                       state == NS_CLOSED))
                 vfd_raise(v);
+        } else if (v->kind == VFD_DGRAM) {
+            if (ns_udp_readable(ns_stack, v->udp))
+                vfd_raise(v);
         }
     }
 }
 
 /* ---------------- kernel fallback ---------------- */
 
+static int vfd_reuse(const Vfd *v)
+{
+    int i;
+    for (i = 0; i < v->nopts; i++)
+        if (v->opts[i].level == SOL_SOCKET &&
+            v->opts[i].opt == SO_REUSEADDR)
+            return v->opts[i].value != 0;
+    return 0;
+}
+
 static int vfd_kernel_socket(const Vfd *v)
 {
-    int fd = socket(v->domain, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    int stype = (v->type & 0xf) == SOCK_DGRAM ? SOCK_DGRAM : SOCK_STREAM;
+    int fd = socket(v->domain, stype | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
     int i;
     if (fd < 0)
         return -1;
@@ -521,17 +539,55 @@ static int ns_family(const NsAddr *addr)
     return ns_addr_family(addr) == NS_AF_INET ? AF_INET : AF_INET6;
 }
 
+static int ns_addr_any(const NsAddr *addr)
+{
+    int i;
+    for (i = 0; i < NS_ADDR_LEN; i++)
+        if (addr->b[i])
+            return 0;
+    return 1;
+}
+
+/* Open the owned UDP socket backing a virtual descriptor. local may be the
+   wildcard for its family; port 0 picks an ephemeral port. */
+static int vfd_udp_open(Vfd *v, const NsAddr *local, uint16_t port)
+{
+    uint64_t id = ns_udp_open(ns_stack, local, port, vfd_reuse(v));
+    NsAddr bound;
+    uint16_t lport = 0;
+
+    if (!id) {
+        errno = EADDRINUSE;
+        return -1;
+    }
+    if (ns_udp_bound_addr(ns_stack, id, &bound, &lport) < 0) {
+        ns_udp_close(ns_stack, id);
+        errno = EINVAL;
+        return -1;
+    }
+    v->kind = VFD_DGRAM;
+    v->udp = id;
+    v->bound = 1;
+    v->bind_wildcard = ns_addr_any(&bound);
+    v->bind_addr = bound;
+    v->bind_port = lport;
+    v->local = bound;
+    v->lport = lport;
+    return 0;
+}
+
 /* ---------------- socket API ---------------- */
 
 int node_netstack_socket(int domain, int type, int mode)
 {
     Vfd *v;
+    int base = type & 0xf;
 
     if (mode < 0 || (domain != AF_INET && domain != AF_INET6) ||
-        (type & 0xf) != SOCK_STREAM)
+        (base != SOCK_STREAM && base != SOCK_DGRAM))
         return -1;
     if (!ns_init()) {
-        v = vfd_alloc(domain, mode == 1);
+        v = vfd_alloc(domain, base, mode == 1);
         if (!v)
             return -1;
         return v->fd;
@@ -557,6 +613,17 @@ int node_netstack_bind(int fd, const struct sockaddr *sa, socklen_t len)
         return -1;
     }
 
+    if ((v->type & 0xf) == SOCK_DGRAM) {
+        int owned = v->force || (!wildcard && addr_managed(&addr));
+        if (v->kind == VFD_DGRAM) {
+            errno = EINVAL;
+            return -1;
+        }
+        if (!owned)
+            return vfd_to_kernel_bind(v, sa, len);
+        return vfd_udp_open(v, &addr, port);
+    }
+
     /* A wildcard bind stays pending until listen/connect tells us which
        engine the socket is for. Explicit netstack addresses (or a forced
        socket) stay on the owned stack; everything else falls back. */
@@ -579,6 +646,10 @@ int node_netstack_listen(int fd, int backlog)
 
     if (!v) {
         errno = EBADF;
+        return -1;
+    }
+    if ((v->type & 0xf) == SOCK_DGRAM) {
+        errno = EOPNOTSUPP;
         return -1;
     }
     if (v->kind == VFD_LISTEN) {
@@ -671,7 +742,7 @@ int node_netstack_accept(int fd, struct sockaddr *sa, socklen_t *len)
         errno = EAGAIN;
         return -1;
     }
-    nv = vfd_alloc(v->domain, 0);
+    nv = vfd_alloc(v->domain, SOCK_STREAM, 0);
     if (!nv) {
         ns_close(ns_stack, id);
         errno = EMFILE;
@@ -713,6 +784,29 @@ int node_netstack_connect(int fd, const struct sockaddr *sa, socklen_t len)
     if (ns_family(&remote) != v->domain) {
         errno = EAFNOSUPPORT;
         return -1;
+    }
+
+    if ((v->type & 0xf) == SOCK_DGRAM) {
+        int owned = v->kind == VFD_DGRAM || v->force ||
+                    addr_managed(&remote);
+        if (!owned)
+            return vfd_to_kernel_connect(v, sa, len);
+        if (v->kind != VFD_DGRAM) {
+            NsAddr any;
+            memset(&any, 0, sizeof(any));
+            any.family = (uint8_t)ns_addr_family(&remote);
+            if (vfd_udp_open(v, &any, 0) < 0)
+                return -1;
+        }
+        if (ns_udp_connect(ns_stack, v->udp, &remote, rport) < 0) {
+            errno = EINVAL;
+            return -1;
+        }
+        v->remote = remote;
+        v->remote.family = (uint8_t)ns_addr_family(&remote);
+        v->rport = rport;
+        node_netstack_pump();
+        return 0;
     }
 
     if (v->force || addr_managed(&remote)) {
@@ -801,6 +895,113 @@ ssize_t node_netstack_write(int fd, const void *buf, size_t len)
     return n;
 }
 
+ssize_t node_netstack_sendto(int fd, const struct sockaddr *sa, socklen_t salen,
+                             const void *buf, size_t buflen)
+{
+    Vfd *v = vfd_find(fd);
+    NsAddr remote;
+    uint16_t rport;
+    int owned;
+    int n;
+
+    if (!v) {
+        errno = EBADF;
+        return -1;
+    }
+    if (sa_to_ns(sa, salen, &remote, &rport, NULL) < 0)
+        return -1;
+    if (ns_family(&remote) != v->domain) {
+        errno = EAFNOSUPPORT;
+        return -1;
+    }
+
+    owned = v->kind == VFD_DGRAM || v->force || addr_managed(&remote);
+    if (owned) {
+        if (v->kind != VFD_DGRAM) {
+            NsAddr any;
+            memset(&any, 0, sizeof(any));
+            any.family = (uint8_t)ns_addr_family(&remote);
+            if (vfd_udp_open(v, &any, 0) < 0)
+                return -1;
+        }
+        n = ns_udp_sendto(ns_stack, v->udp, &remote, rport, buf, buflen);
+        if (n < 0) {
+            if (n == -NS_EMSGSIZE)
+                errno = EMSGSIZE;
+            else if (n == -NS_EDESTADDRREQ)
+                errno = EDESTADDRREQ;
+            else if (n == -NS_ENOTCONN)
+                errno = ENOTCONN;
+            else
+                errno = EINVAL;
+            return -1;
+        }
+        node_netstack_pump();
+        return n;
+    }
+
+    /* The destination is outside the managed prefixes: turn the eventfd into
+       a real non-blocking datagram socket and hand the send to the kernel. */
+    {
+        int kfd = vfd_kernel_socket(v);
+        if (kfd < 0)
+            return -1;
+        if (vfd_install_kernel(v, kfd) < 0) {
+            int e = errno;
+            close(kfd);
+            errno = e;
+            return -1;
+        }
+    }
+    do {
+        n = (int)sendto(fd, buf, buflen, 0, sa, salen);
+    } while (n < 0 && errno == EINTR);
+    return n;
+}
+
+ssize_t node_netstack_recvfrom(int fd, void *buf, size_t len,
+                               struct sockaddr *sa, socklen_t *salen)
+{
+    Vfd *v = vfd_find(fd);
+    NsAddr src;
+    uint16_t sport = 0;
+    int n;
+
+    if (!v || v->kind != VFD_DGRAM) {
+        errno = EAGAIN;
+        return -1;
+    }
+    vfd_drain(v);
+    node_netstack_pump();
+    n = ns_udp_recvfrom(ns_stack, v->udp, buf, len, &src, &sport);
+    if (n < 0) {
+        errno = n == -NS_EAGAIN ? EAGAIN : ENOTCONN;
+        return -1;
+    }
+    if (sa && salen)
+        ns_to_sa(&src, sport, sa, salen);
+    /* More datagrams may still be queued; keep the eventfd readable. */
+    vfd_signal_all();
+    return n;
+}
+
+int node_netstack_disconnect(int fd)
+{
+    Vfd *v = vfd_find(fd);
+
+    if (!v || v->kind != VFD_DGRAM) {
+        errno = ENOTCONN;
+        return -1;
+    }
+    if (ns_udp_disconnect(ns_stack, v->udp) < 0) {
+        errno = ENOTCONN;
+        return -1;
+    }
+    memset(&v->remote, 0, sizeof(v->remote));
+    v->rport = 0;
+    return 0;
+}
+
 int node_netstack_close(int fd)
 {
     Vfd *v = vfd_find(fd);
@@ -812,6 +1013,8 @@ int node_netstack_close(int fd)
         ns_close(ns_stack, v->conn);
     else if (v->kind == VFD_LISTEN)
         ns_unlisten(ns_stack, v->lport);
+    else if (v->kind == VFD_DGRAM)
+        ns_udp_close(ns_stack, v->udp);
     node_netstack_pump();
     vfd_reset(v);
     return 0;
@@ -845,8 +1048,11 @@ int node_netstack_getsockname(int fd, struct sockaddr *sa, socklen_t *len)
     } else if (v->kind == VFD_LISTEN) {
         local = v->local;
         lport = v->lport;
+    } else if (v->kind == VFD_DGRAM) {
+        ns_udp_bound_addr(ns_stack, v->udp, &local, &lport);
     } else {
         memset(&local, 0, sizeof(local));
+        local.family = v->domain == AF_INET ? NS_AF_INET : NS_AF_INET6;
     }
     ns_to_sa(&local, lport, sa, len);
     return 0;
@@ -858,7 +1064,19 @@ int node_netstack_getpeername(int fd, struct sockaddr *sa, socklen_t *len)
     NsAddr remote;
     uint16_t rport = 0;
 
-    if (!v || v->kind != VFD_CONN) {
+    if (!v) {
+        errno = EBADF;
+        return -1;
+    }
+    if (v->kind == VFD_DGRAM) {
+        if (ns_udp_peer_addr(ns_stack, v->udp, &remote, &rport) < 0) {
+            errno = ENOTCONN;
+            return -1;
+        }
+        ns_to_sa(&remote, rport, sa, len);
+        return 0;
+    }
+    if (v->kind != VFD_CONN) {
         errno = ENOTCONN;
         return -1;
     }
@@ -930,6 +1148,9 @@ int node_netstack_poll(int fd, int events)
         revents |= 0x001; /* POLLIN */
     else if (v->kind == VFD_CONN &&
              ns_conn_readable(ns_stack, v->conn))
+        revents |= 0x001;
+    else if (v->kind == VFD_DGRAM &&
+             ns_udp_readable(ns_stack, v->udp))
         revents |= 0x001;
     return revents;
 }

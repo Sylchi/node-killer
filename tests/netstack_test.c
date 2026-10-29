@@ -89,6 +89,14 @@ static void set_addr4(NsAddr *a, uint8_t b0, uint8_t b1, uint8_t b2,
     a->b[3] = b3;
 }
 
+static void set_addr6(NsAddr *a, uint8_t low)
+{
+    memset(a, 0, sizeof(*a));
+    a->family = NS_AF_INET6;
+    memcpy(a->b, prefix, NS_PREFIX_LEN);
+    a->b[15] = low;
+}
+
 /* Two plain-mode stacks with stable IPv4 addresses, mirroring how the
    node bridge configures the engine. */
 static void make_plain_pair(Link *l, NsAddr *local_a, NsAddr *local_b)
@@ -550,6 +558,280 @@ static void test_ipv4_plain(void)
     free_pair(&l);
 }
 
+static void test_udp_ipv4(void)
+{
+    Link l;
+    NsAddr local_a, local_b;
+    NsAddr bound, src;
+    uint16_t aport = 0, bport = 0, sport = 0;
+    uint64_t a, b;
+    char buf[64];
+    int n;
+    int i;
+
+    make_plain_pair(&l, &local_a, &local_b);
+    a = ns_udp_open(l.a, &local_a, 0, 0);
+    b = ns_udp_open(l.b, &local_b, 0, 0);
+    CHECK(a != 0 && b != 0);
+    CHECK((a >> 63) == 1 && (b >> 63) == 1);
+    CHECK(ns_udp_bound_addr(l.a, a, NULL, &aport) == 0);
+    CHECK(ns_udp_bound_addr(l.b, b, &bound, &bport) == 0);
+    CHECK(aport != 0 && bport != 0);
+    CHECK(bound.family == NS_AF_INET);
+    CHECK(bound.b[0] == 10 && bound.b[3] == 2);
+
+    CHECK(ns_udp_readable(l.b, b) == 0);
+    CHECK(ns_udp_sendto(l.a, a, &local_b, bport, "hello", 5) == 5);
+    pump(&l, 10);
+    CHECK(ns_udp_readable(l.b, b) == 1);
+    memset(buf, 0, sizeof(buf));
+    n = ns_udp_recvfrom(l.b, b, buf, sizeof(buf), &src, &sport);
+    CHECK(n == 5);
+    CHECK(memcmp(buf, "hello", 5) == 0);
+    CHECK(sport == aport);
+    CHECK(src.family == NS_AF_INET);
+    CHECK(src.b[0] == 10 && src.b[3] == 1);
+    CHECK(ns_udp_readable(l.b, b) == 0);
+    CHECK(ns_udp_recvfrom(l.b, b, buf, sizeof(buf), NULL, NULL) ==
+          -NS_EAGAIN);
+
+    /* Datagrams keep their boundaries and are delivered in order. */
+    for (i = 0; i < 4; i++) {
+        char msg[8];
+        snprintf(msg, sizeof(msg), "m%d", i);
+        CHECK(ns_udp_sendto(l.a, a, &local_b, bport, msg, 2) == 2);
+    }
+    pump(&l, 20);
+    CHECK(ns_udp_readable(l.b, b) == 1);
+    for (i = 0; i < 4; i++) {
+        char msg[8];
+        snprintf(msg, sizeof(msg), "m%d", i);
+        memset(buf, 0, sizeof(buf));
+        n = ns_udp_recvfrom(l.b, b, buf, sizeof(buf), NULL, NULL);
+        CHECK(n == 2);
+        CHECK(memcmp(buf, msg, 2) == 0);
+    }
+    CHECK(ns_udp_readable(l.b, b) == 0);
+
+    /* A short receive buffer truncates the datagram. */
+    CHECK(ns_udp_sendto(l.a, a, &local_b, bport, "truncate", 8) == 8);
+    pump(&l, 10);
+    memset(buf, 0, sizeof(buf));
+    n = ns_udp_recvfrom(l.b, b, buf, 3, NULL, NULL);
+    CHECK(n == 3);
+    CHECK(memcmp(buf, "tru", 3) == 0);
+
+    /* Sending exceeds the largest datagram that fits in one link frame. */
+    {
+        char big[NS_MAX_PACKET];
+        int max_v4 = 1500 - 20 - 8;
+
+        memset(big, 'x', sizeof(big));
+        CHECK(ns_udp_sendto(l.a, a, &local_b, bport, big, max_v4) == max_v4);
+        CHECK(ns_udp_sendto(l.a, a, &local_b, bport, big, max_v4 + 1) ==
+              -NS_EMSGSIZE);
+        pump(&l, 10);
+    }
+
+    CHECK(ns_udp_close(l.a, a) == 0);
+    CHECK(ns_udp_close(l.a, a) == -NS_ENOTCONN);
+    CHECK(ns_udp_sendto(l.a, a, &local_b, bport, "x", 1) == -NS_ENOTCONN);
+    CHECK(ns_udp_close(l.b, b) == 0);
+    free_pair(&l);
+}
+
+static void test_udp_connected_ipv4(void)
+{
+    Link l;
+    NsAddr local_a, local_b;
+    NsAddr peer;
+    uint16_t aport = 0, bport = 0, rport = 0;
+    uint64_t a, b, imp;
+    char buf[16];
+    int n;
+
+    make_plain_pair(&l, &local_a, &local_b);
+    a = ns_udp_open(l.a, &local_a, 0, 0);
+    b = ns_udp_open(l.b, &local_b, 0, 0);
+    CHECK(a != 0 && b != 0);
+    CHECK(ns_udp_bound_addr(l.a, a, NULL, &aport) == 0);
+    CHECK(ns_udp_bound_addr(l.b, b, NULL, &bport) == 0);
+    CHECK(ns_udp_peer_addr(l.a, a, NULL, NULL) == -NS_ENOTCONN);
+    CHECK(ns_udp_sendto(l.a, a, NULL, 0, "x", 1) == -NS_EDESTADDRREQ);
+
+    CHECK(ns_udp_connect(l.a, a, &local_b, bport) == 0);
+    CHECK(ns_udp_is_connected(l.a, a) == 1);
+    CHECK(ns_udp_peer_addr(l.a, a, &peer, &rport) == 0);
+    CHECK(rport == bport);
+    CHECK(peer.family == NS_AF_INET);
+    CHECK(peer.b[0] == 10 && peer.b[3] == 2);
+
+    /* A connected socket may send without repeating the destination. */
+    CHECK(ns_udp_sendto(l.a, a, NULL, 0, "conn", 4) == 4);
+    pump(&l, 10);
+    memset(buf, 0, sizeof(buf));
+    n = ns_udp_recvfrom(l.b, b, buf, sizeof(buf), NULL, NULL);
+    CHECK(n == 4);
+    CHECK(memcmp(buf, "conn", 4) == 0);
+
+    /* Replies from the peer are accepted. */
+    CHECK(ns_udp_sendto(l.b, b, &local_a, aport, "pong", 4) == 4);
+    pump(&l, 10);
+    memset(buf, 0, sizeof(buf));
+    n = ns_udp_recvfrom(l.a, a, buf, sizeof(buf), NULL, NULL);
+    CHECK(n == 4);
+    CHECK(memcmp(buf, "pong", 4) == 0);
+
+    /* Datagrams from any other source port are filtered out. */
+    imp = ns_udp_open(l.b, &local_b, 0, 0);
+    CHECK(imp != 0);
+    CHECK(ns_udp_sendto(l.b, imp, &local_a, aport, "nope", 4) == 4);
+    pump(&l, 10);
+    CHECK(ns_udp_readable(l.a, a) == 0);
+
+    CHECK(ns_udp_disconnect(l.a, a) == 0);
+    CHECK(ns_udp_is_connected(l.a, a) == 0);
+    CHECK(ns_udp_peer_addr(l.a, a, NULL, NULL) == -NS_ENOTCONN);
+    CHECK(ns_udp_sendto(l.a, a, NULL, 0, "x", 1) == -NS_EDESTADDRREQ);
+
+    /* Without a peer filter the impostor's datagram is now delivered. */
+    CHECK(ns_udp_sendto(l.b, imp, &local_a, aport, "now", 3) == 3);
+    pump(&l, 10);
+    CHECK(ns_udp_readable(l.a, a) == 1);
+    memset(buf, 0, sizeof(buf));
+    n = ns_udp_recvfrom(l.a, a, buf, sizeof(buf), NULL, NULL);
+    CHECK(n == 3);
+    CHECK(memcmp(buf, "now", 3) == 0);
+
+    CHECK(ns_udp_close(l.b, imp) == 0);
+    CHECK(ns_udp_close(l.a, a) == 0);
+    CHECK(ns_udp_close(l.b, b) == 0);
+    free_pair(&l);
+}
+
+static void test_udp_bind_rules(void)
+{
+    Link l;
+    NsAddr local_a, local_b;
+    uint64_t w, e, a;
+    char buf[16];
+    int n;
+
+    make_plain_pair(&l, &local_a, &local_b);
+
+    /* Without reuse the same address/port, and its wildcard, conflict. */
+    CHECK(ns_udp_open(l.a, &local_a, 7000, 0) != 0);
+    CHECK(ns_udp_open(l.a, &local_a, 7000, 0) == 0);
+    CHECK(ns_udp_open(l.a, NULL, 7000, 0) == 0);
+    CHECK(ns_udp_open(l.a, &local_a, 7000, 1) == 0);
+
+    /* Both sides need SO_REUSEADDR before a shared port is allowed. */
+    w = ns_udp_open(l.b, NULL, 7100, 1);
+    e = ns_udp_open(l.b, &local_b, 7100, 1);
+    CHECK(w != 0);
+    CHECK(e != 0);
+    a = ns_udp_open(l.a, &local_a, 0, 0);
+    CHECK(a != 0);
+    CHECK(ns_udp_sendto(l.a, a, &local_b, 7100, "exact", 5) == 5);
+    pump(&l, 10);
+    CHECK(ns_udp_readable(l.b, e) == 1);
+    CHECK(ns_udp_readable(l.b, w) == 0);
+    memset(buf, 0, sizeof(buf));
+    n = ns_udp_recvfrom(l.b, e, buf, sizeof(buf), NULL, NULL);
+    CHECK(n == 5);
+    CHECK(memcmp(buf, "exact", 5) == 0);
+
+    /* Once the exact bind is gone, the wildcard takes the datagram. */
+    CHECK(ns_udp_close(l.b, e) == 0);
+    CHECK(ns_udp_sendto(l.a, a, &local_b, 7100, "wild", 4) == 4);
+    pump(&l, 10);
+    CHECK(ns_udp_readable(l.b, w) == 1);
+    memset(buf, 0, sizeof(buf));
+    n = ns_udp_recvfrom(l.b, w, buf, sizeof(buf), NULL, NULL);
+    CHECK(n == 4);
+    CHECK(memcmp(buf, "wild", 4) == 0);
+
+    /* IPv4 wildcard sockets only accept IPv4 datagrams. */
+    CHECK(ns_udp_open(l.b, NULL, 7200, 0) != 0);
+    CHECK(ns_udp_open(l.b, NULL, 7200, 0) == 0);
+
+    CHECK(ns_udp_close(l.b, w) == 0);
+    CHECK(ns_udp_close(l.a, a) == 0);
+    free_pair(&l);
+}
+
+static void test_udp_ipv6(void)
+{
+    Link l;
+    NsAddr addr_a, addr_b, bound, src;
+    uint16_t aport = 0, bport = 0, sport = 0;
+    uint64_t a, b, w;
+    char buf[32];
+    int n;
+
+    make_pair(&l, 2);
+    set_addr6(&addr_a, 1);
+    set_addr6(&addr_b, 2);
+    CHECK(ns_addr_shard(&addr_b) == 0);
+
+    a = ns_udp_open(l.a, &addr_a, 0, 0);
+    b = ns_udp_open(l.b, &addr_b, 0, 0);
+    CHECK(a != 0 && b != 0);
+    CHECK(ns_udp_bound_addr(l.a, a, NULL, &aport) == 0);
+    CHECK(ns_udp_bound_addr(l.b, b, &bound, &bport) == 0);
+    CHECK(aport != 0 && bport != 0);
+    CHECK(bound.family == NS_AF_INET6);
+    CHECK(memcmp(bound.b, addr_b.b, NS_ADDR_LEN) == 0);
+
+    CHECK(ns_udp_sendto(l.a, a, &addr_b, bport, "hello6", 6) == 6);
+    pump(&l, 10);
+    CHECK(ns_udp_readable(l.b, b) == 1);
+    memset(buf, 0, sizeof(buf));
+    n = ns_udp_recvfrom(l.b, b, buf, sizeof(buf), &src, &sport);
+    CHECK(n == 6);
+    CHECK(memcmp(buf, "hello6", 6) == 0);
+    CHECK(sport == aport);
+    CHECK(src.family == NS_AF_INET6);
+    CHECK(memcmp(src.b, addr_a.b, NS_ADDR_LEN) == 0);
+
+    /* A wildcard IPv6 socket receives datagrams for the whole prefix. */
+    w = ns_udp_open(l.b, NULL, 7300, 0);
+    CHECK(w != 0);
+    CHECK(ns_udp_bound_addr(l.b, w, &bound, NULL) == 0);
+    CHECK(bound.family == NS_AF_INET6);
+    CHECK(ns_udp_sendto(l.a, a, &addr_b, 7300, "any6", 4) == 4);
+    pump(&l, 10);
+    CHECK(ns_udp_readable(l.b, w) == 1);
+    memset(buf, 0, sizeof(buf));
+    n = ns_udp_recvfrom(l.b, w, buf, sizeof(buf), NULL, NULL);
+    CHECK(n == 4);
+    CHECK(memcmp(buf, "any6", 4) == 0);
+
+    /* IPv6 has no "no checksum" escape hatch, so an all-zero field would be
+       dropped by ns_input; the engine must transmit 0xffff instead. */
+    CHECK(ns_udp_sendto(l.a, a, &addr_b, bport, "", 0) == 0);
+    pump(&l, 10);
+    CHECK(ns_udp_readable(l.b, b) == 1);
+    n = ns_udp_recvfrom(l.b, b, buf, sizeof(buf), NULL, NULL);
+    CHECK(n == 0);
+
+    {
+        char big[NS_MAX_PACKET];
+        int max_v6 = 1500 - 40 - 8;
+
+        memset(big, 'y', sizeof(big));
+        CHECK(ns_udp_sendto(l.a, a, &addr_b, bport, big, max_v6) == max_v6);
+        CHECK(ns_udp_sendto(l.a, a, &addr_b, bport, big, max_v6 + 1) ==
+              -NS_EMSGSIZE);
+        pump(&l, 10);
+    }
+
+    CHECK(ns_udp_close(l.b, w) == 0);
+    CHECK(ns_udp_close(l.a, a) == 0);
+    CHECK(ns_udp_close(l.b, b) == 0);
+    free_pair(&l);
+}
+
 int main(void)
 {
     test_addressing();
@@ -562,6 +844,10 @@ int main(void)
     test_interleaved_dispatch();
     test_listener_validation();
     test_ipv4_plain();
+    test_udp_ipv4();
+    test_udp_connected_ipv4();
+    test_udp_bind_rules();
+    test_udp_ipv6();
 
     if (failures) {
         fprintf(stderr, "netstack: %d check(s) failed\n", failures);

@@ -23,6 +23,7 @@ The parts are **not** ES modules. They share one top-level scope, so:
 | `30-web.js` | `AbortController`/`EventTarget`, `URL`, `querystring` |
 | `40-modules.js` | `node_modules` resolution, CommonJS loader |
 | `50-net-http.js` | `net` (including owned-stack selection), `http`, `child_process` |
+| `55-dgram.js` | `dgram` over the owned UDP engine or kernel fallback |
 | `60-crypto.js` | hashes, HMACs, key objects, signatures, KDFs |
 | `70-misc.js` | `assert`, `string_decoder`, small core modules, `readline` |
 | `80-tls.js` | `tls` |

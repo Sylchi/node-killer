@@ -86,6 +86,12 @@ static JSValue node_ok(JSContext *ctx, JSValue val)
     return node_err(ctx, val, 0);
 }
 
+static int node_sockaddr_type(JSContext *ctx, const char *host, int port,
+                              struct sockaddr_storage *ss, socklen_t *plen,
+                              bool passive, int socktype);
+static JSValue node_addr_obj(JSContext *ctx, struct sockaddr_storage *ss,
+                             socklen_t len);
+
 static const char *node_cstr(JSContext *ctx, JSValueConst v)
 {
     return JS_ToCString(ctx, v);
@@ -897,6 +903,108 @@ static JSValue js_node_write(JSContext *ctx, JSValueConst this_val,
     return node_ok(ctx, JS_NewInt64(ctx, n));
 }
 
+static JSValue js_node_sendto(JSContext *ctx, JSValueConst this_val,
+                              int argc, JSValueConst *argv)
+{
+    int32_t fd, port;
+    NodeBytes b;
+    struct sockaddr_storage ss;
+    socklen_t len;
+    ssize_t n = -1;
+    int err = 0;
+
+    if (JS_ToInt32(ctx, &fd, argv[0]) || JS_ToInt32(ctx, &port, argv[2]))
+        return JS_EXCEPTION;
+    const char *host = JS_IsUndefined(argv[1]) || JS_IsNull(argv[1])
+                           ? NULL : node_cstr(ctx, argv[1]);
+    if (node_get_bytes(ctx, argv[3], &b)) {
+        if (host) JS_FreeCString(ctx, host);
+        return JS_EXCEPTION;
+    }
+    err = node_sockaddr_type(ctx, host, port, &ss, &len, false, SOCK_DGRAM);
+    if (!err) {
+        if (node_netstack_is_vfd(fd)) {
+            n = node_netstack_sendto(fd, (struct sockaddr *)&ss, len, b.data,
+                                     b.len);
+        } else {
+            do {
+                n = sendto(fd, b.data, b.len, 0, (struct sockaddr *)&ss,
+                           len);
+            } while (n < 0 && errno == EINTR);
+        }
+        if (n < 0)
+            err = errno;
+    }
+    if (host) JS_FreeCString(ctx, host);
+    node_free_bytes(ctx, &b);
+    if (err)
+        return node_err(ctx, JS_NULL, err);
+    return node_ok(ctx, JS_NewInt64(ctx, n));
+}
+
+static JSValue js_node_recvfrom(JSContext *ctx, JSValueConst this_val,
+                                int argc, JSValueConst *argv)
+{
+    int32_t fd, maxlen = 65536;
+    struct sockaddr_storage ss;
+    socklen_t len = sizeof(ss);
+    ssize_t n;
+
+    if (JS_ToInt32(ctx, &fd, argv[0]))
+        return JS_EXCEPTION;
+    if (argc > 1 && !JS_IsUndefined(argv[1]))
+        if (JS_ToInt32(ctx, &maxlen, argv[1]))
+            return JS_EXCEPTION;
+    if (maxlen < 0 || maxlen > 16 * 1024 * 1024)
+        return JS_ThrowRangeError(ctx, "invalid receive length");
+
+    uint8_t *buf = js_malloc(ctx, maxlen ? (size_t)maxlen : 1);
+    if (!buf)
+        return JS_EXCEPTION;
+    memset(&ss, 0, sizeof(ss));
+    if (node_netstack_is_vfd(fd)) {
+        n = node_netstack_recvfrom(fd, buf, (size_t)maxlen,
+                                   (struct sockaddr *)&ss, &len);
+    } else {
+        do {
+            n = recvfrom(fd, buf, (size_t)maxlen, 0,
+                         (struct sockaddr *)&ss, &len);
+        } while (n < 0 && errno == EINTR);
+    }
+    if (n < 0) {
+        int err = errno;
+        js_free(ctx, buf);
+        return node_err(ctx, JS_NULL, err);
+    }
+    JSValue val = JS_NewArray(ctx);
+    JSValue data = JS_NewUint8ArrayCopy(ctx, buf, n);
+    JSValue addr = node_addr_obj(ctx, &ss, len);
+    JS_SetPropertyUint32(ctx, val, 0, data);
+    JS_SetPropertyUint32(ctx, val, 1, addr);
+    js_free(ctx, buf);
+    return node_ok(ctx, val);
+}
+
+static JSValue js_node_disconnect(JSContext *ctx, JSValueConst this_val,
+                                  int argc, JSValueConst *argv)
+{
+    int32_t fd;
+    int err = 0;
+
+    if (JS_ToInt32(ctx, &fd, argv[0]))
+        return JS_EXCEPTION;
+    if (node_netstack_is_vfd(fd)) {
+        err = node_netstack_disconnect(fd) ? errno : 0;
+    } else {
+        struct sockaddr sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_family = AF_UNSPEC;
+        if (connect(fd, &sa, sizeof(sa)))
+            err = errno;
+    }
+    return JS_NewInt32(ctx, err);
+}
+
 static JSValue js_node_close(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv)
 {
@@ -1112,15 +1220,15 @@ static JSValue js_node_socket(JSContext *ctx, JSValueConst this_val,
     return node_ok(ctx, JS_NewInt32(ctx, fd));
 }
 
-static int node_sockaddr(JSContext *ctx, const char *host, int port,
-                         struct sockaddr_storage *ss, socklen_t *plen,
-                         bool passive)
+static int node_sockaddr_type(JSContext *ctx, const char *host, int port,
+                              struct sockaddr_storage *ss, socklen_t *plen,
+                              bool passive, int socktype)
 {
     struct addrinfo hints, *res = NULL;
     char portbuf[16];
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_socktype = socktype;
     hints.ai_flags = passive ? AI_PASSIVE : 0;
     snprintf(portbuf, sizeof(portbuf), "%d", port);
     int r = getaddrinfo((host && host[0]) ? host : NULL, portbuf, &hints, &res);
@@ -1131,6 +1239,13 @@ static int node_sockaddr(JSContext *ctx, const char *host, int port,
     freeaddrinfo(res);
     (void)ctx;
     return 0;
+}
+
+static int node_sockaddr(JSContext *ctx, const char *host, int port,
+                         struct sockaddr_storage *ss, socklen_t *plen,
+                         bool passive)
+{
+    return node_sockaddr_type(ctx, host, port, ss, plen, passive, SOCK_STREAM);
 }
 
 static JSValue js_node_bind(JSContext *ctx, JSValueConst this_val,
@@ -4605,6 +4720,9 @@ static const JSCFunctionListEntry js_node_funcs[] = {
     JS_CFUNC_DEF("open", 3, js_node_open),
     JS_CFUNC_DEF("read", 2, js_node_read),
     JS_CFUNC_DEF("write", 2, js_node_write),
+    JS_CFUNC_DEF("sendto", 4, js_node_sendto),
+    JS_CFUNC_DEF("recvfrom", 2, js_node_recvfrom),
+    JS_CFUNC_DEF("disconnect", 1, js_node_disconnect),
     JS_CFUNC_DEF("poll1", 2, js_node_poll1),
     JS_CFUNC_DEF("close", 1, js_node_close),
     JS_CFUNC_DEF("fsync", 1, js_node_fsync),
@@ -4926,6 +5044,7 @@ int js_node_init(JSContext *ctx, JSRuntime *rt)
     NC("SO_REUSEPORT", SO_REUSEPORT);
     NC("SO_KEEPALIVE", SO_KEEPALIVE);
     NC("SO_ERROR", SO_ERROR);
+    NC("SO_BROADCAST", SO_BROADCAST);
     NC("TCP_NODELAY", TCP_NODELAY);
     NC("IPPROTO_TCP", IPPROTO_TCP);
     NC("IPPROTO_IPV6", IPPROTO_IPV6);
@@ -4957,6 +5076,10 @@ int js_node_init(JSContext *ctx, JSRuntime *rt)
     NC("ECONNREFUSED", ECONNREFUSED);
     NC("EADDRINUSE", EADDRINUSE);
     NC("EADDRNOTAVAIL", EADDRNOTAVAIL);
+    NC("EDESTADDRREQ", EDESTADDRREQ);
+    NC("EMSGSIZE", EMSGSIZE);
+    NC("ENOTCONN", ENOTCONN);
+    NC("EOPNOTSUPP", EOPNOTSUPP);
     NC("EINVAL", EINVAL);
     NC("EAFNOSUPPORT", EAFNOSUPPORT);
     NC("EPROTONOSUPPORT", EPROTONOSUPPORT);

@@ -23,6 +23,7 @@ tmp=$(mktemp -d "${TMPDIR:-/tmp}/qnode-tun.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
 
 cat >"$tmp/server.js" <<'EOF'
+const dgram = require("dgram");
 const net = require("net");
 const echo = (sock) => {
   sock.on("data", (d) => sock.write(d));
@@ -30,9 +31,13 @@ const echo = (sock) => {
 };
 const s6 = net.createServer({ netstack: true }, echo);
 const s4 = net.createServer({ netstack: true }, echo);
+const u6 = dgram.createSocket({ type: "udp6", netstack: true });
+const u4 = dgram.createSocket({ type: "udp4", netstack: true });
+u6.on("message", (msg, rinfo) => u6.send(msg, rinfo.port, rinfo.address));
+u4.on("message", (msg, rinfo) => u4.send(msg, rinfo.port, rinfo.address));
 let ready = 0;
 function announce() {
-  if (++ready === 2)
+  if (++ready === 4)
     console.log("READY " + net.netstackAddress() + " " +
                 net.netstackAddress(4));
 }
@@ -40,8 +45,12 @@ s6.listen({ port: 7000, host: net.netstackAddress(), netstack: true },
           announce);
 s4.listen({ port: 7001, host: net.netstackAddress(4), netstack: true,
             family: 4 }, announce);
+u6.bind(7002, net.netstackAddress(), announce);
+u4.bind(7003, net.netstackAddress(4), announce);
 s6.on("error", (e) => { console.error(e); process.exit(1); });
 s4.on("error", (e) => { console.error(e); process.exit(1); });
+u6.on("error", (e) => { console.error(e); process.exit(1); });
+u4.on("error", (e) => { console.error(e); process.exit(1); });
 setTimeout(() => process.exit(3), 15000);
 EOF
 
@@ -79,6 +88,28 @@ c.on("error", () => process.exit(1));
 setTimeout(() => process.exit(2), 10000);
 EOF
 
+cat >"$tmp/client6udp.js" <<'EOF'
+const dgram = require("dgram");
+const s = dgram.createSocket({ type: "udp6", netstack: false });
+s.on("message", (msg) => process.exit(msg.toString() === "tun-udp6" ? 0 : 4));
+s.on("error", () => process.exit(1));
+s.bind(0, "fd00:dead:beef:99::2", () => {
+  s.send("tun-udp6", 7002, "fd00:dead:beef:99::1");
+});
+setTimeout(() => process.exit(2), 10000);
+EOF
+
+cat >"$tmp/client4udp.js" <<'EOF'
+const dgram = require("dgram");
+const s = dgram.createSocket({ type: "udp4", netstack: false });
+s.on("message", (msg) => process.exit(msg.toString() === "tun-udp4" ? 0 : 4));
+s.on("error", () => process.exit(1));
+s.bind(0, "10.254.0.2", () => {
+  s.send("tun-udp4", 7003, "10.254.0.1");
+});
+setTimeout(() => process.exit(2), 10000);
+EOF
+
 QNODE=$(cd "$(dirname "$QNODE")" && pwd)/$(basename "$QNODE")
 export QNODE
 set +e
@@ -102,10 +133,16 @@ unshare -rn sh -c '
   rc6=$?
   "$QNODE" "$1/client4.js"
   rc4=$?
+  "$QNODE" "$1/client6udp.js"
+  rcu6=$?
+  "$QNODE" "$1/client4udp.js"
+  rcu4=$?
   kill $spid 2>/dev/null
   wait $spid 2>/dev/null
   [ "$rc6" -ne 0 ] && exit $rc6
-  exit $rc4
+  [ "$rc4" -ne 0 ] && exit $rc4
+  [ "$rcu6" -ne 0 ] && exit $rcu6
+  exit $rcu4
 ' sh "$tmp"
 rc=$?
 set -e
