@@ -2995,6 +2995,13 @@ static JSValue js_node_set_argv(JSContext *ctx, JSValueConst this_val,
     for (int i = 0; i < argc; i++)
         JS_SetPropertyUint32(ctx, arr, i, JS_DupValue(ctx, argv[i]));
     JS_SetPropertyStr(ctx, global, "__qnode_argv", arr);
+    /* The bootstrap is evaluated before the CLI arguments are known, so its
+       `process.argv` initially points at an empty array. Publish the real
+       argument vector on the process object once it is available. */
+    JSValue proc = JS_GetPropertyStr(ctx, global, "process");
+    if (JS_IsObject(proc))
+        JS_SetPropertyStr(ctx, proc, "argv", JS_DupValue(ctx, arr));
+    JS_FreeValue(ctx, proc);
     JS_FreeValue(ctx, global);
     return JS_UNDEFINED;
 }
