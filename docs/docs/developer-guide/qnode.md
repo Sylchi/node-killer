@@ -94,6 +94,7 @@ make test        # upstream quickjs-ng suite (qjs)
 make qnode-test  # qnode-only tests (crypto, workers, fetch, modules, net)
 ```
 
-Test262 cannot exercise the Node APIs, so qnode tests live outside
-`tests.conf` and are run by `tests/run-qnode-tests.sh`. Put new qnode tests
-there rather than in `tests.conf`.
+Test262 cannot exercise the Node APIs, so qnode tests live in `tests/qnode/`.
+`tests.conf` excludes the whole directory, and `tests/run-qnode-tests.sh`
+picks up every `*.js` file in it automatically, so adding a test needs no
+config change. (`net_shards.js` is run through its `net_shards.sh` wrapper.)

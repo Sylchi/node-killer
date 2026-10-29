@@ -17,18 +17,21 @@ if [ ! -x "$QNODE" ]; then
 fi
 
 status=0
-tests="crypto_keys worker_threads fetch_web module_loader"
-for test in $tests; do
-  echo "=== $test"
-  if ! "$QNODE" "$here/$test.js"; then
-    echo "FAILED: $test" >&2
+for file in "$here"/qnode/*.js; do
+  name=$(basename "$file" .js)
+  # net_shards is run through its wrapper below so a private subnet can be
+  # configured first.
+  [ "$name" = "net_shards" ] && continue
+  echo "=== $name"
+  if ! "$QNODE" "$file"; then
+    echo "FAILED: $name" >&2
     status=1
   fi
 done
 
 # net_shards needs the wrapper to set up an optional private subnet.
 echo "=== net_shards"
-if ! QNODE="$QNODE" "$here/net_shards.sh"; then
+if ! QNODE="$QNODE" "$here/qnode/net_shards.sh"; then
   echo "FAILED: net_shards" >&2
   status=1
 fi

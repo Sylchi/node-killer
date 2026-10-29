@@ -6,7 +6,7 @@
 set -eu
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-QNODE=${QNODE:-"$here/../build/qnode"}
+QNODE=${QNODE:-"$here/../../build/qnode"}
 SUBNET=${QNODE_TEST_SUBNET:-fd00:dead:beef:1::/64}
 SCRIPT="$here/net_shards.js"
 

@@ -142,7 +142,7 @@ microbench: $(QJS)
 
 net-test: $(BUILD_DIR)
 	cmake --build $(BUILD_DIR) --target qnode_exe -j $(JOBS)
-	QNODE=$(abspath $(BUILD_DIR))/qnode $(CURDIR)/tests/net_shards.sh
+	QNODE=$(abspath $(BUILD_DIR))/qnode $(CURDIR)/tests/qnode/net_shards.sh
 
 net-bench: $(BUILD_DIR)
 	cmake --build $(BUILD_DIR) --target qnode_exe -j $(JOBS)
@@ -154,15 +154,15 @@ netstack-test: $(BUILD_DIR)
 
 worker-test: $(BUILD_DIR)
 	cmake --build $(BUILD_DIR) --target qnode_exe -j $(JOBS)
-	$(abspath $(BUILD_DIR))/qnode $(CURDIR)/tests/worker_threads.js
+	$(abspath $(BUILD_DIR))/qnode $(CURDIR)/tests/qnode/worker_threads.js
 
 fetch-test: $(BUILD_DIR)
 	cmake --build $(BUILD_DIR) --target qnode_exe -j $(JOBS)
-	$(abspath $(BUILD_DIR))/qnode $(CURDIR)/tests/fetch_web.js
+	$(abspath $(BUILD_DIR))/qnode $(CURDIR)/tests/qnode/fetch_web.js
 
 crypto-test: $(BUILD_DIR)
 	cmake --build $(BUILD_DIR) --target qnode_exe -j $(JOBS)
-	$(abspath $(BUILD_DIR))/qnode $(CURDIR)/tests/crypto_keys.js
+	$(abspath $(BUILD_DIR))/qnode $(CURDIR)/tests/qnode/crypto_keys.js
 
 qnode-test: $(BUILD_DIR)
 	cmake --build $(BUILD_DIR) --target qnode_exe -j $(JOBS)

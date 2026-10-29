@@ -150,7 +150,7 @@ kernel hashes new connections across processes sharing a shard address.
 make net-test BUILD_DIR=build
 ```
 
-`tests/net_shards.sh` runs the suite inside `unshare -rn` when user namespaces
+`tests/qnode/net_shards.sh` runs the suite inside `unshare -rn` when user namespaces
 and `ip` are available, configures a private `/64` on loopback, and exercises
 shard address derivation, per-shard listeners, shard selection, client source
 binding, fallback, and the `fallback: false` error path. Without user

@@ -1,7 +1,7 @@
 /*
  * node:net IPv6 shard dispatch tests.
  *
- * Run through tests/net_shards.sh so a private /64 can be configured first.
+ * Run through tests/qnode/net_shards.sh so a private /64 can be configured first.
  * Without a usable subnet the script still checks the fallback path and
  * exits successfully, so the suite works on hosts without IPv6 setup.
  */

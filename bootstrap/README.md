@@ -37,4 +37,5 @@ The parts are **not** ES modules. They share one top-level scope, so:
 2. Register the name in the builtin module registry in `90-web-streams.js`.
 3. Add a native primitive to `node.c` and expose it through
    `__qnode_native` if the implementation needs one.
-4. Add a test under `tests/` and make sure it runs through `make qnode-test`.
+4. Add a test under `tests/qnode/` and make sure it runs through
+   `make qnode-test`.
