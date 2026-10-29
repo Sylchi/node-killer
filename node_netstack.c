@@ -488,6 +488,16 @@ int node_netstack_info(char *addr, size_t addrlen, char *addr4, size_t addr4len,
 
     pthread_mutex_lock(&vfd_lock);
     if (!ns_init()) {
+#ifdef QNODE_FREESTANDING
+        if (addr && addrlen)
+            snprintf(addr, addrlen, "::1");
+        if (addr4 && addr4len)
+            snprintf(addr4, addr4len, "127.0.0.1");
+        if (link)
+            *link = "loopback";
+        pthread_mutex_unlock(&vfd_lock);
+        return 0;
+#else
         local6 = ns_stack_local_family(ns_stack, NS_AF_INET6);
         local4 = ns_stack_local_family(ns_stack, NS_AF_INET);
         if (addr && addrlen)
@@ -498,6 +508,7 @@ int node_netstack_info(char *addr, size_t addrlen, char *addr4, size_t addr4len,
             *link = ns_link_name(ns_link) ? ns_link_name(ns_link) : "loopback";
         pthread_mutex_unlock(&vfd_lock);
         return 0;
+#endif
     }
     pthread_mutex_unlock(&vfd_lock);
     if (addr && addrlen)
