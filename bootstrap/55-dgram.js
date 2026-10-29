@@ -86,8 +86,10 @@ class DgramSocket extends EventEmitter {
     if (this._fd !== undefined)
       return this._fd;
     const domain = this.type === "udp6" ? C.AF_INET6 : C.AF_INET;
-    const r = native.socket(domain, C.SOCK_DGRAM, 0,
-                            netstackMode(this._options));
+    let mode = 0;
+    if (this._options && this._options.netstack === true) mode = 1;
+    if (this._options && this._options.netstack === false) mode = -1;
+    const r = native.socket(domain, C.SOCK_DGRAM, 0, mode);
     if (r[1])
       throw sysError(r[1], "socket");
     this._fd = r[0];
