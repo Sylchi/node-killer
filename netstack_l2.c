@@ -17,9 +17,6 @@
 #define ETHERTYPE_ARP 0x0806
 #define ETHERTYPE_IPV6 0x86dd
 
-#define IPV4_HDR 20
-#define IPV6_HDR 40
-#define ICMP6_HDR 8
 #define ND_NS 135
 #define ND_NA 136
 #define ND_RS 133
@@ -59,6 +56,7 @@ typedef struct NsNeigh {
     uint8_t mac[NS_L2_MAC_LEN];
     uint8_t state;
     uint8_t retries;
+    int pending;   /* packets queued for this neighbour */
     uint64_t next_probe;
     uint64_t expires;
     uint64_t used;
@@ -529,11 +527,11 @@ static int arp_emit_reply(NsL2 *l2, const uint8_t *dstmac, const NsAddr *peer)
 
 static int ndp_emit_ns(NsL2 *l2, const NsAddr *target)
 {
-    uint8_t pkt[IPV6_HDR + 24 + 8];
+    uint8_t pkt[NS_IPV6_HDR + 24 + 8];
     uint8_t dst6[16];
     uint8_t dstmac[NS_L2_MAC_LEN];
     uint8_t *ip = pkt;
-    uint8_t *icmp = pkt + IPV6_HDR;
+    uint8_t *icmp = pkt + NS_IPV6_HDR;
     const NsAddr *src;
     uint16_t csum;
 
@@ -563,7 +561,7 @@ static int ndp_emit_ns(NsL2 *l2, const NsAddr *target)
 
     ip[0] = 0x60;
     ns_wr16(ip + 4, 24 + 8);
-    ip[6] = 58;
+    ip[6] = NS_IPPROTO_ICMPV6;
     ip[7] = 255;
     memcpy(ip + 8, src->b, 16);
     memcpy(ip + 24, dst6, 16);
@@ -574,7 +572,8 @@ static int ndp_emit_ns(NsL2 *l2, const NsAddr *target)
     icmp[24] = ND_OPT_SOURCE_LL;
     icmp[25] = 1;
     memcpy(icmp + 26, l2->mac, NS_L2_MAC_LEN);
-    csum = ns_l4_checksum(ip + 8, ip + 24, NS_AF_INET6, 58, icmp, 24 + 8);
+    csum = ns_l4_checksum(ip + 8, ip + 24, NS_AF_INET6,
+                          NS_IPPROTO_ICMPV6, icmp, 24 + 8);
     ns_wr16(icmp + 2, csum);
 
     l2->stats.tx_ndp++;
@@ -584,15 +583,15 @@ static int ndp_emit_ns(NsL2 *l2, const NsAddr *target)
 static int ndp_emit_na(NsL2 *l2, const uint8_t *dstmac, const NsAddr *dst,
                        const NsAddr *target)
 {
-    uint8_t pkt[IPV6_HDR + 24 + 8];
+    uint8_t pkt[NS_IPV6_HDR + 24 + 8];
     uint8_t *ip = pkt;
-    uint8_t *icmp = pkt + IPV6_HDR;
+    uint8_t *icmp = pkt + NS_IPV6_HDR;
     uint16_t csum;
 
     memset(pkt, 0, sizeof(pkt));
     ip[0] = 0x60;
     ns_wr16(ip + 4, 24 + 8);
-    ip[6] = 58;
+    ip[6] = NS_IPPROTO_ICMPV6;
     ip[7] = 255;
     memcpy(ip + 8, target->b, 16);
     memcpy(ip + 24, dst->b, 16);
@@ -605,7 +604,8 @@ static int ndp_emit_na(NsL2 *l2, const uint8_t *dstmac, const NsAddr *dst,
     icmp[24] = ND_OPT_TARGET_LL;
     icmp[25] = 1;
     memcpy(icmp + 26, l2->mac, NS_L2_MAC_LEN);
-    csum = ns_l4_checksum(ip + 8, ip + 24, NS_AF_INET6, 58, icmp, 24 + 8);
+    csum = ns_l4_checksum(ip + 8, ip + 24, NS_AF_INET6,
+                          NS_IPPROTO_ICMPV6, icmp, 24 + 8);
     ns_wr16(icmp + 2, csum);
 
     l2->stats.tx_ndp++;
@@ -615,11 +615,11 @@ static int ndp_emit_na(NsL2 *l2, const uint8_t *dstmac, const NsAddr *dst,
 /* Send a router solicitation to the all-routers multicast group. */
 static int ndp_emit_rs(NsL2 *l2)
 {
-    uint8_t pkt[IPV6_HDR + 8 + 8];
+    uint8_t pkt[NS_IPV6_HDR + 8 + 8];
     uint8_t dst6[16];
     uint8_t dstmac[NS_L2_MAC_LEN] = { 0x33, 0x33, 0, 0, 0, 2 };
     uint8_t *ip = pkt;
-    uint8_t *icmp = pkt + IPV6_HDR;
+    uint8_t *icmp = pkt + NS_IPV6_HDR;
     size_t opt = l2->has_link6 ? 8 : 0;
     size_t plen = 8 + opt;
     uint16_t csum;
@@ -632,7 +632,7 @@ static int ndp_emit_rs(NsL2 *l2)
 
     ip[0] = 0x60;
     ns_wr16(ip + 4, (uint16_t)plen);
-    ip[6] = 58;
+    ip[6] = NS_IPPROTO_ICMPV6;
     ip[7] = 255;
     if (l2->has_link6)
         memcpy(ip + 8, l2->link6.b, 16);
@@ -645,11 +645,12 @@ static int ndp_emit_rs(NsL2 *l2)
         icmp[9] = 1;
         memcpy(icmp + 10, l2->mac, NS_L2_MAC_LEN);
     }
-    csum = ns_l4_checksum(ip + 8, dst6, NS_AF_INET6, 58, icmp, plen);
+    csum = ns_l4_checksum(ip + 8, dst6, NS_AF_INET6, NS_IPPROTO_ICMPV6,
+                          icmp, plen);
     ns_wr16(icmp + 2, csum);
 
     l2->stats.tx_rs++;
-    return l2_emit(l2, dstmac, ETHERTYPE_IPV6, pkt, IPV6_HDR + plen);
+    return l2_emit(l2, dstmac, ETHERTYPE_IPV6, pkt, NS_IPV6_HDR + plen);
 }
 
 /* Find a link-layer option and return a pointer to its address bytes. */
@@ -717,22 +718,23 @@ static int ndp_input(NsL2 *l2, const uint8_t *ip, size_t len,
     uint8_t type;
     NsAddr srcaddr, dstaddr, target;
 
-    if (len < IPV6_HDR)
+    if (len < NS_IPV6_HDR)
         return 0;
-    if (ip[6] != 58 || ip[7] != 255)
+    if (ip[6] != NS_IPPROTO_ICMPV6 || ip[7] != 255)
         return 0;
 
-    total = IPV6_HDR + (size_t)ns_rd16(ip + 4);
+    total = NS_IPV6_HDR + (size_t)ns_rd16(ip + 4);
     if (total > len)
         return 1;
-    if (total < IPV6_HDR + 8)
+    if (total < NS_IPV6_HDR + 8)
         return 0;
     type = ip[40];
     if (type != ND_NS && type != ND_NA && type != ND_RS && type != ND_RA)
         return 0;
-    icmp = ip + IPV6_HDR;
-    icmp_len = total - IPV6_HDR;
-    if (ns_l4_checksum(src, dst, NS_AF_INET6, 58, icmp, icmp_len) != 0 ||
+    icmp = ip + NS_IPV6_HDR;
+    icmp_len = total - NS_IPV6_HDR;
+    if (ns_l4_checksum(src, dst, NS_AF_INET6, NS_IPPROTO_ICMPV6, icmp,
+                       icmp_len) != 0 ||
         icmp[1] != 0)
         return 1;
 
@@ -742,7 +744,7 @@ static int ndp_input(NsL2 *l2, const uint8_t *ip, size_t len,
         ndp_ra_input(l2, src, icmp, icmp_len, srcmac);
         return 1;
     }
-    if (total < IPV6_HDR + 24)
+    if (total < NS_IPV6_HDR + 24)
         return 1;
     l2->stats.rx_ndp++;
 
@@ -813,6 +815,7 @@ static void pending_drop_addr(NsL2 *l2, const NsAddr *addr, int counted)
 {
     NsL2Pkt **pp = &l2->pending;
     NsL2Pkt *prev = NULL;
+    NsNeigh *n = neigh_find(l2, addr);
 
     while (*pp) {
         NsL2Pkt *p = *pp;
@@ -829,6 +832,8 @@ static void pending_drop_addr(NsL2 *l2, const NsAddr *addr, int counted)
             pp = &p->next;
         }
     }
+    if (n)
+        n->pending = 0;
 }
 
 static NsNeigh *neigh_find(const NsL2 *l2, const NsAddr *addr)
@@ -870,34 +875,20 @@ static NsNeigh *neigh_alloc(NsL2 *l2, const NsAddr *addr)
     return victim;
 }
 
-static int pending_count_addr(const NsL2 *l2, const NsAddr *addr)
-{
-    const NsL2Pkt *p = l2->pending;
-    int n = 0;
-
-    while (p) {
-        if (ns_addr_eq(&p->next_hop, addr))
-            n++;
-        p = p->next;
-    }
-    return n;
-}
-
-static int pending_push(NsL2 *l2, const NsAddr *addr, const uint8_t *pkt,
+static int pending_push(NsL2 *l2, NsNeigh *n, const uint8_t *pkt,
                         size_t len)
 {
     NsL2Pkt *p;
 
     if (l2->npending >= NS_L2_MAX_PENDING)
         return -1;
-    if (pending_count_addr(l2, addr) >= NS_L2_PENDING_PER_NEIGHBOR)
+    if (n->pending >= NS_L2_PENDING_PER_NEIGHBOR)
         return -1;
     p = malloc(sizeof(*p) + len);
     if (!p)
         return -1;
     p->next = NULL;
-    p->next_hop = *addr;
-    p->next_hop.family = (uint8_t)ns_addr_family(addr);
+    p->next_hop = n->addr;
     p->len = len;
     memcpy(p->data, pkt, len);
     if (l2->pending_tail)
@@ -906,6 +897,7 @@ static int pending_push(NsL2 *l2, const NsAddr *addr, const uint8_t *pkt,
         l2->pending = p;
     l2->pending_tail = p;
     l2->npending++;
+    n->pending++;
     return 0;
 }
 
@@ -913,6 +905,7 @@ static void pending_flush(NsL2 *l2, const NsAddr *addr, const uint8_t *mac)
 {
     NsL2Pkt **pp = &l2->pending;
     NsL2Pkt *prev = NULL;
+    NsNeigh *n = neigh_find(l2, addr);
 
     while (*pp) {
         NsL2Pkt *p = *pp;
@@ -928,6 +921,8 @@ static void pending_flush(NsL2 *l2, const NsAddr *addr, const uint8_t *mac)
             pp = &p->next;
         }
     }
+    if (n)
+        n->pending = 0;
 }
 
 static void neigh_learn(NsL2 *l2, const NsAddr *addr, const uint8_t *mac)
@@ -983,7 +978,7 @@ static int neigh_send(NsL2 *l2, const uint8_t *pkt, size_t len,
         n->next_probe = l2->clock + NS_L2_PROBE_INTERVAL_MS;
     }
 
-    if (pending_push(l2, next_hop, pkt, len) < 0) {
+    if (pending_push(l2, n, pkt, len) < 0) {
         l2->stats.queue_dropped++;
         return -1;
     }
@@ -1258,7 +1253,7 @@ int ns_l2_send_ip(NsL2 *l2, const uint8_t *pkt, size_t len)
     uint8_t bcast[NS_L2_MAC_LEN];
     int routed;
 
-    if (!l2 || !pkt || len < IPV4_HDR) {
+    if (!l2 || !pkt || len < NS_IPV4_HDR) {
         if (l2)
             l2->stats.dropped++;
         return -NS_EINVAL;
@@ -1300,7 +1295,7 @@ int ns_l2_send_ip(NsL2 *l2, const uint8_t *pkt, size_t len)
     }
 
     if (version == 6) {
-        if (len < IPV6_HDR) {
+        if (len < NS_IPV6_HDR) {
             l2->stats.dropped++;
             return -1;
         }
@@ -1370,7 +1365,7 @@ void ns_l2_input(NsL2 *l2, const uint8_t *frame, size_t len)
         return;
     }
     if (ethertype == ETHERTYPE_IPV6) {
-        if (plen >= IPV6_HDR) {
+        if (plen >= NS_IPV6_HDR) {
             if (ndp_input(l2, payload, plen, frame + 6))
                 return;
         }
@@ -1411,8 +1406,8 @@ void ns_l2_tick(NsL2 *l2, uint64_t now_ms)
             continue;
         if (n->state == NEIGH_REACHABLE) {
             if (now_ms >= n->expires) {
-                n->state = NEIGH_FREE;
                 pending_drop_addr(l2, &n->addr, 0);
+                n->state = NEIGH_FREE;
             }
             continue;
         }

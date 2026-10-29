@@ -47,6 +47,9 @@ sharded listeners use kernel TCP, the managed prefix uses the owned stack.
 - `node_netstack.c` exposes the stack as descriptors. Each virtual fd is an
   `eventfd`; `node.c` routes socket natives to the bridge when the descriptor
   is virtual, and libev polls the underlying eventfd as usual.
+- Hot-path allocations are recycled per stack: acknowledged TCP segments and
+  received UDP datagrams up to 2 KiB use bounded caches (64 entries each), and
+  small ICMP messages are built in stack buffers rather than on the heap.
 - `bootstrap/50-net-http.js` treats a virtual fd like any other non-blocking
   socket. Connect completion uses the read handler, because a virtual fd has
   no writable-side event of its own.

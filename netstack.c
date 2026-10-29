@@ -13,11 +13,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define NS_IPV4_HDR 20
-#define NS_IPV6_HDR 40
-#define NS_TCP_HDR 20
-#define NS_UDP_HDR 8
-#define NS_ICMP_HDR 8
 #define NS_MTU 1500
 #define NS_MSS 1400
 #define NS_RTO_MS 200
@@ -37,6 +32,14 @@
 #define NS_PMTU_V4_MIN 68
 #define NS_PMTU_V6_MIN 1280
 #define NS_MAX_IP_PACKET 65535
+
+/* Per-stack caches for the two most frequent allocations: queued TCP
+   segments and received UDP datagrams. The caps bound retained memory while
+   keeping the steady-state send/receive paths off the system allocator. */
+#define NS_SEG_CACHE_MAX 64
+#define NS_DGRAM_CACHE_SIZE 2048
+#define NS_DGRAM_CACHE_MAX 64
+#define NS_ICMP_INLINE 512
 
 #define NS_TCP_FIN 0x01
 #define NS_TCP_SYN 0x02
@@ -108,6 +111,7 @@ typedef struct NsDgram {
     NsAddr src;
     uint16_t sport;
     uint16_t len;
+    uint16_t cap;   /* allocation size for cache eligibility */
     uint8_t data[];
 } NsDgram;
 
@@ -186,9 +190,83 @@ struct NsStack {
     NsStats stats;
     uint8_t dispatch_log[NS_DISPATCH_LOG_MAX];
     int dispatch_log_len;
+    NsSeg *seg_cache;
+    int nseg_cache;
+    NsDgram *dgram_cache;
+    int ndgram_cache;
 };
 
-static void udp_free(NsUdp *u);
+static NsSeg *seg_alloc(NsStack *s, size_t len)
+{
+    NsSeg *seg;
+
+    if (len > NS_MSS)
+        return NULL;
+    if (s->nseg_cache > 0) {
+        seg = s->seg_cache;
+        s->seg_cache = seg->next;
+        s->nseg_cache--;
+        memset(seg, 0, sizeof(*seg));
+    } else {
+        seg = calloc(1, sizeof(*seg) + NS_MSS);
+        if (!seg)
+            return NULL;
+    }
+    seg->next = NULL;
+    return seg;
+}
+
+static void seg_release(NsStack *s, NsSeg *seg)
+{
+    if (!seg)
+        return;
+    if (s->nseg_cache < NS_SEG_CACHE_MAX) {
+        seg->next = s->seg_cache;
+        s->seg_cache = seg;
+        s->nseg_cache++;
+        return;
+    }
+    free(seg);
+}
+
+static NsDgram *dgram_alloc(NsStack *s, size_t len)
+{
+    NsDgram *d;
+
+    if (len <= NS_DGRAM_CACHE_SIZE && s->ndgram_cache > 0) {
+        d = s->dgram_cache;
+        s->dgram_cache = d->next;
+        s->ndgram_cache--;
+        d->next = NULL;
+        d->cap = NS_DGRAM_CACHE_SIZE;
+        return d;
+    }
+    if (len <= NS_DGRAM_CACHE_SIZE)
+        d = malloc(sizeof(*d) + NS_DGRAM_CACHE_SIZE);
+    else
+        d = malloc(sizeof(*d) + len);
+    if (!d)
+        return NULL;
+    d->next = NULL;
+    d->cap = len <= NS_DGRAM_CACHE_SIZE ? NS_DGRAM_CACHE_SIZE : 0;
+    return d;
+}
+
+static void dgram_release(NsStack *s, NsDgram *d)
+{
+    if (!d)
+        return;
+    if (d->cap == NS_DGRAM_CACHE_SIZE &&
+        s->ndgram_cache < NS_DGRAM_CACHE_MAX) {
+        d->next = s->dgram_cache;
+        s->dgram_cache = d;
+        s->ndgram_cache++;
+        return;
+    }
+    free(d);
+}
+
+static void udp_free(NsStack *s, NsUdp *u);
 static void reasm_destroy(NsStack *s, NsReasm *e);
 static void reasm_add(NsStack *s, int family, const NsAddr *src,
                       const NsAddr *dst, uint8_t proto, uint32_t id,
@@ -204,7 +282,7 @@ static int ip_emit(NsStack *s, const NsAddr *src, const NsAddr *dst,
 static uint16_t tcp_checksum(const uint8_t *src, const uint8_t *dst,
                              int family, const uint8_t *tcp, size_t tcp_len)
 {
-    return ns_l4_checksum(src, dst, family, 6, tcp, tcp_len);
+    return ns_l4_checksum(src, dst, family, NS_IPPROTO_TCP, tcp, tcp_len);
 }
 
 /* A computed zero is transmitted as 0xffff: zero means "no checksum" in
@@ -212,7 +290,7 @@ static uint16_t tcp_checksum(const uint8_t *src, const uint8_t *dst,
 static uint16_t udp_checksum(const uint8_t *src, const uint8_t *dst,
                              int family, const uint8_t *udp, size_t udp_len)
 {
-    uint16_t c = ns_l4_checksum(src, dst, family, 17, udp, udp_len);
+    uint16_t c = ns_l4_checksum(src, dst, family, NS_IPPROTO_UDP, udp, udp_len);
     return c ? c : 0xffff;
 }
 
@@ -397,10 +475,11 @@ NsStack *ns_stack_new(const uint8_t prefix[NS_PREFIX_LEN], int nshards,
 
 static void conn_free(NsConn *c)
 {
+    NsStack *s = c->shard->stack;
     NsSeg *seg = c->tx_head;
     while (seg) {
         NsSeg *next = seg->next;
-        free(seg);
+        seg_release(s, seg);
         seg = next;
     }
     free(c->rbuf);
@@ -430,12 +509,22 @@ void ns_stack_free(NsStack *s)
         NsUdp *u = s->udp;
         while (u) {
             NsUdp *next = u->next;
-            udp_free(u);
+            udp_free(s, u);
             u = next;
         }
     }
     while (s->reasm)
         reasm_destroy(s, s->reasm);
+    while (s->seg_cache) {
+        NsSeg *seg = s->seg_cache;
+        s->seg_cache = seg->next;
+        free(seg);
+    }
+    while (s->dgram_cache) {
+        NsDgram *d = s->dgram_cache;
+        s->dgram_cache = d->next;
+        free(d);
+    }
     free(s);
 }
 
@@ -897,14 +986,14 @@ static void ns_emit(NsConn *c, uint8_t flags, uint32_t seq, uint32_t ack,
     ns_wr16(tcp + 16, tcp_checksum(c->local.b, c->remote.b, family, tcp,
                                 tcp_len));
 
-    ip_emit(s, &c->local, &c->remote, 6, tcp, tcp_len);
+    ip_emit(s, &c->local, &c->remote, NS_IPPROTO_TCP, tcp, tcp_len);
 }
 
 static NsSeg *seg_add(NsConn *c, uint32_t seq, uint32_t seq_len,
                       uint8_t flags, const uint8_t *data, size_t len,
                       uint64_t now)
 {
-    NsSeg *seg = calloc(1, sizeof(*seg) + len);
+    NsSeg *seg = seg_alloc(c->shard->stack, len);
     if (!seg)
         return NULL;
     seg->seq = seq;
@@ -935,7 +1024,7 @@ static void conn_ack(NsConn *c, uint32_t ack)
         c->tx_head = seg->next;
         if (!c->tx_head)
             c->tx_tail = NULL;
-        free(seg);
+        seg_release(c->shard->stack, seg);
     }
 }
 
@@ -1112,9 +1201,12 @@ static int icmp_emit(NsStack *s, const NsAddr *src, const NsAddr *dst,
     if (family == NS_AF_INET)
         ns_wr16(msg + 2, ipv4_checksum(msg, len));
     else
-        ns_wr16(msg + 2, ns_l4_checksum(src->b, dst->b, family, 58, msg, len));
+        ns_wr16(msg + 2, ns_l4_checksum(src->b, dst->b, family,
+                                     NS_IPPROTO_ICMPV6, msg, len));
 
-    r = ip_emit(s, src, dst, family == NS_AF_INET ? 1 : 58, msg, len);
+    r = ip_emit(s, src, dst,
+                family == NS_AF_INET ? NS_IPPROTO_ICMP : NS_IPPROTO_ICMPV6,
+                msg, len);
     if (r == 0)
         s->stats.icmp_tx++;
     return r;
@@ -1190,8 +1282,8 @@ static void icmp_input(NsShard *sh, const uint8_t *pkt, size_t len)
             s->stats.dropped++;
             return;
         }
-    } else if (ns_l4_checksum(pkt + 8, pkt + 24, family, 58, icmp,
-                           icmp_len) != 0) {
+    } else if (ns_l4_checksum(pkt + 8, pkt + 24, family,
+                           NS_IPPROTO_ICMPV6, icmp, icmp_len) != 0) {
         s->stats.dropped++;
         return;
     }
@@ -1206,21 +1298,25 @@ static void icmp_input(NsShard *sh, const uint8_t *pkt, size_t len)
 
     if ((family == NS_AF_INET && icmp[0] == 8 && icmp[1] == 0) ||
         (family == NS_AF_INET6 && icmp[0] == 128 && icmp[1] == 0)) {
-        uint8_t *reply;
+        uint8_t small[NS_ICMP_INLINE];
+        uint8_t *reply = small;
         int r;
 
         if (!icmp_can_reply(&sa, &da))
             return;
-        reply = malloc(icmp_len);
-        if (!reply) {
-            s->stats.dropped++;
-            return;
+        if (icmp_len > sizeof(small)) {
+            reply = malloc(icmp_len);
+            if (!reply) {
+                s->stats.dropped++;
+                return;
+            }
         }
         memcpy(reply, icmp, icmp_len);
         reply[0] = family == NS_AF_INET ? 0 : 129;
         reply[1] = 0;
         r = icmp_emit(s, &da, &sa, reply, icmp_len);
-        free(reply);
+        if (reply != small)
+            free(reply);
         if (r < 0)
             s->stats.dropped++;
     }
@@ -1281,7 +1377,8 @@ static void icmp_port_unreachable(NsShard *sh, const uint8_t *pkt, size_t len)
 int ns_icmp_echo(NsStack *s, const NsAddr *local, const NsAddr *remote,
                  uint16_t id, uint16_t seq, const void *payload, size_t len)
 {
-    uint8_t *msg;
+    uint8_t small[NS_ICMP_INLINE];
+    uint8_t *msg = small;
     int family;
     size_t total;
     int r;
@@ -1294,9 +1391,11 @@ int ns_icmp_echo(NsStack *s, const NsAddr *local, const NsAddr *remote,
     if (len > (size_t)NS_MAX_IP_PACKET - NS_ICMP_HDR)
         return -NS_EMSGSIZE;
     total = NS_ICMP_HDR + len;
-    msg = malloc(total);
-    if (!msg)
-        return -NS_EMSGSIZE;
+    if (total > sizeof(small)) {
+        msg = malloc(total);
+        if (!msg)
+            return -NS_EMSGSIZE;
+    }
     memset(msg, 0, NS_ICMP_HDR);
     msg[0] = family == NS_AF_INET ? 8 : 128;
     msg[1] = 0;
@@ -1305,18 +1404,19 @@ int ns_icmp_echo(NsStack *s, const NsAddr *local, const NsAddr *remote,
     if (len)
         memcpy(msg + NS_ICMP_HDR, payload, len);
     r = icmp_emit(s, local, remote, msg, total);
-    free(msg);
+    if (msg != small)
+        free(msg);
     return r;
 }
 
 /* ---------------- UDP ---------------- */
 
-static void udp_free(NsUdp *u)
+static void udp_free(NsStack *s, NsUdp *u)
 {
     NsDgram *d = u->qhead;
     while (d) {
         NsDgram *next = d->next;
-        free(d);
+        dgram_release(s, d);
         d = next;
     }
     free(u);
@@ -1413,7 +1513,7 @@ static int udp_emit(NsStack *s, const NsAddr *src, const NsAddr *dst,
         memcpy(udp + NS_UDP_HDR, buf, len);
     ns_wr16(udp + 6, udp_checksum(src->b, dst->b, family, udp, udp_len));
 
-    r = ip_emit(s, src, dst, 17, udp, udp_len);
+    r = ip_emit(s, src, dst, NS_IPPROTO_UDP, udp, udp_len);
     if (udp != small)
         free(udp);
     return r;
@@ -1582,7 +1682,7 @@ int ns_udp_recvfrom(NsStack *s, uint64_t id, void *buf, size_t len,
         *src = d->src;
     if (sport)
         *sport = d->sport;
-    free(d);
+    dgram_release(s, d);
     return (int)n;
 }
 
@@ -1598,7 +1698,7 @@ int ns_udp_close(NsStack *s, uint64_t id)
             continue;
         *pp = u->next;
         s->nudp--;
-        udp_free(u);
+        udp_free(s, u);
         return 0;
     }
     return -NS_ENOTCONN;
@@ -1695,7 +1795,7 @@ static void udp_input(NsShard *sh, const uint8_t *pkt, size_t len)
         s->stats.dropped++;
         return;
     }
-    d = malloc(sizeof(*d) + dlen);
+    d = dgram_alloc(s, dlen);
     if (!d) {
         s->stats.dropped++;
         return;
@@ -1919,7 +2019,7 @@ static void ip_dispatch(NsStack *s, const uint8_t *pkt, size_t len, int family,
     l4 = pkt + ip_hdr;
     l4_len = len - ip_hdr;
 
-    if (proto == 17) {
+    if (proto == NS_IPPROTO_UDP) {
         uint16_t ulen;
 
         if (l4_len < NS_UDP_HDR) {
@@ -1938,11 +2038,12 @@ static void ip_dispatch(NsStack *s, const uint8_t *pkt, size_t len, int family,
                 s->stats.dropped++;
                 return;
             }
-        } else if (ns_l4_checksum(src, dst, family, 17, l4, l4_len) != 0) {
+        } else if (ns_l4_checksum(src, dst, family, NS_IPPROTO_UDP, l4,
+                                  l4_len) != 0) {
             s->stats.dropped++;
             return;
         }
-    } else if (proto == 1 || proto == 58) {
+    } else if (proto == NS_IPPROTO_ICMP || proto == NS_IPPROTO_ICMPV6) {
         if (l4_len < NS_ICMP_HDR) {
             s->stats.dropped++;
             return;
@@ -2016,11 +2117,11 @@ static void shard_process(NsShard *sh, NsPacket *p)
 
     /* UDP packets are not TCP segments; do not decode a TCP header until
        after this check, since a short datagram may end before tcp[12]. */
-    if (proto == 17) {
+    if (proto == NS_IPPROTO_UDP) {
         udp_input(sh, pkt, p->len);
         return;
     }
-    if (proto == 1 || proto == 58) {
+    if (proto == NS_IPPROTO_ICMP || proto == NS_IPPROTO_ICMPV6) {
         icmp_input(sh, pkt, p->len);
         return;
     }
@@ -2208,12 +2309,17 @@ void ns_input(NsStack *s, const uint8_t *pkt, size_t len)
                       len - NS_IPV6_HDR - 8);
             return;
         }
-        if (proto != 6 && proto != 17 && proto != 58) {
+        if (proto != NS_IPPROTO_TCP && proto != NS_IPPROTO_UDP &&
+            proto != NS_IPPROTO_ICMPV6) {
             s->stats.dropped++;
             return;
         }
-        min_hdr = proto == 6 ? NS_TCP_HDR
-                            : proto == 17 ? NS_UDP_HDR : NS_ICMP_HDR;
+        if (proto == NS_IPPROTO_TCP)
+            min_hdr = NS_TCP_HDR;
+        else if (proto == NS_IPPROTO_UDP)
+            min_hdr = NS_UDP_HDR;
+        else
+            min_hdr = NS_ICMP_HDR;
         if (len < NS_IPV6_HDR + min_hdr) {
             s->stats.dropped++;
             return;

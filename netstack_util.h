@@ -15,6 +15,19 @@
 
 #include "netstack.h"
 
+/* Fixed header sizes and IP protocol numbers shared by the stack and link
+   layer. */
+#define NS_IPV4_HDR 20
+#define NS_IPV6_HDR 40
+#define NS_TCP_HDR 20
+#define NS_UDP_HDR 8
+#define NS_ICMP_HDR 8
+
+#define NS_IPPROTO_ICMP 1
+#define NS_IPPROTO_TCP 6
+#define NS_IPPROTO_UDP 17
+#define NS_IPPROTO_ICMPV6 58
+
 static inline uint16_t ns_rd16(const uint8_t *p)
 {
     return (uint16_t)((p[0] << 8) | p[1]);
