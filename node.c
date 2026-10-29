@@ -33,6 +33,8 @@
 #include <pwd.h>
 
 #include <strings.h>
+#include <pthread.h>
+#include <sodium.h>
 #include <zlib.h>
 #include <mbedtls/version.h>
 #include <mbedtls/ssl.h>
@@ -256,6 +258,8 @@ static JSValue js_node_exepath(JSContext *ctx, JSValueConst this_val,
     return JS_NewString(ctx, buf);
 }
 
+static int node_sodium_init(void);
+
 static JSValue js_node_random_bytes(JSContext *ctx, JSValueConst this_val,
                                     int argc, JSValueConst *argv)
 {
@@ -265,20 +269,24 @@ static JSValue js_node_random_bytes(JSContext *ctx, JSValueConst this_val,
     uint8_t *buf = js_malloc(ctx, len ? len : 1);
     if (!buf)
         return JS_EXCEPTION;
-    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
-    size_t got = 0;
-    if (fd >= 0) {
-        while (got < (size_t)len) {
-            ssize_t n = read(fd, buf + got, len - got);
-            if (n <= 0)
-                break;
-            got += n;
+    if (node_sodium_init() == 0) {
+        randombytes_buf(buf, (size_t)len);
+    } else {
+        int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+        size_t got = 0;
+        if (fd >= 0) {
+            while (got < (size_t)len) {
+                ssize_t n = read(fd, buf + got, len - got);
+                if (n <= 0)
+                    break;
+                got += n;
+            }
+            close(fd);
         }
-        close(fd);
-    }
-    if (got < (size_t)len) {
-        js_free(ctx, buf);
-        return JS_ThrowPlainError(ctx, "cannot read random bytes");
+        if (got < (size_t)len) {
+            js_free(ctx, buf);
+            return JS_ThrowPlainError(ctx, "cannot read random bytes");
+        }
     }
     JSValue val = JS_NewUint8ArrayCopy(ctx, buf, len);
     js_free(ctx, buf);
@@ -1597,6 +1605,8 @@ static JSValue js_node_waitpid(JSContext *ctx, JSValueConst this_val,
     return node_ok(ctx, arr);
 }
 
+/* ---------------- zlib / compression ---------------- */
+
 /* compress(data, windowBits, level, memLevel, strategy) */
 static JSValue js_node_zlib_compress(JSContext *ctx, JSValueConst this_val,
                                      int argc, JSValueConst *argv)
@@ -1933,6 +1943,8 @@ static JSValue js_node_crc32(JSContext *ctx, JSValueConst this_val,
     return JS_NewUint32(ctx, (uint32_t)crc);
 }
 
+/* ---------------- text encoding ---------------- */
+
 /* UTF-8 conversion. The engine already has a fast decoder, so expose it
    instead of decoding byte by byte in JS (which costs ~300ns/byte). */
 static JSValue js_node_utf8_decode(JSContext *ctx, JSValueConst this_val,
@@ -1962,6 +1974,8 @@ static JSValue js_node_utf8_encode(JSContext *ctx, JSValueConst this_val,
     JS_FreeCString(ctx, p);
     return r;
 }
+
+/* ---------------- TLS ---------------- */
 
 #define NODE_TLS_MAX_CTX 256
 #define NODE_TLS_MAX_CONN 1024
@@ -2802,6 +2816,8 @@ static JSValue js_node_tls_info(JSContext *ctx, JSValueConst this_val,
     return obj;
 }
 
+/* ---------------- digest ---------------- */
+
 /* digest(name, data) -> Uint8Array. Used by crypto for algorithms that are
    not implemented in JS (sha384/sha512). */
 static JSValue js_node_digest(JSContext *ctx, JSValueConst this_val,
@@ -3206,6 +3222,236 @@ static const uint8_t *node_spki_to_pkcs1(const uint8_t *spki, size_t spki_len,
     return q + 1;
 }
 
+/* ---------------- Ed25519 (libsodium) ---------------- */
+
+static pthread_once_t node_sodium_once = PTHREAD_ONCE_INIT;
+static int node_sodium_status = -1;
+
+static void node_sodium_init_once(void)
+{
+    node_sodium_status = sodium_init();
+}
+
+static int node_sodium_init(void)
+{
+    pthread_once(&node_sodium_once, node_sodium_init_once);
+    return node_sodium_status < 0 ? -1 : 0;
+}
+
+/* Decode a PEM block into DER. Returns 1 when decoded, 0 when the input is
+   not PEM, and -1 on malformed input. */
+static int node_pem_to_der(JSContext *ctx, const uint8_t *data, size_t len,
+                           uint8_t **out, size_t *outlen)
+{
+    const uint8_t *body, *end, *p;
+    uint8_t *b64, *der;
+    size_t b64len = 0, n = 0, derlen;
+
+    if (len < 11 || memcmp(data, "-----BEGIN ", 11) != 0)
+        return 0;
+    p = memchr(data, '\n', len);
+    if (!p)
+        return -1;
+    body = p + 1;
+    end = NULL;
+    for (p = body; p + 9 <= data + len; p++) {
+        if (memcmp(p, "-----END ", 9) == 0) {
+            end = p;
+            break;
+        }
+    }
+    if (!end)
+        return -1;
+    /* Traditional encrypted PEM (RFC 1421) puts Proc-Type/DEK-Info headers
+       between the BEGIN line and the base64 payload. Those lines contain
+       non-base64 characters (':' and ','), so skip through the blank line
+       that terminates the header block. */
+    for (p = body; p < end && *p != ':' && *p != '\n' && *p != '\r'; p++)
+        ;
+    if (p < end && *p == ':') {
+        for (;;) {
+            const uint8_t *nl = memchr(p, '\n', (size_t)(end - p));
+            if (!nl)
+                return -1;
+            p = nl + 1;
+            if (p < end && *p == '\n') {
+                body = p + 1;
+                break;
+            }
+            if (p + 1 < end && *p == '\r' && p[1] == '\n') {
+                body = p + 2;
+                break;
+            }
+            if (p >= end)
+                return -1;
+        }
+    }
+    for (p = body; p < end; p++) {
+        if (*p != ' ' && *p != '\t' && *p != '\r' && *p != '\n')
+            b64len++;
+    }
+    if (b64len == 0)
+        return -1;
+    b64 = js_malloc(ctx, b64len);
+    if (!b64)
+        return -1;
+    for (p = body; p < end; p++) {
+        if (*p != ' ' && *p != '\t' && *p != '\r' && *p != '\n')
+            b64[n++] = *p;
+    }
+    derlen = b64len * 3 / 4 + 4;
+    der = js_malloc(ctx, derlen);
+    if (!der) {
+        js_free(ctx, b64);
+        return -1;
+    }
+    if (mbedtls_base64_decode(der, derlen, &derlen, b64, b64len) != 0) {
+        js_free(ctx, b64);
+        js_free(ctx, der);
+        return -1;
+    }
+    js_free(ctx, b64);
+    *out = der;
+    *outlen = derlen;
+    return 1;
+}
+
+static int node_ed25519_parse_der(const uint8_t *der, size_t derlen,
+                                  int *is_private, uint8_t seed[32],
+                                  uint8_t pub[32])
+{
+    static const uint8_t oid[] = { 0x2b, 0x65, 0x70 };
+    const uint8_t *end = der + derlen, *p, *q, *v;
+    uint8_t tag;
+    size_t len, alen;
+
+    p = node_der_tlv(der, end, &tag, &len);
+    if (!p || tag != 0x30 || p + len > end)
+        return 0;
+    end = p + len;
+    if (p >= end)
+        return 0;
+
+    if (*p == 0x02) {
+        /* PKCS#8 PrivateKeyInfo. */
+        v = node_der_tlv(p, end, &tag, &len);
+        if (!v || tag != 0x02)
+            return 0;
+        p = v + len;
+        v = node_der_tlv(p, end, &tag, &len);
+        if (!v || tag != 0x30)
+            return 0;
+        q = node_der_tlv(v, v + len, &tag, &alen);
+        if (!q || tag != 0x06 || alen != sizeof(oid) ||
+            memcmp(q, oid, sizeof(oid)) != 0)
+            return 0;
+        p = v + len;
+        v = node_der_tlv(p, end, &tag, &len);
+        if (!v || tag != 0x04)
+            return 0;
+        q = node_der_tlv(v, v + len, &tag, &alen);
+        if (!q || tag != 0x04 || alen != 32)
+            return 0;
+        memcpy(seed, q, 32);
+        *is_private = 1;
+        return 1;
+    }
+
+    if (*p == 0x30) {
+        /* SubjectPublicKeyInfo. */
+        v = node_der_tlv(p, end, &tag, &len);
+        if (!v || tag != 0x30)
+            return 0;
+        q = node_der_tlv(v, v + len, &tag, &alen);
+        if (!q || tag != 0x06 || alen != sizeof(oid) ||
+            memcmp(q, oid, sizeof(oid)) != 0)
+            return 0;
+        p = v + len;
+        v = node_der_tlv(p, end, &tag, &len);
+        if (!v || tag != 0x03 || len != 33 || v[0] != 0)
+            return 0;
+        memcpy(pub, v + 1, 32);
+        *is_private = 0;
+        return 1;
+    }
+
+    return 0;
+}
+
+/* Returns 1 for an Ed25519 key, 0 when the input is not Ed25519, and -1 on
+   malformed PEM input. */
+static int node_ed25519_parse(JSContext *ctx, const uint8_t *data, size_t len,
+                              int *is_private, uint8_t seed[32],
+                              uint8_t pub[32])
+{
+    uint8_t *der = NULL;
+    size_t derlen = 0;
+    const uint8_t *use = data;
+    int ret;
+
+    if (len >= 11 && memcmp(data, "-----BEGIN ", 11) == 0) {
+        ret = node_pem_to_der(ctx, data, len, &der, &derlen);
+        if (ret <= 0)
+            return ret;
+        use = der;
+    } else {
+        derlen = len;
+    }
+    ret = node_ed25519_parse_der(use, derlen, is_private, seed, pub);
+    if (der)
+        js_free(ctx, der);
+    return ret;
+}
+
+static int node_ed25519_pkcs8_der(JSContext *ctx, const uint8_t seed[32],
+                                  uint8_t **out, size_t *outlen)
+{
+    static const uint8_t oid[] = { 0x2b, 0x65, 0x70 };
+    size_t inner = node_der_tlv_size(32);
+    size_t content = 3 + node_der_tlv_size(node_der_tlv_size(sizeof(oid))) +
+                     node_der_tlv_size(inner);
+    size_t total = node_der_tlv_size(content);
+    uint8_t *buf = js_malloc(ctx, total), *p;
+
+    if (!buf)
+        return -1;
+    p = node_der_write(buf, 0x30, content);
+    p = node_der_write(p, 0x02, 1);
+    *p++ = 0;
+    p = node_der_write(p, 0x30, node_der_tlv_size(sizeof(oid)));
+    p = node_der_write_oid(p, oid, sizeof(oid));
+    p = node_der_write(p, 0x04, inner);
+    p = node_der_write(p, 0x04, 32);
+    memcpy(p, seed, 32);
+    p += 32;
+    *out = buf;
+    *outlen = (size_t)(p - buf);
+    return 0;
+}
+
+static int node_ed25519_spki_der(JSContext *ctx, const uint8_t pub[32],
+                                 uint8_t **out, size_t *outlen)
+{
+    static const uint8_t oid[] = { 0x2b, 0x65, 0x70 };
+    size_t content = node_der_tlv_size(node_der_tlv_size(sizeof(oid))) +
+                     node_der_tlv_size(33);
+    size_t total = node_der_tlv_size(content);
+    uint8_t *buf = js_malloc(ctx, total), *p;
+
+    if (!buf)
+        return -1;
+    p = node_der_write(buf, 0x30, content);
+    p = node_der_write(p, 0x30, node_der_tlv_size(sizeof(oid)));
+    p = node_der_write_oid(p, oid, sizeof(oid));
+    p = node_der_write(p, 0x03, 33);
+    *p++ = 0;
+    memcpy(p, pub, 32);
+    p += 32;
+    *out = buf;
+    *outlen = (size_t)(p - buf);
+    return 0;
+}
+
 static JSValue js_node_crypto_key_info(JSContext *ctx, JSValueConst this_val,
                                        int argc, JSValueConst *argv)
 {
@@ -3227,6 +3473,30 @@ static JSValue js_node_crypto_key_info(JSContext *ctx, JSValueConst this_val,
         }
         pwd_data = pwd.data;
         pwd_len = pwd.len;
+    }
+    {
+        uint8_t seed[32], edpub[32];
+        int ed_private = 0;
+        int ed = node_ed25519_parse(ctx, in.data, in.len, &ed_private,
+                                    seed, edpub);
+        if (ed < 0) {
+            node_free_bytes(ctx, &in);
+            node_free_bytes(ctx, &pwd);
+            return JS_ThrowTypeError(ctx, "Invalid key data");
+        }
+        if (ed == 1) {
+            obj = JS_NewObject(ctx);
+            details = JS_NewObject(ctx);
+            JS_SetPropertyStr(ctx, obj, "type",
+                              JS_NewString(ctx, ed_private ? "private"
+                                                          : "public"));
+            JS_SetPropertyStr(ctx, obj, "asymmetricKeyType",
+                              JS_NewString(ctx, "ed25519"));
+            JS_SetPropertyStr(ctx, obj, "details", details);
+            node_free_bytes(ctx, &in);
+            node_free_bytes(ctx, &pwd);
+            return obj;
+        }
     }
     if (node_crypto_parse_key(ctx, in.data, in.len, pwd_data, pwd_len,
                               &pk, &is_private)) {
@@ -3313,6 +3583,52 @@ static JSValue js_node_crypto_export_key(JSContext *ctx, JSValueConst this_val,
         node_free_bytes(ctx, &in);
         node_free_bytes(ctx, &pwd);
         return JS_EXCEPTION;
+    }
+    mbedtls_pk_init(&pk);
+    {
+        uint8_t seed[32], edpub[32], sk[64];
+        int ed_private = 0;
+        int ed = node_ed25519_parse(ctx, in.data, in.len, &ed_private,
+                                    seed, edpub);
+        if (ed < 0) {
+            JS_ThrowTypeError(ctx, "Invalid key data");
+            goto done;
+        }
+        if (ed == 1) {
+            if (node_sodium_init() != 0) {
+                JS_ThrowPlainError(ctx, "Failed to initialize crypto");
+                goto done;
+            }
+            if (ed_private)
+                crypto_sign_ed25519_seed_keypair(edpub, sk, seed);
+            if (!strcmp(kind, "pkcs8-der") || !strcmp(kind, "pkcs8-pem")) {
+                if (!ed_private) {
+                    JS_ThrowTypeError(ctx, "Private key required");
+                    goto done;
+                }
+                if (node_ed25519_pkcs8_der(ctx, seed, &buf, &len) != 0) {
+                    JS_ThrowOutOfMemory(ctx);
+                    goto done;
+                }
+                if (!strcmp(kind, "pkcs8-der"))
+                    result = JS_NewUint8ArrayCopy(ctx, buf, len);
+                else
+                    result = node_pem_encode(ctx, "PRIVATE KEY", buf, len);
+            } else if (!strcmp(kind, "spki-der") ||
+                       !strcmp(kind, "spki-pem")) {
+                if (node_ed25519_spki_der(ctx, edpub, &buf, &len) != 0) {
+                    JS_ThrowOutOfMemory(ctx);
+                    goto done;
+                }
+                if (!strcmp(kind, "spki-der"))
+                    result = JS_NewUint8ArrayCopy(ctx, buf, len);
+                else
+                    result = node_pem_encode(ctx, "PUBLIC KEY", buf, len);
+            } else {
+                JS_ThrowTypeError(ctx, "Unsupported key type for Ed25519");
+            }
+            goto done;
+        }
     }
     if (node_crypto_parse_key(ctx, in.data, in.len, pwd_data, pwd_len,
                               &pk, &is_private)) {
@@ -3459,7 +3775,24 @@ static JSValue js_node_crypto_generate_key_pair(JSContext *ctx,
     }
     mbedtls_pk_init(&pk);
 
-    if (!strcasecmp(type, "rsa")) {
+    if (!strcasecmp(type, "ed25519")) {
+        uint8_t seed[32], edpub[32], sk[64];
+        if (node_sodium_init() != 0) {
+            JS_ThrowPlainError(ctx, "Failed to initialize crypto");
+            goto out_pk;
+        }
+        crypto_sign_ed25519_keypair(edpub, sk);
+        memcpy(seed, sk, 32);
+        if (node_ed25519_pkcs8_der(ctx, seed, &priv, &privlen) != 0) {
+            JS_ThrowOutOfMemory(ctx);
+            goto out_pk;
+        }
+        if (node_ed25519_spki_der(ctx, edpub, &pub, &publen) != 0) {
+            JS_ThrowOutOfMemory(ctx);
+            goto out_pk;
+        }
+        goto build_obj;
+    } else if (!strcasecmp(type, "rsa")) {
         if (bits < 512 || bits > 16384) {
             JS_ThrowRangeError(ctx, "Invalid modulus length");
             goto out_pk;
@@ -3524,6 +3857,7 @@ static JSValue js_node_crypto_generate_key_pair(JSContext *ctx,
     memcpy(pub, buf + bufsize - n, (size_t)n);
     publen = (size_t)n;
 
+build_obj:
     obj = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, obj, "privateKey",
                       JS_NewUint8ArrayCopy(ctx, priv, privlen));
@@ -3590,6 +3924,8 @@ static JSValue js_node_crypto_sign(JSContext *ctx, JSValueConst this_val,
     size_t hash_len = 0, sig_size, sig_len = 0;
     unsigned char *sig = NULL;
     int is_private = 0, pss = 0;
+    uint8_t edseed[32], edpub[32], edsk[64];
+    int ed_private = 0, ed;
     JSValue result = JS_EXCEPTION;
 
     mdname = node_cstr(ctx, argv[0]);
@@ -3606,6 +3942,33 @@ static JSValue js_node_crypto_sign(JSContext *ctx, JSValueConst this_val,
     }
     if (argc > 3 && JS_ToBool(ctx, argv[3]) > 0)
         pss = 1;
+
+    ed = node_ed25519_parse(ctx, key.data, key.len, &ed_private, edseed, edpub);
+    if (ed < 0) {
+        JS_ThrowTypeError(ctx, "Invalid key data");
+        goto out;
+    }
+    if (ed == 1) {
+        unsigned char ed_sig[crypto_sign_ed25519_BYTES];
+        unsigned long long ed_siglen = 0;
+
+        if (!ed_private) {
+            JS_ThrowTypeError(ctx, "Private key required");
+            goto out;
+        }
+        if (node_sodium_init() != 0) {
+            JS_ThrowPlainError(ctx, "Failed to initialize crypto");
+            goto out;
+        }
+        crypto_sign_ed25519_seed_keypair(edpub, edsk, edseed);
+        if (crypto_sign_ed25519_detached(ed_sig, &ed_siglen, data.data,
+                                         data.len, edsk) != 0) {
+            JS_ThrowPlainError(ctx, "Signing failed");
+            goto out;
+        }
+        result = JS_NewUint8ArrayCopy(ctx, ed_sig, (size_t)ed_siglen);
+        goto out;
+    }
 
     if (node_crypto_parse_key(ctx, key.data, key.len, NULL, 0,
                               &pk, &is_private)) {
@@ -3666,6 +4029,8 @@ static JSValue js_node_crypto_verify(JSContext *ctx, JSValueConst this_val,
     unsigned char *hash = NULL;
     size_t hash_len = 0;
     int is_private = 0, pss = 0, ok = 0;
+    uint8_t edseed[32], edpub[32], edsk[64];
+    int ed_private = 0, ed;
     JSValue result = JS_FALSE;
 
     mdname = node_cstr(ctx, argv[0]);
@@ -3688,6 +4053,26 @@ static JSValue js_node_crypto_verify(JSContext *ctx, JSValueConst this_val,
     }
     if (argc > 4 && JS_ToBool(ctx, argv[4]) > 0)
         pss = 1;
+
+    ed = node_ed25519_parse(ctx, key.data, key.len, &ed_private, edseed, edpub);
+    if (ed < 0) {
+        JS_ThrowTypeError(ctx, "Invalid key data");
+        goto out;
+    }
+    if (ed == 1) {
+        if (node_sodium_init() != 0) {
+            JS_ThrowPlainError(ctx, "Failed to initialize crypto");
+            goto out;
+        }
+        if (ed_private)
+            crypto_sign_ed25519_seed_keypair(edpub, edsk, edseed);
+        ok = sigb.len == crypto_sign_ed25519_BYTES &&
+             crypto_sign_ed25519_verify_detached(
+                 (const unsigned char *)sigb.data, data.data, data.len,
+                 edpub) == 0;
+        result = JS_NewBool(ctx, ok);
+        goto out;
+    }
 
     if (node_crypto_parse_key(ctx, key.data, key.len, NULL, 0,
                               &pk, &is_private)) {
@@ -4177,8 +4562,9 @@ static JSValue node_call_global(JSContext *ctx, const char *name,
 }
 
 /* Builtin ES modules: build a C module that re-exports the properties of
-   the object returned by __qnode_esm_builtin(name). */
-static int node_builtin_init(JSContext *ctx, JSModuleDef *m)
+   the object returned by __qnode_esm_builtin(name), and CommonJS modules
+   imported from ESM, which use the same shape. */
+static int node_esm_init(JSContext *ctx, JSModuleDef *m)
 {
     JSValue obj = JS_GetModulePrivateValue(ctx, m);
     JSPropertyEnum *tab = NULL;
@@ -4209,87 +4595,23 @@ done:
     return ret;
 }
 
-static JSModuleDef *node_builtin_module(JSContext *ctx, const char *name)
+/* Wrap the object returned by a bootstrap global in a synthetic ES module. */
+static JSModuleDef *node_wrap_module(JSContext *ctx, const char *name,
+                                     const char *global, int require_object)
 {
     JSValue arg = JS_NewString(ctx, name);
-    JSValue obj = node_call_global(ctx, "__qnode_esm_builtin", 1, &arg);
+    JSValue obj = node_call_global(ctx, global, 1, &arg);
     JS_FreeValue(ctx, arg);
     if (JS_IsException(obj))
         return NULL;
-
-    JSModuleDef *m = JS_NewCModule(ctx, name, node_builtin_init);
-    if (!m) {
-        JS_FreeValue(ctx, obj);
-        return NULL;
-    }
-    JSPropertyEnum *tab = NULL;
-    uint32_t len = 0;
-    if (JS_GetOwnPropertyNames(ctx, &tab, &len, obj,
-                               JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY)) {
-        JS_FreeValue(ctx, obj);
-        return NULL;
-    }
-    for (uint32_t i = 0; i < len; i++) {
-        const char *n = JS_AtomToCString(ctx, tab[i].atom);
-        if (n) {
-            JS_AddModuleExport(ctx, m, n);
-            JS_FreeCString(ctx, n);
-        }
-    }
-    JS_FreePropertyEnum(ctx, tab, len);
-    JS_AddModuleExport(ctx, m, "default");
-    JS_SetModulePrivateValue(ctx, m, obj);
-    return m;
-}
-
-/* CommonJS modules imported from ESM: evaluate the CJS module and expose
-   its exports as a synthetic ES module. */
-static int node_cjs_init(JSContext *ctx, JSModuleDef *m)
-{
-    JSValue obj = JS_GetModulePrivateValue(ctx, m);
-    JSPropertyEnum *tab = NULL;
-    uint32_t len = 0;
-    int ret = -1;
-
-    if (JS_GetOwnPropertyNames(ctx, &tab, &len, obj,
-                               JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY))
-        return -1;
-    for (uint32_t i = 0; i < len; i++) {
-        const char *name = JS_AtomToCString(ctx, tab[i].atom);
-        if (!name)
-            goto done;
-        JSValue v = JS_GetProperty(ctx, obj, tab[i].atom);
-        if (JS_IsException(v)) {
-            JS_FreeCString(ctx, name);
-            goto done;
-        }
-        if (JS_SetModuleExport(ctx, m, name, v))
-            JS_FreeValue(ctx, v);
-        JS_FreeCString(ctx, name);
-    }
-    if (JS_SetModuleExport(ctx, m, "default", JS_DupValue(ctx, obj)))
-        goto done;
-    ret = 0;
-done:
-    JS_FreePropertyEnum(ctx, tab, len);
-    return ret;
-}
-
-static JSModuleDef *node_cjs_module(JSContext *ctx, const char *path)
-{
-    JSValue arg = JS_NewString(ctx, path);
-    JSValue obj = node_call_global(ctx, "__qnode_import_cjs", 1, &arg);
-    JS_FreeValue(ctx, arg);
-    if (JS_IsException(obj))
-        return NULL;
-    if (!JS_IsObject(obj)) {
+    if (require_object && !JS_IsObject(obj)) {
         JS_FreeValue(ctx, obj);
         JS_ThrowTypeError(ctx, "CommonJS module '%s' did not export an object",
-                          path);
+                          name);
         return NULL;
     }
 
-    JSModuleDef *m = JS_NewCModule(ctx, path, node_cjs_init);
+    JSModuleDef *m = JS_NewCModule(ctx, name, node_esm_init);
     if (!m) {
         JS_FreeValue(ctx, obj);
         return NULL;
@@ -4310,6 +4632,16 @@ static JSModuleDef *node_cjs_module(JSContext *ctx, const char *path)
     JS_AddModuleExport(ctx, m, "default");
     JS_SetModulePrivateValue(ctx, m, obj);
     return m;
+}
+
+static JSModuleDef *node_builtin_module(JSContext *ctx, const char *name)
+{
+    return node_wrap_module(ctx, name, "__qnode_esm_builtin", 0);
+}
+
+static JSModuleDef *node_cjs_module(JSContext *ctx, const char *path)
+{
+    return node_wrap_module(ctx, path, "__qnode_import_cjs", 1);
 }
 
 static char *node_normalize(JSContext *ctx, const char *base,

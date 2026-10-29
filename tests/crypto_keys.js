@@ -159,6 +159,86 @@ function testEc() {
   }
 }
 
+function testEd25519() {
+  /* RFC 8032 test vector 1: empty message. */
+  const seed = Buffer.from(
+    "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+    "hex");
+  const pkcs8 = Buffer.concat([
+    Buffer.from("302e020100300506032b657004220420", "hex"),
+    seed,
+  ]);
+  const privateKey = crypto.createPrivateKey({ key: pkcs8, format: "der",
+                                               type: "pkcs8" });
+  const publicKey = crypto.createPublicKey(privateKey);
+  assert.strictEqual(privateKey.asymmetricKeyType, "ed25519");
+  assert.strictEqual(publicKey.asymmetricKeyType, "ed25519");
+  assert.deepStrictEqual(privateKey.asymmetricKeyDetails, {});
+  assert.deepStrictEqual(publicKey.asymmetricKeyDetails, {});
+  assert.strictEqual(publicKey.export({ format: "der", type: "spki" })
+                       .toString("hex"),
+    "302a300506032b6570032100" +
+    "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a");
+  assert.strictEqual(crypto.sign(null, Buffer.alloc(0), privateKey)
+                       .toString("hex"),
+    "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155" +
+    "5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b");
+
+  const pair = crypto.generateKeyPairSync("ed25519");
+  assert.strictEqual(pair.privateKey.type, "private");
+  assert.strictEqual(pair.publicKey.type, "public");
+  assert.strictEqual(pair.privateKey.asymmetricKeyType, "ed25519");
+  assert.strictEqual(pair.publicKey.asymmetricKeyType, "ed25519");
+
+  const data = Buffer.from("ed25519 message");
+  const sig = crypto.sign(null, data, pair.privateKey);
+  assert.strictEqual(sig.length, 64);
+  assert.strictEqual(crypto.verify(null, data, pair.publicKey, sig), true);
+  assert.strictEqual(crypto.verify(null, data, pair.privateKey, sig), true);
+  assert.strictEqual(
+    crypto.verify(null, Buffer.from("ed25519 messagf"), pair.publicKey, sig),
+    false);
+  assert.strictEqual(crypto.verify(null, data, pair.publicKey,
+                                   Buffer.alloc(64, 1)), false);
+  assert.throws(() => crypto.sign("sha256", data, pair.privateKey),
+                TypeError);
+
+  const pkcs8Der = pair.privateKey.export({ type: "pkcs8", format: "der" });
+  const spkiDer = pair.publicKey.export({ type: "spki", format: "der" });
+  assert.strictEqual(pkcs8Der.length, 48);
+  assert.strictEqual(spkiDer.length, 44);
+  const pkcs8Pem = pair.privateKey.export({ type: "pkcs8", format: "pem" });
+  const spkiPem = pair.publicKey.export({ type: "spki", format: "pem" });
+  assert.ok(pkcs8Pem.startsWith("-----BEGIN PRIVATE KEY-----"));
+  assert.ok(spkiPem.startsWith("-----BEGIN PUBLIC KEY-----"));
+
+  const privPem = crypto.createPrivateKey(pkcs8Pem);
+  const pubPem = crypto.createPublicKey(spkiPem);
+  assert.ok(privPem.equals(pair.privateKey));
+  assert.ok(pubPem.equals(pair.publicKey));
+  assert.strictEqual(crypto.verify(null, data, pubPem, sig), true);
+  assert.strictEqual(crypto.verify(null, data, pair.publicKey,
+                                   crypto.sign(null, data, privPem)), true);
+
+  /* A public key can be derived from the private key. */
+  assert.ok(crypto.createPublicKey(pair.privateKey).equals(pair.publicKey));
+
+  const privDer = crypto.createPrivateKey({ key: pkcs8Der, format: "der",
+                                            type: "pkcs8" });
+  const pubDer = crypto.createPublicKey({ key: spkiDer, format: "der",
+                                          type: "spki" });
+  assert.ok(privDer.equals(pair.privateKey));
+  assert.ok(pubDer.equals(pair.publicKey));
+
+  /* Streaming APIs accept a null digest for Ed25519. */
+  const signer = crypto.createSign(null);
+  signer.update("part one").update(" and part two");
+  const streamSig = signer.sign(pair.privateKey);
+  const verifier = crypto.createVerify(null);
+  verifier.update("part one and part two");
+  assert.strictEqual(verifier.verify(pair.publicKey, streamSig), true);
+}
+
 function testSignStreams() {
   const { privateKey, publicKey } = crypto.generateKeyPairSync("ec",
     { namedCurve: "prime256v1" });
@@ -234,12 +314,108 @@ function testAsync() {
     }));
 }
 
+function testHmac() {
+  const key = Buffer.alloc(20, 0x0b);
+  const data = "Hi There";
+  /* RFC 4231 test case 1. */
+  assert.strictEqual(
+    hex(crypto.createHmac("sha256", key).update(data).digest()),
+    "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
+  assert.strictEqual(
+    hex(crypto.createHmac("sha384", key).update(data).digest()),
+    "afd03944d84895626b0825f4ab46907f15f9dadbe4101ec682aa034c7cebc59c" +
+    "faea9ea9076ede7f4af152e8b2fa9cb6");
+  assert.strictEqual(
+    hex(crypto.createHmac("sha512", key).update(data).digest()),
+    "87aa7cdea5ef619d4ff0b4241a1d6cb02379f4e2ce4ec2787ad0b30545e17cde" +
+    "daa833b7d6b8a702038b274eaea3f4e4be9d914eeb61f1702e696c203a126854");
+
+  /* RFC 4231 test case 6: key longer than the hash block size. */
+  const longKey = Buffer.alloc(131, 0xaa);
+  const longData = "Test Using Larger Than Block-Size Key - Hash Key First";
+  assert.strictEqual(
+    hex(crypto.createHmac("sha256", longKey).update(longData).digest()),
+    "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54");
+  assert.strictEqual(
+    hex(crypto.createHmac("sha384", longKey).update(longData).digest()),
+    "4ece084485813e9088d2c63a041bc5b44f9ef1012a2b588f3cd11f05033ac4c6" +
+    "0c2ef6ab4030fe8296248df163f44952");
+  assert.strictEqual(
+    hex(crypto.createHmac("sha512", longKey).update(longData).digest()),
+    "80b24263c7c1a3ebb71493c1dd7be8b49b46d1f41b4aeec1121b013783f8f352" +
+    "6b56d037e05f2598bd0fd2215d6a1e5295e64f73f63f0aec8b915a985d786598");
+
+  /* Streaming updates match a single update, and aliases are accepted. */
+  const streamed = crypto.createHmac("SHA-512", key);
+  streamed.update("Hi ");
+  streamed.update(Buffer.from("There"));
+  assert.strictEqual(hex(streamed.digest()),
+                     hex(crypto.createHmac("sha512", key).update(data).digest()));
+  assert.strictEqual(
+    crypto.createHmac("sha256", key).update(data).digest("hex").length, 64);
+
+  assert.throws(() => crypto.createHmac("nope", key), /not supported/i);
+  const used = crypto.createHmac("sha256", key).update(data);
+  used.digest();
+  assert.throws(() => used.update(data), /Digest already called/);
+}
+
+function testEncryptedPem() {
+  const pem = [
+    "-----BEGIN RSA PRIVATE KEY-----",
+    "Proc-Type: 4,ENCRYPTED",
+    "DEK-Info: AES-256-CBC,CF6DEC38913887AC0FDF286DA4305722",
+    "",
+    "8TlKpy7ikt7ewTaotnhjO6HoqYWVwACb1wz/j/inPTFbt0uy/Zq96s6z6xS6Hsgs",
+    "8i7bO5xmRVCHtgG8v4GBrV691KzBZbE1tSiPGAbchL+dVc/k5poJqkjLmfoJQJne",
+    "NHfWxTVI7Lzafrq6B2qn/KRtfgutGLeUF2yflMgn+sw8L6bqvzDg6QaIOx9Zih48",
+    "9kVFSyxXLgaGKEYU13VmLz8JhQ1bYa/FpMARWV/Vs6UojaBqN3b+/Y/q5LWjasNs",
+    "t5VVQX16NXDIXP3v1UO2mRCUtHFD9r7ZrfPwK/CaanF6uIgsbgjPsEYoETdrm1Ep",
+    "Z0t7kuV/jQTPpsrc+fmDEqJI5MHXEaHqzc+3pa2T5i4WBqHOPfgcZA2+xfmVzMIe",
+    "cK9u0C1rpRuv7FyJN6sR9CsDORimjQmSMap+yX9Q4LfFlMkzENlFuqbHbM9LECGr",
+    "yeBkpkAud2P61pbHEQxHlFRdySXnO9JXxSimD3xgVlBI/bm6nlO8zdVHq3Bry9mg",
+    "VbcmTE/J+IxmaOTWJAifD8DDJiMXCq9qEAXSHB3ZwInYBMGmzvUca2TXwlj0gL84",
+    "O38emfElOfUQkh0E8k20IJo4SFhMLxsUgK+6i6xaoQsnFzLR8xQEoa77HpDsEWqZ",
+    "9MjYphWjmBCsMdoa2NJKRjdZGhBjlO0PBM8rAopSg2cz3gcI79PhW64/PdBjWwnK",
+    "vtBvgCrlvocJTXu5dfnuYIaIKo/9NNr4BL1Bly9QDAW+ZQ3msbN4WuFfuNGgvHjm",
+    "XANtOeajVJnzGY+DseMr68CuvjrXxJH6AAAtnLNHWGECRedm+r6C9JtidIid1cA5",
+    "hNYtvrNOeqf3uJWHGJo+OkzVbbF9DPdZXFx+pPdrcojHapA82k1UgwZwrvoIlYc6",
+    "VYtmFwHkCmjldjUHbnMEXCMEByad6C0xnm5TR33VCU33N+fqSfrp3oOxQECMfGue",
+    "J+TckTW0bQFLhUjhb1nYuJuxTFf0LVVi5NX2vivJoEPgaOfm3tuoSyDynkkNgnvl",
+    "oEbnhTzKUd1oDOFL8wPCX+gG9rxBGs2NnJitvun+x5eP47DORPStrTyqdAiiIl80",
+    "nc7JODKz5JQVJX9kRertLb5AA0Mn6znH4ChmXf+WwnVDr/YlAVygqNfU0rYt7ZP/",
+    "vExh5MS7t1dKUOueXBOI4JRXRYbMiAfqV/m9YLh2LDwjdxORhDwH/k7USgnGIie8",
+    "JSO0nXJANdEKGfhEmTd0R0ts+wG9SvqtEYaU7e/HKCUWy4k2YRbU+ocF/a5W8CJl",
+    "6l6emqq2aF1+1wUU7LRGxN84h3QC4tdN+/go0AaZ/Ul5B9+TZvyl2PiMELAS4DUM",
+    "SU6iEft/DcExo9EMP6H+MyqTR4+O5U5TNaaFUWnTQCTHoWVAD1DDXyie3a8IYsU3",
+    "+pQ7bSwfXYravE7FU996NWzuHJ8ZkcF5JAcjUKhpGRqGruNR39Nqox7D0vKn3P4b",
+    "fGbVdH650/hjx6R5miR6Arqsl84wS0YEgykIKvSD8nyZvqi5MauDGMPQQLmVsPUB",
+    "fakto++4W5/hyop563LONdnmx0JFCXjF3loQg9udw/dFXr2RhFO0reX7NSi07S97",
+    "-----END RSA PRIVATE KEY-----",
+    "",
+  ].join("\n");
+  const passphrase = "qnode-test";
+  const privateKey = crypto.createPrivateKey({ key: pem, passphrase });
+  assert.strictEqual(privateKey.type, "private");
+  assert.strictEqual(privateKey.asymmetricKeyType, "rsa");
+  assert.strictEqual(privateKey.asymmetricKeyDetails.modulusLength, 2048);
+
+  const publicKey = crypto.createPublicKey(privateKey);
+  assertRoundTrip(privateKey, publicKey, "sha256");
+
+  assert.throws(() => crypto.createPrivateKey({ key: pem,
+                                                passphrase: "wrong" }));
+}
+
 const tests = [
   testPbkdf2,
   testHkdf,
   testScrypt,
+  testHmac,
   testRsa,
+  testEncryptedPem,
   testEc,
+  testEd25519,
   testSignStreams,
   testKeyObject,
   testAsync,

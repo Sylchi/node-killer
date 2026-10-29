@@ -266,27 +266,42 @@ add_library(qjs-libc STATIC quickjs-libc.c)
 target_compile_definitions(qjs-libc PRIVATE ${qjs_defines})
 target_link_libraries(qjs-libc PRIVATE ${qjs_libs} qjs)
 
-# qnode embeds the JS bootstrap as a C array. xxd ships with vim; fall back
-# to a CMake-generated header when it is unavailable.
+# qnode embeds the JS bootstrap as a C array. The bootstrap lives in
+# bootstrap/ as ordered parts that are concatenated into one script (they
+# share a top-level scope). xxd ships with vim; fall back to a CMake-generated
+# header when it is unavailable.
 find_program(XXD_EXECUTABLE xxd)
+set(NODE_BOOTSTRAP_DIR ${CMAKE_CURRENT_SOURCE_DIR}/bootstrap)
+file(GLOB NODE_BOOTSTRAP_PARTS CONFIGURE_DEPENDS ${NODE_BOOTSTRAP_DIR}/*.js)
+list(SORT NODE_BOOTSTRAP_PARTS)
+set(NODE_BOOTSTRAP_JS ${CMAKE_CURRENT_BINARY_DIR}/node_bootstrap.js)
 set(NODE_BOOTSTRAP_H ${CMAKE_CURRENT_BINARY_DIR}/node_bootstrap.h)
+add_custom_command(
+    OUTPUT ${NODE_BOOTSTRAP_JS}
+    COMMAND ${CMAKE_COMMAND} -DINPUT_DIR=${NODE_BOOTSTRAP_DIR}
+            -DOUTPUT=${NODE_BOOTSTRAP_JS}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/concat_js.cmake
+    DEPENDS ${NODE_BOOTSTRAP_PARTS}
+    COMMENT "Concatenating node bootstrap"
+    VERBATIM
+)
 if(XXD_EXECUTABLE)
     add_custom_command(
         OUTPUT ${NODE_BOOTSTRAP_H}
         COMMAND ${XXD_EXECUTABLE} -i -n node_bootstrap_js
-                ${CMAKE_CURRENT_SOURCE_DIR}/node_bootstrap.js
+                ${NODE_BOOTSTRAP_JS}
                 ${NODE_BOOTSTRAP_H}
-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/node_bootstrap.js
+        DEPENDS ${NODE_BOOTSTRAP_JS}
         COMMENT "Embedding node_bootstrap.js"
         VERBATIM
     )
 else()
     add_custom_command(
         OUTPUT ${NODE_BOOTSTRAP_H}
-        COMMAND ${CMAKE_COMMAND} -DINPUT=${CMAKE_CURRENT_SOURCE_DIR}/node_bootstrap.js
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${NODE_BOOTSTRAP_JS}
                 -DOUTPUT=${NODE_BOOTSTRAP_H}
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_js.cmake
-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/node_bootstrap.js
+        DEPENDS ${NODE_BOOTSTRAP_JS}
         COMMENT "Embedding node_bootstrap.js (cmake fallback)"
         VERBATIM
     )
@@ -333,11 +348,62 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_include_directories(qnode_mbedtls PUBLIC
         ${QNODE_MBEDTLS_DIR}/include)
 
+    # libsodium is used for Ed25519, which the vendored mbedTLS build does
+    # not provide. It is compiled from the vendored sources with a portable
+    # configuration so the build needs no system crypto packages.
+    set(QNODE_SODIUM_DIR ${CMAKE_CURRENT_SOURCE_DIR}/vendor/libsodium)
+    if(NOT EXISTS ${QNODE_SODIUM_DIR}/src/libsodium/include/sodium.h)
+        message(FATAL_ERROR
+            "vendor/libsodium is missing; see vendor/README.md")
+    endif()
+    file(GLOB_RECURSE QNODE_SODIUM_SOURCES CONFIGURE_DEPENDS
+        ${QNODE_SODIUM_DIR}/src/libsodium/*.c)
+    add_library(qnode_sodium STATIC ${QNODE_SODIUM_SOURCES})
+    target_include_directories(qnode_sodium PUBLIC
+        ${QNODE_SODIUM_DIR}/src/libsodium/include
+        ${QNODE_SODIUM_DIR}/src/libsodium/include/sodium)
+    include(TestBigEndian)
+    test_big_endian(QNODE_BIG_ENDIAN)
+    if(QNODE_BIG_ENDIAN)
+        set(QNODE_SODIUM_ENDIAN NATIVE_BIG_ENDIAN=1)
+    else()
+        set(QNODE_SODIUM_ENDIAN NATIVE_LITTLE_ENDIAN=1)
+    endif()
+    target_compile_definitions(qnode_sodium PRIVATE
+        CONFIGURED=1
+        ${QNODE_SODIUM_ENDIAN}
+        HAVE_SYS_RANDOM_H=1
+        HAVE_SYS_MMAN_H=1
+        HAVE_SYS_PARAM_H=1
+        HAVE_SYS_AUXV_H=1
+        HAVE_DLFCN_H=1
+        HAVE_GETRANDOM=1
+        HAVE_GETENTROPY=1
+        HAVE_GETPID=1
+        HAVE_GETAUXVAL=1
+        HAVE_SYSCONF=1
+        HAVE_MMAP=1
+        HAVE_MLOCK=1
+        HAVE_MADVISE=1
+        HAVE_MPROTECT=1
+        HAVE_RAISE=1
+        HAVE_POSIX_MEMALIGN=1
+        HAVE_NANOSLEEP=1
+        HAVE_CLOCK_GETTIME=1
+        HAVE_EXPLICIT_BZERO=1
+        HAVE_C11_MEMORY_FENCES=1
+        HAVE_GCC_MEMORY_FENCES=1
+        HAVE_ATOMIC_OPS=1
+        HAVE_WEAK_SYMBOLS=1
+        TLS=_Thread_local
+        _GNU_SOURCE=1)
+    target_link_libraries(qnode_sodium PUBLIC Threads::Threads)
+
     add_library(qnode_core STATIC node.c)
     target_compile_definitions(qnode_core PRIVATE ${qjs_defines})
     target_include_directories(qnode_core PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
     target_link_libraries(qnode_core PRIVATE qjs qjs-libc
-        qnode_zlib qnode_mbedtls)
+        qnode_zlib qnode_mbedtls qnode_sodium)
     add_dependencies(qnode_core node_bootstrap_header)
 
     add_executable(qnode_exe qnode.c)

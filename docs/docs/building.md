@@ -26,13 +26,13 @@ make
 This will build the `qjs` and `qjsc` executables and other test tools. Head over [here](./cli) for
 instructions on how to use them.
 
-On Linux the build also produces `qnode`, a Node.js-compatible runtime. zlib
-and mbedTLS are vendored under `vendor/` and compiled into the binary, so no
-system packages or download step are required.
+On Linux the build also produces `qnode`, a Node.js-compatible runtime. zlib,
+mbedTLS and libsodium are vendored under `vendor/` and compiled into the
+binary, so no system packages or download step are required.
 
 On Linux there are no build options for the runtime features: WebAssembly
-(wasm3), libev, zlib and mbedTLS are always compiled in. The vendored mbedTLS
-supports TLS 1.2 and TLS 1.3.
+(wasm3), libev, zlib, mbedTLS and libsodium are always compiled in. The
+vendored mbedTLS supports TLS 1.2 and TLS 1.3.
 
 ## Big Endian architecture support
 
