@@ -1714,6 +1714,10 @@ static void node_close_fd(int fd)
 static JSValue js_node_spawn(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv)
 {
+#ifdef QNODE_FREESTANDING
+    (void)this_val; (void)argc; (void)argv;
+    return node_err(ctx, JS_NULL, ENOSYS);
+#else
     /* spawn(argvArray, cwd|null, envArray|null, stdinMode, stdoutMode, stderrMode)
        mode: 0=inherit 1=pipe 2=ignore */
     if (!JS_IsArray(argv[0]))
@@ -1850,11 +1854,16 @@ fail:
         js_free(ctx, envp);
     }
     return node_err(ctx, JS_NULL, err);
+#endif
 }
 
 static JSValue js_node_waitpid(JSContext *ctx, JSValueConst this_val,
                                int argc, JSValueConst *argv)
 {
+#ifdef QNODE_FREESTANDING
+    (void)ctx; (void)this_val; (void)argc; (void)argv;
+    return node_err(ctx, JS_NULL, ENOSYS);
+#else
     int32_t pid = -1, options = 0;
     if (argc > 0 && !JS_IsUndefined(argv[0]))
         if (JS_ToInt32(ctx, &pid, argv[0])) return JS_EXCEPTION;
@@ -1868,6 +1877,7 @@ static JSValue js_node_waitpid(JSContext *ctx, JSValueConst this_val,
     JS_SetPropertyUint32(ctx, arr, 0, JS_NewInt32(ctx, r));
     JS_SetPropertyUint32(ctx, arr, 1, JS_NewInt32(ctx, status));
     return node_ok(ctx, arr);
+#endif
 }
 
 /* ---------------- zlib / compression ---------------- */
