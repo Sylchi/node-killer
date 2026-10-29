@@ -26,16 +26,7 @@
 
 BUILD_DIR?=build
 BUILD_TYPE?=Release
-INSTALL_PREFIX?=/usr/local
-
-QJS=$(BUILD_DIR)/qjs
-QJSC=$(BUILD_DIR)/qjsc
-RUN262=$(BUILD_DIR)/run-test262
-
 JOBS?=$(shell getconf _NPROCESSORS_ONLN)
-ifeq ($(JOBS),)
-JOBS := $(shell sysctl -n hw.ncpu)
-endif
 ifeq ($(JOBS),)
 JOBS := $(shell nproc)
 endif
@@ -43,43 +34,27 @@ ifeq ($(JOBS),)
 JOBS := 4
 endif
 
-all: $(QJS)
+QNODE=$(BUILD_DIR)/qnode
+QJSC=$(BUILD_DIR)/qjsc
 
-amalgam: TEMP := $(shell mktemp -d)
-amalgam: $(QJS)
-	$(QJS) amalgam.js $(TEMP)/quickjs-amalgam.c
-	cp quickjs.h quickjs-libc.h $(TEMP)
-	cd $(TEMP) && zip -9 quickjs-amalgam.zip quickjs-amalgam.c quickjs.h quickjs-libc.h
-	cp $(TEMP)/quickjs-amalgam.zip $(BUILD_DIR)
-	cd $(TEMP) && $(RM) quickjs-amalgam.zip quickjs-amalgam.c quickjs.h quickjs-libc.h
-	$(RM) -d $(TEMP)
-
-fuzz:
-	clang -g -O1 -fsanitize=address,undefined,fuzzer -o fuzz fuzz.c
-	./fuzz
+all: $(QNODE)
 
 $(BUILD_DIR):
-	cmake -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) -DCMAKE_INSTALL_PREFIX=$(INSTALL_PREFIX)
+	cmake -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE)
 
-$(QJS): $(BUILD_DIR)
-	cmake --build $(BUILD_DIR) -j $(JOBS)
+$(QNODE): $(BUILD_DIR)
+	cmake --build $(BUILD_DIR) --target qnode_exe -j $(JOBS)
 
 $(QJSC): $(BUILD_DIR)
 	cmake --build $(BUILD_DIR) --target qjsc -j $(JOBS)
 
-install: $(QJS) $(QJSC)
-	cmake --build $(BUILD_DIR) --target install
-
 clean:
-	cmake --build $(BUILD_DIR) --target clean
+	cmake --build $(BUILD_DIR) --target clean 2>/dev/null || rm -rf $(BUILD_DIR)
+
+distclean:
+	rm -rf $(BUILD_DIR)
 
 codegen: $(QJSC)
-	$(QJSC) -ss -o gen/repl.c -m repl.js
-	$(QJSC) -ss -o gen/standalone.c -m standalone.js
-	$(QJSC) -e -o gen/function_source.c tests/function_source.js
-	$(QJSC) -e -o gen/hello.c examples/hello.js
-	$(QJSC) -e -o gen/hello_module.c -m examples/hello_module.js
-	$(QJSC) -e -o gen/test_fib.c -m examples/test_fib.js
 	$(QJSC) -C -ss -o builtin-array-fromasync.h builtin-array-fromasync.js
 	$(QJSC) -C -ss -o builtin-iterator-zip.h builtin-iterator-zip.js
 	$(QJSC) -C -ss -o builtin-iterator-zip-keyed.h builtin-iterator-zip-keyed.js
@@ -87,100 +62,19 @@ codegen: $(QJSC)
 debug:
 	BUILD_TYPE=Debug $(MAKE)
 
-distclean:
-	@rm -rf $(BUILD_DIR)
+qnode-test: $(QNODE)
+	QNODE=$(abspath $(QNODE)) $(CURDIR)/tests/run-qnode-tests.sh
 
-stats: $(QJS)
-	$(QJS) -qd
+net-test: $(QNODE)
+	QNODE=$(abspath $(QNODE)) $(CURDIR)/tests/qnode/net_shards.sh
 
-jscheck: CFLAGS=-I. -D_GNU_SOURCE -DJS_CHECK_JSVALUE -Wall -Werror -fsyntax-only -c -o /dev/null
-jscheck:
-	$(CC) $(CFLAGS) api-test.c
-	$(CC) $(CFLAGS) ctest.c
-	$(CC) $(CFLAGS) fuzz.c
-	$(CC) $(CFLAGS) gen/function_source.c
-	$(CC) $(CFLAGS) gen/hello.c
-	$(CC) $(CFLAGS) gen/hello_module.c
-	$(CC) $(CFLAGS) gen/repl.c
-	$(CC) $(CFLAGS) gen/standalone.c
-	$(CC) $(CFLAGS) gen/test_fib.c
-	$(CC) $(CFLAGS) qjs.c
-	$(CC) $(CFLAGS) qjsc.c
-	$(CC) $(CFLAGS) quickjs-libc.c
-	$(CC) $(CFLAGS) quickjs.c
-	$(CC) $(CFLAGS) run-test262.c
+net-bench: $(QNODE)
+	QNODE=$(abspath $(QNODE)) $(CURDIR)/benchmarks/net-shards/bench.sh
 
-# effectively .PHONY because it doesn't generate output
-ctest: CFLAGS=-std=c11 -fsyntax-only -Wall -Wextra -Werror -pedantic
-ctest: ctest.c quickjs.h
-	$(CC) $(CFLAGS) -DJS_NAN_BOXING=0 $<
-	$(CC) $(CFLAGS) -DJS_NAN_BOXING=1 $<
+netstack-tun-test: $(QNODE)
+	QNODE=$(abspath $(QNODE)) sh $(CURDIR)/tests/qnode/netstack_tun.sh
 
-# effectively .PHONY because it doesn't generate output
-cxxtest: CXXFLAGS=-std=c++11 -fsyntax-only -Wall -Wextra -Werror -pedantic
-cxxtest: cxxtest.cc quickjs.h
-	$(CXX) $(CXXFLAGS) -DJS_NAN_BOXING=0 $<
-	$(CXX) $(CXXFLAGS) -DJS_NAN_BOXING=1 $<
+netstack-tap-test: $(QNODE)
+	QNODE=$(abspath $(QNODE)) sh $(CURDIR)/tests/qnode/netstack_tap.sh
 
-test: $(QJS)
-	$(RUN262) -c tests.conf
-
-test262: $(QJS)
-	$(RUN262) -m -c test262.conf -a
-
-test262-fast: $(QJS)
-	$(RUN262) -m -c test262.conf -c test262-fast.conf -a
-
-test262-update: $(QJS)
-	$(RUN262) -u -c test262.conf -a -t 1
-
-test262-check: $(QJS)
-	$(RUN262) -m -c test262.conf -E -a
-
-microbench: $(QJS)
-	$(QJS) tests/microbench.js
-
-net-test: $(BUILD_DIR)
-	cmake --build $(BUILD_DIR) --target qnode_exe -j $(JOBS)
-	QNODE=$(abspath $(BUILD_DIR))/qnode $(CURDIR)/tests/qnode/net_shards.sh
-
-net-bench: $(BUILD_DIR)
-	cmake --build $(BUILD_DIR) --target qnode_exe -j $(JOBS)
-	QNODE=$(abspath $(BUILD_DIR))/qnode $(CURDIR)/benchmarks/net-shards/bench.sh
-
-netstack-test: $(BUILD_DIR)
-	cmake --build $(BUILD_DIR) --target netstack_test netstack_l2_test
-	$(BUILD_DIR)/netstack-test
-	$(BUILD_DIR)/netstack-l2-test
-
-netstack-tun-test: $(BUILD_DIR)
-	cmake --build $(BUILD_DIR) --target qnode_exe -j $(JOBS)
-	QNODE=$(abspath $(BUILD_DIR))/qnode sh $(CURDIR)/tests/qnode/netstack_tun.sh
-
-netstack-tap-test: $(BUILD_DIR)
-	cmake --build $(BUILD_DIR) --target qnode_exe -j $(JOBS)
-	QNODE=$(abspath $(BUILD_DIR))/qnode sh $(CURDIR)/tests/qnode/netstack_tap.sh
-
-worker-test: $(BUILD_DIR)
-	cmake --build $(BUILD_DIR) --target qnode_exe -j $(JOBS)
-	$(abspath $(BUILD_DIR))/qnode $(CURDIR)/tests/qnode/worker_threads.js
-
-fetch-test: $(BUILD_DIR)
-	cmake --build $(BUILD_DIR) --target qnode_exe -j $(JOBS)
-	$(abspath $(BUILD_DIR))/qnode $(CURDIR)/tests/qnode/fetch_web.js
-
-crypto-test: $(BUILD_DIR)
-	cmake --build $(BUILD_DIR) --target qnode_exe -j $(JOBS)
-	$(abspath $(BUILD_DIR))/qnode $(CURDIR)/tests/qnode/crypto_keys.js
-
-qnode-test: $(BUILD_DIR)
-	cmake --build $(BUILD_DIR) --target qnode_exe -j $(JOBS)
-	QNODE=$(abspath $(BUILD_DIR))/qnode $(CURDIR)/tests/run-qnode-tests.sh
-
-unicode_gen: $(BUILD_DIR)
-	cmake --build $(BUILD_DIR) --target unicode_gen
-
-libunicode-table.h: unicode_gen
-	$(BUILD_DIR)/unicode_gen unicode $@
-
-.PHONY: all amalgam ctest cxxtest debug fuzz jscheck install clean codegen distclean stats test test262 test262-update test262-check microbench net-test net-bench netstack-test netstack-tun-test netstack-tap-test worker-test fetch-test crypto-test qnode-test unicode_gen $(QJS) $(QJSC)
+.PHONY: all clean distclean debug codegen qnode-test net-test net-bench netstack-tun-test netstack-tap-test $(QNODE) $(QJSC)
