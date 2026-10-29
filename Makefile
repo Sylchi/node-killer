@@ -149,12 +149,17 @@ net-bench: $(BUILD_DIR)
 	QNODE=$(abspath $(BUILD_DIR))/qnode $(CURDIR)/benchmarks/net-shards/bench.sh
 
 netstack-test: $(BUILD_DIR)
-	cmake --build $(BUILD_DIR) --target netstack_test
+	cmake --build $(BUILD_DIR) --target netstack_test netstack_l2_test
 	$(BUILD_DIR)/netstack-test
+	$(BUILD_DIR)/netstack-l2-test
 
 netstack-tun-test: $(BUILD_DIR)
 	cmake --build $(BUILD_DIR) --target qnode_exe -j $(JOBS)
 	QNODE=$(abspath $(BUILD_DIR))/qnode sh $(CURDIR)/tests/qnode/netstack_tun.sh
+
+netstack-tap-test: $(BUILD_DIR)
+	cmake --build $(BUILD_DIR) --target qnode_exe -j $(JOBS)
+	QNODE=$(abspath $(BUILD_DIR))/qnode sh $(CURDIR)/tests/qnode/netstack_tap.sh
 
 worker-test: $(BUILD_DIR)
 	cmake --build $(BUILD_DIR) --target qnode_exe -j $(JOBS)
@@ -178,4 +183,4 @@ unicode_gen: $(BUILD_DIR)
 libunicode-table.h: unicode_gen
 	$(BUILD_DIR)/unicode_gen unicode $@
 
-.PHONY: all amalgam ctest cxxtest debug fuzz jscheck install clean codegen distclean stats test test262 test262-update test262-check microbench net-test net-bench netstack-test worker-test fetch-test crypto-test qnode-test unicode_gen $(QJS) $(QJSC)
+.PHONY: all amalgam ctest cxxtest debug fuzz jscheck install clean codegen distclean stats test test262 test262-update test262-check microbench net-test net-bench netstack-test netstack-tun-test netstack-tap-test worker-test fetch-test crypto-test qnode-test unicode_gen $(QJS) $(QJSC)

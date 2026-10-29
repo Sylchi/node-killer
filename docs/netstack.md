@@ -4,8 +4,10 @@ Status: integrated. `node:net` hands managed IPv4 and IPv6 TCP streams and
 `node:dgram` UDP sockets to the in-process stack in `netstack.c` instead of the
 kernel. The stack also answers IPv4 and IPv6 ICMP echo requests, reports
 unreachable UDP ports, fragments and reassembles IP packets, and learns path
-MTUs from ICMP errors. Unmanaged addresses still use kernel sockets, and
-`netstack: false` restores the kernel path per socket.
+MTUs from ICMP errors. A separate link layer (`netstack_l2.c`) adds Ethernet
+framing, ARP for IPv4 and IPv6 neighbour discovery, so the stack can run on a
+Linux TAP device as a real Ethernet peer. Unmanaged addresses still use kernel
+sockets, and `netstack: false` restores the kernel path per socket.
 
 The kernel-backed sharded transport is still available and is documented in
 `docs/sharded-net.md`. The two features share the same `/64` address layout
@@ -24,15 +26,23 @@ sharded listeners use kernel TCP, the managed prefix uses the owned stack.
    eventfd      netstack.c  (IPv4/IPv6 + TCP + UDP + ICMP)
                    |
               netstack_link.c
-              /             \
-       loopback          Linux TUN
+              /      |        \
+       loopback   Linux TUN   Linux TAP
+                                  |
+                            netstack_l2.c
+                       (Ethernet + ARP + NDP)
 ```
 
 - `netstack.c` is transport-agnostic. It consumes and emits complete IPv4 or
   IPv6 packets; it never opens a kernel socket. IPv4 and IPv6 share the TCP
   state machine, the UDP socket table and the ICMP echo logic, and differ only
   in header encode/decode, checksum pseudo-headers and dispatch.
-- `netstack_link.c` is the link: an in-process loopback or a Linux TUN device.
+- `netstack_l2.c` owns one Ethernet interface: framing, ARP, IPv6 neighbour
+  solicitation/advertisement and the neighbour cache. It sits between the IP
+  engine and a frame transport.
+- `netstack_link.c` is the link: an in-process loopback, a Linux TUN device
+  carrying bare IP packets, or a Linux TAP device carrying Ethernet frames
+  through `netstack_l2.c`.
 - `node_netstack.c` exposes the stack as descriptors. Each virtual fd is an
   `eventfd`; `node.c` routes socket natives to the bridge when the descriptor
   is virtual, and libev polls the underlying eventfd as usual.
@@ -81,7 +91,8 @@ net.netstackInfo();
 //   address4: "10.254.0.1", link: "loopback", fd: -1 }
 ```
 
-`fd` is the TUN descriptor, or `-1` on the loopback link.
+`fd` is the TUN/TAP descriptor, or `-1` on the loopback link. `link` is the
+interface name for a TUN/TAP link, or `"loopback"`.
 `net.netstackAddress()` returns the IPv6 address; `net.netstackAddress(4)`
 returns the IPv4 address.
 
@@ -115,10 +126,15 @@ Environment variables:
 | Variable | Meaning |
 | --- | --- |
 | `QNODE_NETSTACK=0` | Disable the owned stack; all sockets use the kernel. |
-| `QNODE_NETSTACK_PREFIX` | Override the managed IPv6 `/64`, e.g. `fd00:1:2:3::/64`. |
-| `QNODE_NETSTACK_IPV4_PREFIX` | Override the managed IPv4 range, e.g. `10.254.0.0/16` or `192.168.99.0/24`. |
+| `QNODE_NETSTACK_PREFIX` | Override the managed IPv6 range, e.g. `fd00:1:2:3::/64`. The prefix length is honoured for on-link decisions and defaults to 64. |
+| `QNODE_NETSTACK_IPV4_PREFIX` | Override the managed IPv4 range, e.g. `10.254.0.0/16` or `192.168.99.0/24`. The prefix length is honoured for on-link decisions. |
 | `QNODE_NETSTACK_TUN=1` | Use a TUN link instead of the in-process loopback. |
 | `QNODE_NETSTACK_TUN_NAME` | TUN interface name, e.g. `qn0`. Defaults to a kernel-assigned name. |
+| `QNODE_NETSTACK_TAP=1` | Use a TAP (Ethernet) link. Takes precedence over TUN. |
+| `QNODE_NETSTACK_TAP_NAME` | TAP interface name, e.g. `qn0`. Defaults to a kernel-assigned name. |
+| `QNODE_NETSTACK_MAC` | Source MAC for a TAP link. Defaults to `02:51:4e:00:00:01`. |
+| `QNODE_NETSTACK_GATEWAY4` | Optional default IPv4 gateway for off-link destinations. |
+| `QNODE_NETSTACK_GATEWAY6` | Optional default IPv6 gateway for off-link destinations. |
 
 ## Links
 
@@ -157,6 +173,83 @@ an idle `qnode -e` still exits.
 Creating a TUN device normally needs `CAP_NET_ADMIN` (or a user namespace).
 The loopback link remains the default because it works unprivileged.
 
+### TAP
+
+Set `QNODE_NETSTACK_TAP=1` to carry real Ethernet frames instead of bare IP
+packets:
+
+```sh
+sudo ip tuntap add dev qn0 mode tap user "$USER"
+sudo ip link set dev qn0 address 02:51:4e:00:00:02
+sudo ip link set qn0 up
+sudo ip -6 addr add fd00:dead:beef:99::2/64 dev qn0 nodad
+sudo ip addr add 10.254.0.2/16 dev qn0
+
+QNODE_NETSTACK=1 QNODE_NETSTACK_TAP=1 QNODE_NETSTACK_TAP_NAME=qn0 \
+QNODE_NETSTACK_MAC=02:51:4e:00:00:01 \
+  ./qnode app.js
+```
+
+The stack keeps `fd00:dead:beef:99::1` and `10.254.0.1`; the kernel side of the
+device uses the `::2` and `.2` addresses. The stack answers ARP requests for its
+IPv4 address and neighbour solicitations for its IPv6 address, and resolves the
+kernel side before transmitting. The host does not need a static neighbour
+entry; ARP and NDP populate the cache in both directions.
+
+The stack uses the destination directly when it is on-link and the configured
+gateway when it is not. There is no full routing table and only one interface,
+so a TAP link reaches its on-link prefix plus destinations behind the optional
+`QNODE_NETSTACK_GATEWAY4`/`QNODE_NETSTACK_GATEWAY6` next hop. Without a
+gateway, an off-link destination is resolved as if it were on-link and normally
+fails.
+
+## Link layer: Ethernet, ARP and NDP
+
+`netstack_l2.c` is independent of the transport. Tests drive it over a
+simulated Ethernet segment; the TAP link drives it with frames read from and
+written to `/dev/net/tun`.
+
+- Outbound IP packets are prefixed with a 14-byte Ethernet header. The
+  EtherType follows the IP version (`0x0800` or `0x86dd`).
+- IPv4 uses ARP: requests are broadcast, replies are unicast, and both request
+  senders and reply senders are learnt. IPv4 limited broadcast
+  (`255.255.255.255`), the subnet broadcast address and multicast destinations
+  are framed with the all-ones or `01:00:5e:xx:xx:xx` MAC without a neighbour
+  lookup.
+- IPv6 uses neighbour solicitation (type 135) and advertisement (type 136).
+  Solicitations go to the solicited-node multicast address and MAC
+  (`33:33:xx:xx:xx:xx`); advertisements are sent directly to the solicitor.
+  Other multicast destinations are mapped to `33:33` MACs without resolution.
+- Frames addressed to the interface's own IP address are delivered straight
+  back into `ns_input()` without touching the wire, so same-process loopback
+  still works on a TAP link.
+- ARP requests for the interface address are answered. NDP solicitations are
+  answered only for the interface's own address and not for duplicate address
+  detection probes, which carry an unspecified source.
+- The neighbour cache holds 64 entries. An entry is *incomplete* while requests
+  are outstanding and *reachable* afterwards. Probes are retried every second,
+  up to three transmissions, and a reachable entry expires after 60 seconds.
+- Packets waiting for resolution are queued: at most 64 packets in total and 8
+  per neighbour. Overflow, probe exhaustion and malformed input are counted as
+  drops rather than blocking the caller.
+- Incoming NDP messages are validated before use: IPv6 payload, hop limit 255,
+  next header 58, a valid ICMPv6 checksum and a message type of 135 or 136. NDP
+  is intercepted before the packet reaches the IP engine.
+
+`NsL2Stats` exposes `rx_frames`, `tx_frames`, `rx_arp`, `tx_arp`, `rx_ndp`,
+`tx_ndp`, `local_delivered`, `neighbor_hits`, `neighbor_misses`,
+`neighbors_created`, `neighbor_timeouts`, `queued`, `queue_dropped` and
+`dropped`.
+
+Current link-layer limits:
+
+- No router advertisements, SLAAC, duplicate address detection for the
+  interface address, or neighbour-unreachability detection beyond expiry.
+- No IGMP/MLD membership; multicast and broadcast are framed and transmitted,
+  but incoming multicast is only accepted for delivery to the IP engine.
+- One interface per stack, with one on-link prefix and one optional gateway per
+  address family.
+
 ## TCP behaviour
 
 Implemented:
@@ -182,7 +275,7 @@ Current limits:
 - No SACK, window scaling, congestion control or delayed ACK. Segments are
   delivered in order; the receive window is a fixed 64 KiB ring, and peers that
   exceed it are retransmitted into after the application reads.
-- No cross-process loopback. Two processes need a TUN link (or a future
+- No cross-process loopback. Two processes need a TUN or TAP link (or a future
   shared-memory/raw link).
 - TLS over a virtual fd is routed through the bridge, but there is no
   dedicated regression test yet.
@@ -266,8 +359,10 @@ Limits and errors:
 The `dgram` module is implemented in `bootstrap/55-dgram.js`. It uses the same
 `native.socket(..., SOCK_DGRAM, ...)`, `bind`, `sendto`, `recvfrom`, `connect`
 and `disconnect` primitives as the TCP path. Broadcast and multicast
-membership setters are accepted as no-ops for API compatibility; the engine
-does not implement multicast or broadcast delivery.
+membership setters are accepted as no-ops for API compatibility. An outbound
+datagram to a broadcast or multicast destination is framed and transmitted by
+the link layer on a TAP link, but the engine does not implement receive-side
+delivery to matching sockets or multicast membership filtering.
 
 ## ICMP behaviour
 
@@ -319,6 +414,7 @@ connection-address allocation.
 ```sh
 make netstack-test       # C engine: TCP, UDP, ICMP, dispatch, retransmit, limits
 make netstack-tun-test   # optional TUN path in a private user+network namespace
+make netstack-tap-test   # optional TAP/ARP/NDP path in a private namespace
 make qnode-test          # includes netstack_socket.js and netstack_dgram.js
 ```
 
@@ -355,5 +451,19 @@ against a kernel peer. It skips (and succeeds) when user namespaces, `ip(8)` or
 `/dev/net/tun` are unavailable; the ICMP checks are skipped when `ping` is not
 installed.
 
-The C test is `tests/netstack_test.c`; it links the stack directly and needs no
-runtime or privileges.
+`tests/netstack_l2_test.c` links `netstack_l2.c` against a simulated two-node
+Ethernet segment. It checks ARP request/reply and cache learning, IPv6
+neighbour solicitation/advertisement, Ethernet framing and MAC selection,
+packet queueing while a gateway is unresolved, probe exhaustion and packet
+drop, local delivery without a frame, broadcast/subnet-broadcast and IPv6
+multicast MAC mapping, and neighbour expiry.
+
+`tests/qnode/netstack_tap.sh` follows the TUN script but creates a TAP device
+with an explicit kernel MAC (`02:51:4e:00:00:02`) and runs qnode with
+`02:51:4e:00:00:01`. It repeats the TCP, UDP and large-datagram transfers and
+the `ping` checks, then verifies through `ip neigh` that the kernel learnt the
+qnode MAC for both `10.254.0.1` and `fd00:dead:beef:99::1`, covering real ARP
+and NDP interop in both directions.
+
+The C tests are `tests/netstack_test.c` and `tests/netstack_l2_test.c`; they
+link the stack directly and need no runtime or privileges.

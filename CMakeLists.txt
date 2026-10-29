@@ -399,8 +399,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         _GNU_SOURCE=1)
     target_link_libraries(qnode_sodium PUBLIC Threads::Threads)
 
-    add_library(qnode_core STATIC node.c netstack.c netstack_link.c
-        node_netstack.c)
+    add_library(qnode_core STATIC node.c netstack.c netstack_l2.c
+        netstack_link.c node_netstack.c)
     target_compile_definitions(qnode_core PRIVATE ${qjs_defines})
     target_include_directories(qnode_core PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
     target_link_libraries(qnode_core PRIVATE qjs qjs-libc
@@ -533,12 +533,18 @@ target_link_libraries(api-test PRIVATE qjs qjs-libc)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     # Owned TCP/IP stack prototype (docs/netstack.md).
-    add_library(netstack STATIC netstack.c)
+    add_library(netstack STATIC netstack.c netstack_l2.c)
     add_executable(netstack_test tests/netstack_test.c)
     set_target_properties(netstack_test PROPERTIES
         OUTPUT_NAME "netstack-test"
     )
     target_link_libraries(netstack_test PRIVATE netstack)
+
+    add_executable(netstack_l2_test tests/netstack_l2_test.c)
+    set_target_properties(netstack_l2_test PROPERTIES
+        OUTPUT_NAME "netstack-l2-test"
+    )
+    target_link_libraries(netstack_l2_test PRIVATE netstack)
 endif()
 
 add_executable(lre-test

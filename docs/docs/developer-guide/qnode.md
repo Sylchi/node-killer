@@ -14,13 +14,14 @@ changes.
 | `node.h` | Entry points used by `qnode.c` and the worker hook |
 | `bootstrap/` | Node compatibility layer, split into ordered parts |
 | `netstack.c` | Owned IPv4/IPv6 TCP, UDP and ICMP engine (no kernel sockets) |
-| `netstack_link.c` | Loopback and Linux TUN links for the owned stack |
+| `netstack_l2.c` | Ethernet framing, ARP, IPv6 NDP and the neighbour cache |
+| `netstack_link.c` | Loopback, Linux TUN and Linux TAP links for the owned stack |
 | `vendor/` | zlib, mbedTLS, libsodium, libev, wasm3 |
 | `tests/` | Test262-compatible tests plus qnode-only tests |
 
 `node.c` is compiled only on Linux. The upstream `qjs` and `qjsc` targets do
-not depend on it. `netstack.c` itself is portable; the Linux-only pieces are
-the TUN link and the `eventfd` virtual descriptors.
+not depend on it. `netstack.c` and `netstack_l2.c` are portable; the
+Linux-only pieces are the TUN/TAP links and the `eventfd` virtual descriptors.
 
 ## Boot sequence
 
@@ -79,6 +80,14 @@ that may be strings, `Buffer`s, typed arrays or `ArrayBuffer`s.
   The shared IP emitter fragments datagrams to the cached path MTU, and inbound
   fragments are reassembled before checksum validation and dispatch. Path MTU
   is cached per destination and also sizes TCP segments (capped at `NS_MSS`).
+- **Ethernet via TAP** (`netstack_l2.c`) when `QNODE_NETSTACK_TAP=1`. The IP
+  engine is unchanged; outbound packets are framed and resolved with ARP for
+  IPv4 and neighbour solicitation for IPv6, and inbound frames are unwrapped
+  before `ns_input()`. The neighbour cache queues a bounded number of packets
+  while resolution is in progress. One interface and one on-link prefix per
+  family are supported; the optional gateway is used only for off-link
+  destinations. The default MAC is `02:51:4e:00:00:01` and is set with
+  `QNODE_NETSTACK_MAC`.
 
 When a virtual socket binds, connects or sends to an address outside the
 managed prefix, the bridge creates a kernel socket, `dup2`s it onto the same
@@ -93,9 +102,11 @@ primitives.
 
 The stack is driven by three native calls: socket operations pump it
 synchronously; an unref'd timer calls `netstackTick()` for RTO retransmits; and
-a TUN link additionally installs a read handler that calls `netstackPump()`.
-The loopback link needs no timer or privileges, but it is process-local. See
-`docs/netstack.md` for the packet engine, environment variables and limits.
+a TUN/TAP link additionally installs a read handler that calls
+`netstackPump()`. A TAP link also advances neighbour retries and expiry from
+the same tick. The loopback link needs no timer or privileges, but it is
+process-local. See `docs/netstack.md` for the packet engine, link layer,
+environment variables and limits.
 
 WebSocket support lives in `bootstrap/85-websocket.js`. `http.Server` emits
 the standard `'upgrade'`/`'connect'` events, and `node:websocket` provides both
@@ -141,8 +152,9 @@ Concurrent TLS use from multiple workers is not safe yet. Crypto RNG state
 ```bash
 make test              # upstream quickjs-ng suite (qjs)
 make qnode-test        # qnode-only tests (crypto, workers, fetch, modules, net, dgram, WebSocket)
-make netstack-test     # owned TCP/UDP/ICMP engine, fragmentation and PMTU in isolation
+make netstack-test     # owned TCP/UDP/ICMP engine, fragment/PMTU and L2/ARP/NDP in isolation
 make netstack-tun-test # optional TUN path, including large fragmented datagrams
+make netstack-tap-test # optional TAP path: Ethernet frames, ARP and NDP against the kernel
 ```
 
 Test262 cannot exercise the Node APIs, so qnode tests live in `tests/qnode/`.
