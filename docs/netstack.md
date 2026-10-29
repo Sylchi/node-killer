@@ -1,9 +1,9 @@
 # Owned TCP/IP stack (`netstack`)
 
-Status: integrated. `node:net` now hands managed IPv6 TCP streams to the
-in-process stack in `netstack.c` instead of the kernel. IPv4, UDP and
-unmanaged addresses still use kernel sockets, and `netstack: false` restores
-the kernel path per socket.
+Status: integrated. `node:net` now hands managed IPv4 and IPv6 TCP streams to
+the in-process stack in `netstack.c` instead of the kernel. UDP and unmanaged
+addresses still use kernel sockets, and `netstack: false` restores the kernel
+path per socket.
 
 The kernel-backed sharded transport is still available and is documented in
 `docs/sharded-net.md`. The two features share the same `/64` address layout
@@ -19,15 +19,17 @@ sharded listeners use kernel TCP, the managed prefix uses the owned stack.
              |
    node_netstack.c  (virtual fd bridge)
       |            |
-   eventfd      netstack.c  (IPv6 + TCP state machine)
+   eventfd      netstack.c  (IPv4/IPv6 + TCP state machine)
                    |
               netstack_link.c
               /             \
        loopback          Linux TUN
 ```
 
-- `netstack.c` is transport-agnostic. It consumes complete IPv6 packets and
-  emits complete IPv6 packets; it never opens a kernel socket.
+- `netstack.c` is transport-agnostic. It consumes and emits complete IPv4 or
+  IPv6 packets; it never opens a kernel socket. IPv4 and IPv6 share the TCP
+  state machine and differ only in header encode/decode, checksum
+  pseudo-headers and dispatch.
 - `netstack_link.c` is the link: an in-process loopback or a Linux TUN device.
 - `node_netstack.c` exposes the stack as descriptors. Each virtual fd is an
   `eventfd`; `node.c` routes socket natives to the bridge when the descriptor
@@ -56,31 +58,37 @@ const kernelSocket = net.connect({ host: "...", port: 80, netstack: false });
 
 The default is automatic:
 
-- An IPv6 stream socket whose bind or connect address lies inside the managed
-  prefix stays on the owned stack.
+- An IPv4 or IPv6 stream socket whose bind or connect address lies inside the
+  matching managed prefix stays on the owned stack.
 - Any other address is converted to a real kernel socket in place, so the
   descriptor number and the JS `Socket` object stay valid.
-- IPv4 (`127.0.0.1`, `0.0.0.0`, ...) always uses the kernel. So do UDP
-  sockets, `shards`/`subnet` listeners, and sockets created when the stack
-  could not be initialised.
+- UDP sockets, `shards`/`subnet` listeners, and sockets created when the stack
+  could not be initialised still use the kernel.
+- `netstack: true` keeps the socket on the owned stack even when the address
+  is outside the managed prefix (for example `127.0.0.1`).
 
 `net.netstackInfo()` reports the engine:
 
 ```js
 net.netstackInfo();
 // { enabled: true, address: "fd00:dead:beef:99::1",
-//   link: "loopback", fd: -1 }
+//   address4: "10.254.0.1", link: "loopback", fd: -1 }
 ```
 
 `fd` is the TUN descriptor, or `-1` on the loopback link.
-`net.netstackAddress()` is shorthand for the `address` field.
+`net.netstackAddress()` returns the IPv6 address; `net.netstackAddress(4)`
+returns the IPv4 address.
 
 ## Addressing
 
-The default prefix is `fd00:dead:beef:99::/64`. The stack owns one stable
-local address in that prefix, the first host address (`::1` by default):
-`fd00:dead:beef:99::1`. In plain mode, client connections use that address as
-their source and listeners may bind any explicit address inside the prefix.
+The default IPv6 prefix is `fd00:dead:beef:99::/64` and the default IPv4
+prefix is `10.254.0.0/16`. The stack owns one stable local address in each:
+`fd00:dead:beef:99::1` and `10.254.0.1`. In plain mode, client connections use
+the local address for the destination family as their source, and listeners
+may bind any explicit address inside the corresponding prefix.
+
+IPv4 has no shard byte, so every IPv4 packet is dispatched to shard 0. The
+sharded `/64` address allocation described below remains IPv6-only.
 
 The low 64 bits of an address still follow the sharded layout used by the
 kernel path:
@@ -101,7 +109,8 @@ Environment variables:
 | Variable | Meaning |
 | --- | --- |
 | `QNODE_NETSTACK=0` | Disable the owned stack; all sockets use the kernel. |
-| `QNODE_NETSTACK_PREFIX` | Override the managed `/64`, e.g. `fd00:1:2:3::/64`. |
+| `QNODE_NETSTACK_PREFIX` | Override the managed IPv6 `/64`, e.g. `fd00:1:2:3::/64`. |
+| `QNODE_NETSTACK_IPV4_PREFIX` | Override the managed IPv4 range, e.g. `10.254.0.0/16` or `192.168.99.0/24`. |
 | `QNODE_NETSTACK_TUN=1` | Use a TUN link instead of the in-process loopback. |
 | `QNODE_NETSTACK_TUN_NAME` | TUN interface name, e.g. `qn0`. Defaults to a kernel-assigned name. |
 
@@ -125,14 +134,16 @@ Set `QNODE_NETSTACK_TUN=1` to move packet I/O to a TUN device:
 sudo ip tuntap add dev qn0 mode tun user "$USER"
 sudo ip link set qn0 up
 sudo ip -6 addr add fd00:dead:beef:99::2/64 dev qn0
+sudo ip addr add 10.254.0.2/16 dev qn0
 
 QNODE_NETSTACK=1 QNODE_NETSTACK_TUN=1 QNODE_NETSTACK_TUN_NAME=qn0 \
   ./qnode app.js
 ```
 
-The stack keeps `fd00:dead:beef:99::1`; `::2` is the host side of the link.
-Add routes so the host knows which destinations belong to the stack, and
-ensure the managed prefix is routed to the TUN device. Incoming packets wake
+The stack keeps `fd00:dead:beef:99::1` and `10.254.0.1`; `::2` and `10.254.0.2`
+are the host side of the link. Add routes so the host knows which destinations
+belong to the stack, and ensure the managed prefixes are routed to the TUN
+device. Incoming packets wake
 the TUN read handler, and an unref'd 20 ms heartbeat drives retransmission
 timers. The heartbeat only runs while other work keeps the event loop alive, so
 an idle `qnode -e` still exits.
@@ -144,7 +155,8 @@ The loopback link remains the default because it works unprivileged.
 
 Implemented:
 
-- IPv6 header and TCP segment encode/decode with checksums;
+- IPv4 and IPv6 header encode/decode, including IP and TCP checksums with the
+  correct pseudo-header for each family;
 - SYN / SYN-ACK / ACK handshake and accept queue;
 - in-order data transfer, ACK, PSH and a receive ring;
 - FIN close with `FIN_WAIT_1`, `FIN_WAIT_2`, `CLOSE_WAIT`, `LAST_ACK` and
@@ -157,8 +169,8 @@ Implemented:
 
 Current limits:
 
-- IPv6 TCP only. UDP, ICMPv6, fragmentation and IPv4 are not implemented; they
-  stay on the kernel path.
+- TCP only. UDP, ICMP, IPv4/IPv6 fragmentation and reassembly are not
+  implemented; those packets are dropped, and UDP stays on the kernel path.
 - No out-of-order reassembly, SACK, window scaling, congestion control or
   delayed ACK. The receive window is a fixed 64 KiB ring; peers that exceed it
   are retransmitted into after the application reads.
@@ -167,8 +179,8 @@ Current limits:
 - Path MTU discovery is not implemented; the stack emits 1400-byte segments.
 - TLS over a virtual fd is routed through the bridge, but there is no
   dedicated regression test yet.
-- `netstack: true` with an IPv4 domain still falls back to the kernel, because
-  virtual fds are IPv6-only.
+- IPv4 is plain-only. There is no shard byte in an IPv4 header, so sharded
+  listener allocation remains an IPv6 feature.
 
 ## Sharded transport relationship
 
@@ -187,15 +199,16 @@ make qnode-test          # includes tests/qnode/netstack_socket.js
 ```
 
 `tests/qnode/netstack_socket.js` runs the JS integration end to end over
-loopback: explicit and automatic netstack selection, concurrent connections,
-a 200 KiB binary echo (multiple MSS and retransmission rounds), and an IPv4
-kernel fallback case. The WebSocket suite in `tests/qnode/websocket.js` also
-runs over `node:net` and can be pointed at managed addresses for manual
-testing.
+loopback: explicit and automatic netstack selection for both families,
+concurrent connections, IPv6 and IPv4 binary echoes spanning multiple MSS,
+forced IPv4 on `127.0.0.1`, and kernel fallback for unmanaged addresses. The
+WebSocket suite in `tests/qnode/websocket.js` also runs over `node:net` and
+can be pointed at managed addresses for manual testing.
 
 `tests/qnode/netstack_tun.sh` starts a TUN-backed stack in `unshare -rn`, adds
-the host side address, and connects to it with a kernel client. It skips (and
-succeeds) when user namespaces, `ip(8)` or `/dev/net/tun` are unavailable.
+IPv6 and IPv4 host-side addresses, and connects to both with kernel clients.
+It skips (and succeeds) when user namespaces, `ip(8)` or `/dev/net/tun` are
+unavailable.
 
 The C test is `tests/netstack_test.c`; it links the stack directly and needs no
 runtime or privileges.

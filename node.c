@@ -1094,8 +1094,9 @@ static JSValue js_node_socket(JSContext *ctx, JSValueConst this_val,
     if (argc > 3 && !JS_IsUndefined(argv[3]))
         if (JS_ToInt32(ctx, &mode, argv[3])) return JS_EXCEPTION;
 
-    /* The owned TCP stack owns managed IPv6 streams. Everything else, and
-       every failure to initialise the stack, falls through to the kernel. */
+    /* The owned TCP stack owns managed IPv4/IPv6 streams. Everything else,
+       and every failure to initialise the stack, falls through to the
+       kernel. */
     if (proto == 0) {
         int vfd = node_netstack_socket(domain, type, mode);
         if (vfd >= 0)
@@ -1465,14 +1466,17 @@ static JSValue js_node_netstack_info(JSContext *ctx, JSValueConst this_val,
                                      int argc, JSValueConst *argv)
 {
     char addr[64];
+    char addr4[64];
     const char *link = NULL;
-    int ok = node_netstack_info(addr, sizeof(addr), &link);
+    int ok = node_netstack_info(addr, sizeof(addr), addr4, sizeof(addr4),
+                                &link);
     JSValue arr = JS_NewArray(ctx);
     JS_SetPropertyUint32(ctx, arr, 0, JS_NewInt32(ctx, ok == 0 ? 1 : 0));
     JS_SetPropertyUint32(ctx, arr, 1, JS_NewString(ctx, addr));
     JS_SetPropertyUint32(ctx, arr, 2, JS_NewString(ctx, link ? link : ""));
     JS_SetPropertyUint32(ctx, arr, 3,
                          JS_NewInt32(ctx, node_netstack_link_fd()));
+    JS_SetPropertyUint32(ctx, arr, 4, JS_NewString(ctx, addr4));
     (void)this_val; (void)argc; (void)argv;
     return arr;
 }

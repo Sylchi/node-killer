@@ -553,9 +553,13 @@ class Server extends EventEmitter {
   }
 
   _listenSingle(options, fallbackReason) {
+    /* Choose the socket family from the requested host. In particular,
+       netstack: true with an IPv4 host (or family: 4) must create an
+       AF_INET virtual socket rather than an IPv6 one with an IPv4 bind. */
+    const hostText = typeof options.host === "string" ? options.host : "";
     const want6 = options.family === 6 ||
-      options.netstack === true ||
-      (typeof options.host === "string" && options.host.indexOf(":") >= 0);
+      (options.family !== 4 && hostText.indexOf(":") >= 0);
+    const bindHost = options.host || (want6 ? "::" : "0.0.0.0");
     const r = native.socket(want6 ? C.AF_INET6 : C.AF_INET,
                             C.SOCK_STREAM, 0,
                             netstackMode(options));
@@ -563,8 +567,7 @@ class Server extends EventEmitter {
       throw sysError(r[1], "socket");
     const fd = r[0];
     this._configureListener(fd, options, false);
-    const err = this._bindAndListen(fd, options.host || "0.0.0.0",
-                                    options.port, options);
+    const err = this._bindAndListen(fd, bindHost, options.port, options);
     if (err) {
       native.close(fd);
       this._fd = undefined;
@@ -772,20 +775,24 @@ const net = {
   connect: createConnection,
   shardAddress,
   shardIndex,
-  /* Diagnostics for the owned IPv6 TCP engine. `address` is the stable
-     local address to listen on / connect to when using netstack: true. */
+  /* Diagnostics for the owned TCP engine. `address` and `address4` are the
+     stable local IPv6 and IPv4 addresses to listen on / connect to when
+     using netstack: true. */
   netstackInfo() {
     try {
       const info = native.netstackInfo();
       return { enabled: !!info[0], address: info[1] || null,
-               link: info[2] || null, fd: info[3] };
+               address4: info[4] || null, link: info[2] || null, fd: info[3] };
     } catch (e) {
-      return { enabled: false, address: null, link: null, fd: -1 };
+      return { enabled: false, address: null, address4: null,
+               link: null, fd: -1 };
     }
   },
-  netstackAddress() {
+  netstackAddress(family) {
     const info = this.netstackInfo();
-    return info.enabled ? info.address : null;
+    if (!info.enabled)
+      return null;
+    return family === 4 || family === "IPv4" ? info.address4 : info.address;
   },
   isIP(input) {
     const s = String(input);

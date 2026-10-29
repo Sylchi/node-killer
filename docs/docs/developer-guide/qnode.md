@@ -64,13 +64,13 @@ that may be strings, `Buffer`s, typed arrays or `ArrayBuffer`s.
 
 `node:net` has two server engines:
 
-- **Kernel TCP** for IPv4, UDP, `netstack: false`, and the sharded transport
-  (`subnet`/`shards`). This is the existing path and remains fully
-  interoperable with the host.
-- **Owned TCP** for IPv6 streams inside the managed prefix (default
-  `fd00:dead:beef:99::/64`). `native.socket()` returns an `eventfd`-backed
-  virtual fd; `node_netstack.c` implements the socket operations on top of
-  `netstack.c`, and the real eventfd is what libev polls.
+- **Kernel TCP** for UDP, `netstack: false`, unmanaged addresses, and the
+  sharded transport (`subnet`/`shards`). This is the existing path and remains
+  fully interoperable with the host.
+- **Owned TCP** for IPv4 and IPv6 streams inside the managed prefixes (default
+  `10.254.0.0/16` and `fd00:dead:beef:99::/64`). `native.socket()` returns an
+  `eventfd`-backed virtual fd; `node_netstack.c` implements the socket
+  operations on top of `netstack.c`, and the real eventfd is what libev polls.
 
 When a virtual socket binds or connects to an address outside the managed
 prefix, the bridge creates a kernel socket, `dup2`s it onto the same descriptor

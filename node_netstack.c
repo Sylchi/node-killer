@@ -59,6 +59,9 @@ static NsLink *ns_link;
 static int ns_ready;
 static int ns_tried;
 static char ns_prefix_text[64] = "fd00:dead:beef:99::/64";
+static char ns_prefix4_text[64] = "10.254.0.0/16";
+static uint8_t ns_prefix4[4] = { 10, 254, 0, 0 };
+static int ns_prefix4_len = 16;
 
 static Vfd vfds[VFD_MAX];
 
@@ -92,10 +95,42 @@ static int parse_prefix(const char *text, uint8_t out[NS_PREFIX_LEN])
     return 0;
 }
 
+/* Parse "a.b.c.d[/prefix]" into the IPv4 managed range. The default /16
+   keeps the range private and unlikely to collide with real workloads. */
+static int parse_prefix4(const char *text, uint8_t out[4], int *prefix_len)
+{
+    char buf[INET_ADDRSTRLEN];
+    const char *slash;
+    size_t n;
+    struct in_addr a;
+    int plen = 16;
+
+    if (!text || !text[0])
+        return -1;
+    slash = strchr(text, '/');
+    n = slash ? (size_t)(slash - text) : strlen(text);
+    if (n == 0 || n >= sizeof(buf))
+        return -1;
+    memcpy(buf, text, n);
+    buf[n] = '\0';
+    if (inet_pton(AF_INET, buf, &a) != 1)
+        return -1;
+    if (slash) {
+        char *end;
+        long v = strtol(slash + 1, &end, 10);
+        if (end == slash + 1 || *end || v < 0 || v > 32)
+            return -1;
+        plen = (int)v;
+    }
+    memcpy(out, &a, 4);
+    *prefix_len = plen;
+    return 0;
+}
+
 static int ns_init(void)
 {
     uint8_t prefix[NS_PREFIX_LEN];
-    NsAddr local;
+    NsAddr local6, local4;
     const char *env;
     const char *tun_name = NULL;
     int kind = NS_LINK_LOOPBACK;
@@ -119,14 +154,38 @@ static int ns_init(void)
     if (parse_prefix(ns_prefix_text, prefix) < 0)
         return -1;
 
-    memset(&local, 0, sizeof(local));
-    memcpy(local.b, prefix, NS_PREFIX_LEN);
-    local.b[15] = 1; /* the stack's stable local address */
+    env = getenv("QNODE_NETSTACK_IPV4_PREFIX");
+    if (env && env[0])
+        snprintf(ns_prefix4_text, sizeof(ns_prefix4_text), "%s", env);
+    if (parse_prefix4(ns_prefix4_text, ns_prefix4, &ns_prefix4_len) < 0)
+        return -1;
+
+    memset(&local6, 0, sizeof(local6));
+    local6.family = NS_AF_INET6;
+    memcpy(local6.b, prefix, NS_PREFIX_LEN);
+    local6.b[15] = 1; /* the stack's stable IPv6 local address */
+
+    memset(&local4, 0, sizeof(local4));
+    local4.family = NS_AF_INET;
+    {
+        int i;
+        /* Use the first host address in the managed network. */
+        for (i = 0; i < 4; i++) {
+            int bits = ns_prefix4_len - i * 8;
+            uint8_t mask = bits >= 8 ? 0xff
+                           : bits <= 0 ? 0
+                           : (uint8_t)(0xff << (8 - bits));
+            local4.b[i] = (uint8_t)(ns_prefix4[i] & mask);
+        }
+        if (ns_prefix4_len < 32)
+            local4.b[3] |= 1;
+    }
 
     ns_stack = ns_stack_new(prefix, 1, NULL, NULL);
     if (!ns_stack)
         return -1;
-    ns_stack_set_plain(ns_stack, &local);
+    ns_stack_set_plain(ns_stack, &local6);
+    ns_stack_set_plain(ns_stack, &local4);
 
     env = getenv("QNODE_NETSTACK_TUN");
     if (env && env[0] && env[0] != '0') {
@@ -147,20 +206,27 @@ static int ns_init(void)
 #endif
 }
 
-int node_netstack_info(char *addr, size_t addrlen, const char **link)
+int node_netstack_info(char *addr, size_t addrlen, char *addr4, size_t addr4len,
+                       const char **link)
 {
-    const NsAddr *local;
+    const NsAddr *local6;
+    const NsAddr *local4;
 
     if (!ns_init()) {
-        local = ns_stack_local(ns_stack);
+        local6 = ns_stack_local_family(ns_stack, NS_AF_INET6);
+        local4 = ns_stack_local_family(ns_stack, NS_AF_INET);
         if (addr && addrlen)
-            ns_addr_format(local, addr);
+            ns_addr_format(local6, addr);
+        if (addr4 && addr4len)
+            ns_addr_format(local4, addr4);
         if (link)
             *link = ns_link_name(ns_link) ? ns_link_name(ns_link) : "loopback";
         return 0;
     }
     if (addr && addrlen)
         addr[0] = '\0';
+    if (addr4 && addr4len)
+        addr4[0] = '\0';
     if (link)
         *link = NULL;
     return -1;
@@ -327,15 +393,26 @@ static int vfd_to_kernel_connect(Vfd *v, const struct sockaddr *sa,
     if (fd < 0)
         return -1;
     if (v->bound) {
-        struct sockaddr_in6 local;
+        struct sockaddr_storage local;
+        socklen_t llen;
+
         memset(&local, 0, sizeof(local));
-        local.sin6_family = AF_INET6;
-        local.sin6_port = htons(v->bind_port);
-        if (v->bind_wildcard)
-            local.sin6_addr = in6addr_any;
-        else
-            memcpy(&local.sin6_addr, v->bind_addr.b, 16);
-        if (bind(fd, (struct sockaddr *)&local, sizeof(local)) < 0) {
+        if (v->domain == AF_INET) {
+            struct sockaddr_in *l4 = (struct sockaddr_in *)&local;
+            l4->sin_family = AF_INET;
+            l4->sin_port = htons(v->bind_port);
+            if (!v->bind_wildcard)
+                memcpy(&l4->sin_addr, v->bind_addr.b, 4);
+            llen = sizeof(*l4);
+        } else {
+            struct sockaddr_in6 *l6 = (struct sockaddr_in6 *)&local;
+            l6->sin6_family = AF_INET6;
+            l6->sin6_port = htons(v->bind_port);
+            if (!v->bind_wildcard)
+                memcpy(&l6->sin6_addr, v->bind_addr.b, 16);
+            llen = sizeof(*l6);
+        }
+        if (bind(fd, (struct sockaddr *)&local, llen) < 0) {
             int err = errno;
             close(fd);
             errno = err;
@@ -365,36 +442,83 @@ static int vfd_to_kernel_connect(Vfd *v, const struct sockaddr *sa,
 static int sa_to_ns(const struct sockaddr *sa, socklen_t len, NsAddr *addr,
                     uint16_t *port, int *wildcard)
 {
-    const struct sockaddr_in6 *s6;
+    memset(addr, 0, sizeof(*addr));
 
-    if (!sa || sa->sa_family != AF_INET6 || len < sizeof(*s6)) {
-        errno = EAFNOSUPPORT;
-        return -1;
+    if (sa && sa->sa_family == AF_INET && len >= sizeof(struct sockaddr_in)) {
+        const struct sockaddr_in *s4 = (const struct sockaddr_in *)sa;
+        addr->family = NS_AF_INET;
+        memcpy(addr->b, &s4->sin_addr, 4);
+        if (port)
+            *port = ntohs(s4->sin_port);
+        if (wildcard)
+            *wildcard = s4->sin_addr.s_addr == htonl(INADDR_ANY);
+        return 0;
     }
-    s6 = (const struct sockaddr_in6 *)sa;
-    memcpy(addr->b, &s6->sin6_addr, 16);
-    if (port)
-        *port = ntohs(s6->sin6_port);
-    if (wildcard)
-        *wildcard = IN6_IS_ADDR_UNSPECIFIED(&s6->sin6_addr);
-    return 0;
+    if (sa && sa->sa_family == AF_INET6 &&
+        len >= sizeof(struct sockaddr_in6)) {
+        const struct sockaddr_in6 *s6 = (const struct sockaddr_in6 *)sa;
+        addr->family = NS_AF_INET6;
+        memcpy(addr->b, &s6->sin6_addr, 16);
+        if (port)
+            *port = ntohs(s6->sin6_port);
+        if (wildcard)
+            *wildcard = IN6_IS_ADDR_UNSPECIFIED(&s6->sin6_addr);
+        return 0;
+    }
+    errno = EAFNOSUPPORT;
+    return -1;
 }
 
 static void ns_to_sa(const NsAddr *addr, uint16_t port, struct sockaddr *sa,
                      socklen_t *len)
 {
-    struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)sa;
-    memset(s6, 0, sizeof(*s6));
-    s6->sin6_family = AF_INET6;
-    s6->sin6_port = htons(port);
-    memcpy(&s6->sin6_addr, addr->b, 16);
-    *len = sizeof(*s6);
+    if (ns_addr_family(addr) == NS_AF_INET) {
+        struct sockaddr_in *s4 = (struct sockaddr_in *)sa;
+        memset(s4, 0, sizeof(*s4));
+        s4->sin_family = AF_INET;
+        s4->sin_port = htons(port);
+        memcpy(&s4->sin_addr, addr->b, 4);
+        *len = sizeof(*s4);
+        return;
+    }
+    {
+        struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)sa;
+        memset(s6, 0, sizeof(*s6));
+        s6->sin6_family = AF_INET6;
+        s6->sin6_port = htons(port);
+        memcpy(&s6->sin6_addr, addr->b, 16);
+        *len = sizeof(*s6);
+    }
+}
+
+static int prefix4_match(const uint8_t addr[4], const uint8_t prefix[4],
+                         int bits)
+{
+    int full = bits / 8;
+    int rem = bits % 8;
+    if (full && memcmp(addr, prefix, (size_t)full) != 0)
+        return 0;
+    if (rem) {
+        uint8_t mask = (uint8_t)(0xff << (8 - rem));
+        if ((addr[full] & mask) != (prefix[full] & mask))
+            return 0;
+    }
+    return 1;
 }
 
 static int addr_managed(const NsAddr *addr)
 {
-    const NsAddr *local = ns_stack_local(ns_stack);
-    return memcmp(addr->b, local->b, NS_PREFIX_LEN) == 0;
+    if (ns_addr_family(addr) == NS_AF_INET)
+        return prefix4_match(addr->b, ns_prefix4, ns_prefix4_len);
+    {
+        const NsAddr *local = ns_stack_local_family(ns_stack, NS_AF_INET6);
+        return local && memcmp(addr->b, local->b, NS_PREFIX_LEN) == 0;
+    }
+}
+
+static int ns_family(const NsAddr *addr)
+{
+    return ns_addr_family(addr) == NS_AF_INET ? AF_INET : AF_INET6;
 }
 
 /* ---------------- socket API ---------------- */
@@ -403,7 +527,8 @@ int node_netstack_socket(int domain, int type, int mode)
 {
     Vfd *v;
 
-    if (mode < 0 || domain != AF_INET6 || (type & 0xf) != SOCK_STREAM)
+    if (mode < 0 || (domain != AF_INET && domain != AF_INET6) ||
+        (type & 0xf) != SOCK_STREAM)
         return -1;
     if (!ns_init()) {
         v = vfd_alloc(domain, mode == 1);
@@ -427,6 +552,10 @@ int node_netstack_bind(int fd, const struct sockaddr *sa, socklen_t len)
     }
     if (sa_to_ns(sa, len, &addr, &port, &wildcard) < 0)
         return -1;
+    if (ns_family(&addr) != v->domain) {
+        errno = EAFNOSUPPORT;
+        return -1;
+    }
 
     /* A wildcard bind stays pending until listen/connect tells us which
        engine the socket is for. Explicit netstack addresses (or a forced
@@ -459,9 +588,15 @@ int node_netstack_listen(int fd, int backlog)
 
     if (v->force || (v->bound && !v->bind_wildcard &&
                      addr_managed(&v->bind_addr))) {
-        local = v->bound ? v->bind_addr : *ns_stack_local(ns_stack);
+        const NsAddr *stack_local = ns_stack_local_family(
+            ns_stack, v->domain == AF_INET ? NS_AF_INET : NS_AF_INET6);
+        if (!stack_local) {
+            errno = EAFNOSUPPORT;
+            return -1;
+        }
+        local = v->bound ? v->bind_addr : *stack_local;
         if (v->bound && v->bind_wildcard)
-            local = *ns_stack_local(ns_stack);
+            local = *stack_local;
         port = v->bound ? v->bind_port : 0;
         err = ns_listen_port_ex(ns_stack, &local, port, &port);
         if (err < 0) {
@@ -477,19 +612,27 @@ int node_netstack_listen(int fd, int backlog)
     /* Kernel listener. */
     {
         int kfd = vfd_kernel_socket(v);
-        struct sockaddr_in6 local6;
+        struct sockaddr_storage local;
         socklen_t llen;
         if (kfd < 0)
             return -1;
-        memset(&local6, 0, sizeof(local6));
-        local6.sin6_family = AF_INET6;
-        local6.sin6_port = htons(v->bound ? v->bind_port : 0);
-        if (v->bound && !v->bind_wildcard)
-            memcpy(&local6.sin6_addr, v->bind_addr.b, 16);
-        else
-            local6.sin6_addr = in6addr_any;
-        llen = sizeof(local6);
-        if (v->bound && bind(kfd, (struct sockaddr *)&local6, llen) < 0) {
+        memset(&local, 0, sizeof(local));
+        if (v->domain == AF_INET) {
+            struct sockaddr_in *l4 = (struct sockaddr_in *)&local;
+            l4->sin_family = AF_INET;
+            l4->sin_port = htons(v->bound ? v->bind_port : 0);
+            if (v->bound && !v->bind_wildcard)
+                memcpy(&l4->sin_addr, v->bind_addr.b, 4);
+            llen = sizeof(*l4);
+        } else {
+            struct sockaddr_in6 *l6 = (struct sockaddr_in6 *)&local;
+            l6->sin6_family = AF_INET6;
+            l6->sin6_port = htons(v->bound ? v->bind_port : 0);
+            if (v->bound && !v->bind_wildcard)
+                memcpy(&l6->sin6_addr, v->bind_addr.b, 16);
+            llen = sizeof(*l6);
+        }
+        if (v->bound && bind(kfd, (struct sockaddr *)&local, llen) < 0) {
             int e = errno;
             close(kfd);
             errno = e;
@@ -528,7 +671,7 @@ int node_netstack_accept(int fd, struct sockaddr *sa, socklen_t *len)
         errno = EAGAIN;
         return -1;
     }
-    nv = vfd_alloc(AF_INET6, 0);
+    nv = vfd_alloc(v->domain, 0);
     if (!nv) {
         ns_close(ns_stack, id);
         errno = EMFILE;
@@ -567,12 +710,22 @@ int node_netstack_connect(int fd, const struct sockaddr *sa, socklen_t len)
     }
     if (sa_to_ns(sa, len, &remote, &rport, NULL) < 0)
         return -1;
+    if (ns_family(&remote) != v->domain) {
+        errno = EAFNOSUPPORT;
+        return -1;
+    }
 
     if (v->force || addr_managed(&remote)) {
+        const NsAddr *stack_local = ns_stack_local_family(
+            ns_stack, ns_addr_family(&remote));
+        if (!stack_local) {
+            errno = EAFNOSUPPORT;
+            return -1;
+        }
         if (v->bound && !v->bind_wildcard)
             local = v->bind_addr;
         else
-            local = *ns_stack_local(ns_stack);
+            local = *stack_local;
         lport = v->bound ? v->bind_port : 0;
         id = ns_connect_from(ns_stack, &local, lport, &remote, rport);
         if (!id) {

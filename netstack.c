@@ -2,6 +2,8 @@
  * netstack - an in-process TCP/IP stack with IPv6 shard dispatch.
  *
  * Prototype scope and the addressing model are described in docs/netstack.md.
+ * IPv4 and IPv6 share the TCP state machine; the IP header encode/decode and
+ * pseudo-header checksum are selected from the NsAddr family.
  */
 #include "netstack.h"
 
@@ -10,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define NS_IPV4_HDR 20
 #define NS_IPV6_HDR 40
 #define NS_TCP_HDR 20
 #define NS_MSS 1400
@@ -99,7 +102,11 @@ struct NsStack {
     NsListener listeners[NS_MAX_LISTENERS];
     int nlisteners;
     int plain;
-    NsAddr plain_addr;
+    NsAddr plain_addr4;
+    NsAddr plain_addr6;
+    int has_plain4;
+    int has_plain6;
+    uint16_t ip_id;
     uint64_t clock;
     uint32_t rnd;
     NsStats stats;
@@ -154,19 +161,34 @@ static uint16_t csum_fold(uint32_t sum)
 }
 
 static uint16_t tcp_checksum(const uint8_t *src, const uint8_t *dst,
-                             const uint8_t *tcp, size_t tcp_len)
+                             int family, const uint8_t *tcp, size_t tcp_len)
 {
-    uint8_t tail[4];
-    uint8_t next[4] = { 0, 0, 0, 6 };
     uint32_t sum = 0;
 
-    sum = csum_add(sum, src, 16);
-    sum = csum_add(sum, dst, 16);
-    wr32(tail, (uint32_t)tcp_len);
-    sum = csum_add(sum, tail, sizeof(tail));
-    sum = csum_add(sum, next, sizeof(next));
+    if (family == NS_AF_INET) {
+        uint8_t pseudo[12];
+        memcpy(pseudo, src, 4);
+        memcpy(pseudo + 4, dst, 4);
+        pseudo[8] = 0;
+        pseudo[9] = 6;
+        wr16(pseudo + 10, (uint16_t)tcp_len);
+        sum = csum_add(sum, pseudo, sizeof(pseudo));
+    } else {
+        uint8_t tail[4];
+        uint8_t next[4] = { 0, 0, 0, 6 };
+        sum = csum_add(sum, src, 16);
+        sum = csum_add(sum, dst, 16);
+        wr32(tail, (uint32_t)tcp_len);
+        sum = csum_add(sum, tail, sizeof(tail));
+        sum = csum_add(sum, next, sizeof(next));
+    }
     sum = csum_add(sum, tcp, tcp_len);
     return csum_fold(sum);
+}
+
+static uint16_t ipv4_checksum(const uint8_t *hdr, size_t len)
+{
+    return csum_fold(csum_add(0, hdr, len));
 }
 
 static int seq_lt(uint32_t a, uint32_t b)
@@ -186,6 +208,8 @@ static void shard_alloc_addr(NsShard *sh, NsAddr *out)
     uint64_t slot = sh->next_slot++;
     int i;
 
+    memset(out, 0, sizeof(*out));
+    out->family = NS_AF_INET6;
     memcpy(out->b, sh->stack->prefix, NS_PREFIX_LEN);
     out->b[8] = (uint8_t)sh->index;
     for (i = 0; i < 7; i++) {
@@ -195,30 +219,53 @@ static void shard_alloc_addr(NsShard *sh, NsAddr *out)
 
 void ns_addr_service(const NsStack *s, int shard, NsAddr *out)
 {
-    memset(out->b, 0, sizeof(out->b));
+    memset(out, 0, sizeof(*out));
+    out->family = NS_AF_INET6;
     memcpy(out->b, s->prefix, NS_PREFIX_LEN);
     out->b[8] = (uint8_t)shard;
 }
 
 int ns_addr_shard(const NsAddr *a)
 {
+    if (!a || a->family == NS_AF_INET)
+        return 0;
     return a->b[8];
+}
+
+int ns_addr_family(const NsAddr *a)
+{
+    if (!a || a->family == NS_AF_UNSPEC)
+        return NS_AF_INET6;
+    return a->family;
 }
 
 void ns_addr_format(const NsAddr *a, char out[64])
 {
+    int family = ns_addr_family(a);
+    if (!a) {
+        snprintf(out, 64, "<invalid>");
+        return;
+    }
+    if (family == NS_AF_INET) {
+        if (!inet_ntop(AF_INET, a->b, out, 64))
+            snprintf(out, 64, "<invalid>");
+        return;
+    }
     if (!inet_ntop(AF_INET6, a->b, out, 64))
         snprintf(out, 64, "<invalid>");
 }
 
 static int addr_eq(const NsAddr *a, const NsAddr *b)
 {
-    return memcmp(a->b, b->b, sizeof(a->b)) == 0;
+    return ns_addr_family(a) == ns_addr_family(b) &&
+           memcmp(a->b, b->b, sizeof(a->b)) == 0;
 }
 
 static int is_service_addr(const NsAddr *a)
 {
     int i;
+    if (ns_addr_family(a) != NS_AF_INET6)
+        return 0;
     for (i = 9; i < 16; i++)
         if (a->b[i] != 0)
             return 0;
@@ -297,12 +344,32 @@ void ns_stack_set_send(NsStack *s, NsLinkSendFn send, void *opaque)
 
 /* ---------------- plain mode ---------------- */
 
+static NsAddr *plain_slot(NsStack *s, int family)
+{
+    if (family == NS_AF_INET)
+        return &s->plain_addr4;
+    if (family == NS_AF_INET6)
+        return &s->plain_addr6;
+    return NULL;
+}
+
 int ns_stack_set_plain(NsStack *s, const NsAddr *local)
 {
+    NsAddr *slot;
+    int family = ns_addr_family(local);
+
     if (!s || !local)
         return -NS_EINVAL;
+    slot = plain_slot(s, family);
+    if (!slot)
+        return -NS_EINVAL;
     s->plain = 1;
-    s->plain_addr = *local;
+    *slot = *local;
+    slot->family = (uint8_t)family;
+    if (family == NS_AF_INET)
+        s->has_plain4 = 1;
+    else
+        s->has_plain6 = 1;
     return 0;
 }
 
@@ -311,21 +378,41 @@ int ns_stack_is_plain(const NsStack *s)
     return s ? s->plain : 0;
 }
 
+const NsAddr *ns_stack_local_family(const NsStack *s, int family)
+{
+    if (!s)
+        return NULL;
+    if (family == NS_AF_INET)
+        return s->has_plain4 ? &s->plain_addr4 : NULL;
+    if (family == NS_AF_INET6)
+        return s->has_plain6 ? &s->plain_addr6 : NULL;
+    return NULL;
+}
+
 const NsAddr *ns_stack_local(const NsStack *s)
 {
-    return s ? &s->plain_addr : NULL;
+    const NsAddr *a;
+    if (!s)
+        return NULL;
+    a = ns_stack_local_family(s, NS_AF_INET6);
+    return a ? a : ns_stack_local_family(s, NS_AF_INET);
 }
 
 /* ---------------- listeners ---------------- */
 
-static int listener_match(const NsListener *l, const NsAddr *dst,
-                          uint16_t port)
+static int listener_match(const NsStack *s, const NsListener *l,
+                          const NsAddr *dst, uint16_t port)
 {
     if (l->port != port)
         return 0;
-    if (!l->has_addr)
-        return is_service_addr(dst);
-    return addr_eq(&l->addr, dst);
+    if (l->has_addr)
+        return addr_eq(&l->addr, dst);
+    if (s->plain) {
+        const NsAddr *local =
+            ns_stack_local_family(s, ns_addr_family(dst));
+        return local && addr_eq(local, dst);
+    }
+    return is_service_addr(dst);
 }
 
 static int find_listener_at(const NsStack *s, const NsAddr *dst,
@@ -333,7 +420,7 @@ static int find_listener_at(const NsStack *s, const NsAddr *dst,
 {
     int i;
     for (i = 0; i < s->nlisteners; i++)
-        if (listener_match(&s->listeners[i], dst, port))
+        if (listener_match(s, &s->listeners[i], dst, port))
             return i;
     return -1;
 }
@@ -419,14 +506,26 @@ int ns_unlisten(NsStack *s, uint16_t port)
 
 int ns_listener_addr(const NsStack *s, uint16_t port, int shard, NsAddr *out)
 {
+    int i;
+
     if (!s || !out || shard < 0 || shard >= s->nshards)
         return -NS_EINVAL;
-    if (find_listener_port(s, port) < 0)
+    i = find_listener_port(s, port);
+    if (i < 0)
         return -NS_EINVAL;
-    if (s->plain)
-        *out = s->plain_addr;
-    else
+    if (s->plain) {
+        const NsAddr *local;
+        if (s->listeners[i].has_addr) {
+            *out = s->listeners[i].addr;
+            return 0;
+        }
+        local = ns_stack_local(s);
+        if (!local)
+            return -NS_EINVAL;
+        *out = *local;
+    } else {
         ns_addr_service(s, shard, out);
+    }
     return 0;
 }
 
@@ -531,20 +630,36 @@ static void ns_emit(NsConn *c, uint8_t flags, uint32_t seq, uint32_t ack,
     uint8_t pkt[NS_MAX_PACKET];
     uint8_t *tcp;
     size_t tcp_len = NS_TCP_HDR + plen;
-    size_t total = NS_IPV6_HDR + tcp_len;
+    int family = ns_addr_family(&c->local);
+    size_t ip_hdr = family == NS_AF_INET ? NS_IPV4_HDR : NS_IPV6_HDR;
+    size_t total = ip_hdr + tcp_len;
 
-    if (!s->send || total > sizeof(pkt))
+    if (!s->send || total > sizeof(pkt) ||
+        family != ns_addr_family(&c->remote))
         return;
 
-    memset(pkt, 0, NS_IPV6_HDR);
-    pkt[0] = 0x60;
-    wr16(pkt + 4, (uint16_t)tcp_len);
-    pkt[6] = 6;  /* TCP */
-    pkt[7] = 64; /* hop limit */
-    memcpy(pkt + 8, c->local.b, 16);
-    memcpy(pkt + 24, c->remote.b, 16);
+    if (family == NS_AF_INET) {
+        memset(pkt, 0, NS_IPV4_HDR);
+        pkt[0] = 0x45;
+        wr16(pkt + 2, (uint16_t)total);
+        wr16(pkt + 4, ++s->ip_id);
+        wr16(pkt + 6, 0x4000); /* DF */
+        pkt[8] = 64;           /* TTL */
+        pkt[9] = 6;            /* TCP */
+        memcpy(pkt + 12, c->local.b, 4);
+        memcpy(pkt + 16, c->remote.b, 4);
+        wr16(pkt + 10, ipv4_checksum(pkt, NS_IPV4_HDR));
+    } else {
+        memset(pkt, 0, NS_IPV6_HDR);
+        pkt[0] = 0x60;
+        wr16(pkt + 4, (uint16_t)tcp_len);
+        pkt[6] = 6;  /* TCP */
+        pkt[7] = 64; /* hop limit */
+        memcpy(pkt + 8, c->local.b, 16);
+        memcpy(pkt + 24, c->remote.b, 16);
+    }
 
-    tcp = pkt + NS_IPV6_HDR;
+    tcp = pkt + ip_hdr;
     wr16(tcp, c->lport);
     wr16(tcp + 2, c->rport);
     wr32(tcp + 4, seq);
@@ -556,7 +671,8 @@ static void ns_emit(NsConn *c, uint8_t flags, uint32_t seq, uint32_t ack,
     wr16(tcp + 18, 0);
     if (plen)
         memcpy(tcp + NS_TCP_HDR, payload, plen);
-    wr16(tcp + 16, tcp_checksum(c->local.b, c->remote.b, tcp, tcp_len));
+    wr16(tcp + 16, tcp_checksum(c->local.b, c->remote.b, family, tcp,
+                                tcp_len));
 
     s->stats.tx_packets++;
     s->send(s, pkt, total, s->opaque);
@@ -733,7 +849,7 @@ static NsConn *server_accept_syn(NsShard *sh, const NsAddr *src,
     NsConn *c = conn_new(sh, NS_SYN_RCVD);
     if (!c)
         return NULL;
-    if (s->plain)
+    if (s->plain || ns_addr_family(dst) == NS_AF_INET)
         c->local = *dst;
     else
         shard_alloc_addr(sh, &c->local);
@@ -752,10 +868,14 @@ static NsConn *server_accept_syn(NsShard *sh, const NsAddr *src,
 static void shard_process(NsShard *sh, NsPacket *p)
 {
     const uint8_t *pkt = p->data;
-    const uint8_t *src = pkt + 8;
-    const uint8_t *dst = pkt + 24;
-    const uint8_t *tcp = pkt + NS_IPV6_HDR;
-    uint16_t tcp_len = (uint16_t)(p->len - NS_IPV6_HDR);
+    int family = (pkt[0] >> 4) == 4 ? NS_AF_INET : NS_AF_INET6;
+    size_t ip_hdr = family == NS_AF_INET
+                        ? (size_t)(pkt[0] & 0x0f) * 4 : NS_IPV6_HDR;
+    const uint8_t *src = family == NS_AF_INET ? pkt + 12 : pkt + 8;
+    const uint8_t *dst = family == NS_AF_INET ? pkt + 16 : pkt + 24;
+    size_t addr_len = family == NS_AF_INET ? 4 : 16;
+    const uint8_t *tcp = pkt + ip_hdr;
+    uint16_t tcp_len = (uint16_t)(p->len - ip_hdr);
     size_t off = (size_t)(tcp[12] >> 4) * 4;
     const uint8_t *payload = tcp + off;
     size_t plen = tcp_len - off;
@@ -769,8 +889,11 @@ static void shard_process(NsShard *sh, NsPacket *p)
     uint64_t now = s->clock;
     NsConn *c;
 
-    memcpy(sa.b, src, 16);
-    memcpy(da.b, dst, 16);
+    memset(&sa, 0, sizeof(sa));
+    memset(&da, 0, sizeof(da));
+    sa.family = da.family = (uint8_t)family;
+    memcpy(sa.b, src, addr_len);
+    memcpy(da.b, dst, addr_len);
 
     c = conn_find(sh, &da, dport, &sa, sport);
     if (!c && (flags & NS_TCP_SYN) && !(flags & NS_TCP_ACK)) {
@@ -841,35 +964,82 @@ void ns_input(NsStack *s, const uint8_t *pkt, size_t len)
     NsShard *sh;
     NsPacket *p;
     int shard;
+    int family;
+    size_t ip_hdr;
+    const uint8_t *src;
+    const uint8_t *dst;
+    const uint8_t *tcp;
+    size_t tcp_len;
+    size_t off;
 
-    if (!s) {
+    if (!s || len < 1) {
         return;
     }
     s->stats.rx_packets++;
 
-    if (len < NS_IPV6_HDR + NS_TCP_HDR || (pkt[0] >> 4) != 6 ||
-        pkt[6] != 6) {
-        s->stats.dropped++;
-        return;
-    }
-    int body = rd16(pkt + 4);
-    if (body < NS_TCP_HDR || (size_t)body + NS_IPV6_HDR > len) {
-        s->stats.dropped++;
-        return;
-    }
-    len = (size_t)body + NS_IPV6_HDR;
+    family = (pkt[0] >> 4) == 4 ? NS_AF_INET : NS_AF_INET6;
+    if (family == NS_AF_INET) {
+        uint16_t frag;
 
-    shard = s->plain ? 0 : pkt[24 + 8];
-    if (shard < 0 || shard >= s->nshards) {
+        if (len < NS_IPV4_HDR || pkt[0] == 0 || pkt[9] != 6) {
+            s->stats.dropped++;
+            return;
+        }
+        ip_hdr = (size_t)(pkt[0] & 0x0f) * 4;
+        if (ip_hdr < NS_IPV4_HDR || ip_hdr > len) {
+            s->stats.dropped++;
+            return;
+        }
+        if (rd16(pkt + 2) < ip_hdr || rd16(pkt + 2) > len) {
+            s->stats.dropped++;
+            return;
+        }
+        len = rd16(pkt + 2);
+        /* Reassembly is not implemented; DF is fine, MF and fragments
+           are not. */
+        frag = rd16(pkt + 6);
+        if (frag & 0x3fff) {
+            s->stats.dropped++;
+            return;
+        }
+        if (ipv4_checksum(pkt, ip_hdr) != 0) {
+            s->stats.dropped++;
+            return;
+        }
+        src = pkt + 12;
+        dst = pkt + 16;
+        tcp = pkt + ip_hdr;
+        tcp_len = len - ip_hdr;
+        /* IPv4 has no shard byte. The node integration always uses a
+           plain stack; route every IPv4 packet to shard 0. */
+        shard = 0;
+    } else {
+        if (len < NS_IPV6_HDR + NS_TCP_HDR || (pkt[0] >> 4) != 6 ||
+            pkt[6] != 6) {
+            s->stats.dropped++;
+            return;
+        }
+        int body = rd16(pkt + 4);
+        if (body < NS_TCP_HDR || (size_t)body + NS_IPV6_HDR > len) {
+            s->stats.dropped++;
+            return;
+        }
+        len = (size_t)body + NS_IPV6_HDR;
+        ip_hdr = NS_IPV6_HDR;
+        src = pkt + 8;
+        dst = pkt + 24;
+        tcp = pkt + NS_IPV6_HDR;
+        tcp_len = len - NS_IPV6_HDR;
+        shard = s->plain ? 0 : pkt[24 + 8];
+    }
+
+    if (shard < 0 || shard >= s->nshards || tcp_len < NS_TCP_HDR) {
         s->stats.dropped++;
         return;
     }
-
-    const uint8_t *tcp = pkt + NS_IPV6_HDR;
-    size_t tcp_len = len - NS_IPV6_HDR;
-    size_t off = (size_t)(tcp[12] >> 4) * 4;
+    off = (size_t)(tcp[12] >> 4) * 4;
     if (off < NS_TCP_HDR || off > tcp_len ||
-        tcp_checksum(pkt + 8, pkt + 24, tcp, tcp_len) != 0) {
+        tcp_checksum(src, dst, family, tcp, tcp_len) != 0) {
         s->stats.dropped++;
         return;
     }
@@ -959,14 +1129,29 @@ static uint64_t conn_connect(NsStack *s, NsShard *sh, const NsAddr *local,
                              uint16_t local_port, const NsAddr *remote,
                              uint16_t remote_port)
 {
-    NsConn *c = conn_new(sh, NS_SYN_SENT);
+    NsConn *c;
+    int family = ns_addr_family(remote);
+
+    if (local && ns_addr_family(local) != family)
+        return 0;
+    if (!local && family == NS_AF_INET &&
+        !ns_stack_local_family(s, NS_AF_INET))
+        return 0;
+    c = conn_new(sh, NS_SYN_SENT);
     if (!c)
         return 0;
     c->remote = *remote;
-    if (local)
+    c->remote.family = (uint8_t)family;
+    if (local) {
         c->local = *local;
-    else
+        c->local.family = (uint8_t)family;
+    } else if (family == NS_AF_INET) {
+        c->local = *ns_stack_local_family(s, NS_AF_INET);
+    } else if (s->plain && ns_stack_local_family(s, NS_AF_INET6)) {
+        c->local = *ns_stack_local_family(s, NS_AF_INET6);
+    } else {
         shard_alloc_addr(sh, &c->local);
+    }
     c->lport = local_port ? local_port : sh->next_port++;
     c->rport = remote_port;
     c->iss = ns_rand(s);
@@ -980,14 +1165,28 @@ static uint64_t conn_connect(NsStack *s, NsShard *sh, const NsAddr *local,
 uint64_t ns_connect(NsStack *s, int local_shard, const NsAddr *service,
                     uint16_t port, uint16_t local_port)
 {
+    const NsAddr *local = NULL;
+    NsShard *sh;
+
     if (!s || !service || port == 0 || local_shard < 0 ||
         local_shard >= s->nshards)
         return 0;
+
+    if (ns_addr_family(service) == NS_AF_INET) {
+        /* IPv4 is plain-only: there is no shard byte, so the connection
+           must live on shard 0. */
+        local = ns_stack_local_family(s, NS_AF_INET);
+        if (!s->plain || !local)
+            return 0;
+        return conn_connect(s, &s->shards[0], local, local_port, service,
+                            port);
+    }
     if (ns_addr_shard(service) >= s->nshards)
         return 0;
-    return conn_connect(s, &s->shards[local_shard],
-                        s->plain ? &s->plain_addr : NULL, local_port,
-                        service, port);
+    sh = &s->shards[local_shard];
+    if (s->plain)
+        local = ns_stack_local_family(s, NS_AF_INET6);
+    return conn_connect(s, sh, local, local_port, service, port);
 }
 
 uint64_t ns_connect_from(NsStack *s, const NsAddr *local, uint16_t local_port,

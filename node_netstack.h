@@ -1,11 +1,12 @@
 /*
  * node_netstack - node:net <-> netstack bridge.
  *
- * AF_INET6 stream sockets are handed out as virtual descriptors: a real
- * eventfd that the libev event loop can poll, with the socket state held by
- * the in-process netstack. Addresses inside the stack's prefix stay on the
- * owned TCP engine; any other address is transparently converted to a
- * kernel socket at bind/connect time so existing workloads keep working.
+ * AF_INET and AF_INET6 stream sockets are handed out as virtual descriptors:
+ * a real eventfd that the libev event loop can poll, with the socket state
+ * held by the in-process netstack. Addresses inside the stack's managed
+ * prefixes stay on the owned TCP engine; any other address is transparently
+ * converted to a kernel socket at bind/connect time so existing workloads
+ * keep working.
  */
 #ifndef NODE_NETSTACK_H
 #define NODE_NETSTACK_H
@@ -47,8 +48,9 @@ int node_netstack_tick(void);
 /* Real fd to poll for TUN input, or -1 for the loopback link. */
 int node_netstack_link_fd(void);
 
-/* Fill in diagnostics: enabled, address, link name. Returns 0 when the
-   stack is ready. */
-int node_netstack_info(char *addr, size_t addrlen, const char **link);
+/* Fill in diagnostics: enabled, IPv6 address, IPv4 address, link name.
+   Returns 0 when the stack is ready. */
+int node_netstack_info(char *addr, size_t addrlen, char *addr4, size_t addr4len,
+                       const char **link);
 
 #endif /* NODE_NETSTACK_H */

@@ -24,17 +24,28 @@ trap 'rm -rf "$tmp"' EXIT
 
 cat >"$tmp/server.js" <<'EOF'
 const net = require("net");
-const s = net.createServer({ netstack: true }, (sock) => {
+const echo = (sock) => {
   sock.on("data", (d) => sock.write(d));
   sock.on("end", () => sock.end());
-});
-s.listen({ port: 7000, host: net.netstackAddress(), netstack: true },
-         () => console.log("READY " + net.netstackAddress()));
-s.on("error", (e) => { console.error(e); process.exit(1); });
+};
+const s6 = net.createServer({ netstack: true }, echo);
+const s4 = net.createServer({ netstack: true }, echo);
+let ready = 0;
+function announce() {
+  if (++ready === 2)
+    console.log("READY " + net.netstackAddress() + " " +
+                net.netstackAddress(4));
+}
+s6.listen({ port: 7000, host: net.netstackAddress(), netstack: true },
+          announce);
+s4.listen({ port: 7001, host: net.netstackAddress(4), netstack: true,
+            family: 4 }, announce);
+s6.on("error", (e) => { console.error(e); process.exit(1); });
+s4.on("error", (e) => { console.error(e); process.exit(1); });
 setTimeout(() => process.exit(3), 15000);
 EOF
 
-cat >"$tmp/client.js" <<'EOF'
+cat >"$tmp/client6.js" <<'EOF'
 const net = require("net");
 const c = net.connect({
   host: "fd00:dead:beef:99::1",
@@ -51,6 +62,23 @@ c.on("error", () => process.exit(1));
 setTimeout(() => process.exit(2), 10000);
 EOF
 
+cat >"$tmp/client4.js" <<'EOF'
+const net = require("net");
+const c = net.connect({
+  host: "10.254.0.1",
+  port: 7001,
+  family: 4,
+  localAddress: "10.254.0.2",
+  netstack: false,
+});
+let got = "";
+c.on("connect", () => c.end("tun-v4"));
+c.on("data", (d) => { got += d; });
+c.on("end", () => process.exit(got === "tun-v4" ? 0 : 4));
+c.on("error", () => process.exit(1));
+setTimeout(() => process.exit(2), 10000);
+EOF
+
 QNODE=$(cd "$(dirname "$QNODE")" && pwd)/$(basename "$QNODE")
 export QNODE
 set +e
@@ -59,6 +87,7 @@ unshare -rn sh -c '
   ip tuntap add dev qn0 mode tun || exit 125
   ip link set qn0 up
   ip -6 addr add fd00:dead:beef:99::2/64 dev qn0 nodad
+  ip addr add 10.254.0.2/16 dev qn0
 
   QNODE_NETSTACK_TUN=1 QNODE_NETSTACK_TUN_NAME=qn0 \
     "$QNODE" "$1/server.js" >"$1/server.out" 2>&1 &
@@ -69,11 +98,14 @@ unshare -rn sh -c '
   done
   grep -q READY "$1/server.out" || { cat "$1/server.out"; kill $spid 2>/dev/null; exit 1; }
 
-  "$QNODE" "$1/client.js"
-  rc=$?
+  "$QNODE" "$1/client6.js"
+  rc6=$?
+  "$QNODE" "$1/client4.js"
+  rc4=$?
   kill $spid 2>/dev/null
   wait $spid 2>/dev/null
-  exit $rc
+  [ "$rc6" -ne 0 ] && exit $rc6
+  exit $rc4
 ' sh "$tmp"
 rc=$?
 set -e

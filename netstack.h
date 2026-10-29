@@ -1,7 +1,9 @@
 /*
  * netstack - an in-process TCP/IP stack with IPv6 shard dispatch.
  *
- * See docs/netstack.md for the addressing and dispatch model.
+ * IPv4 uses the same TCP engine in plain mode; IPv6 additionally supports the
+ * sharded service addresses. See docs/netstack.md for the addressing and
+ * dispatch model.
  */
 #ifndef NETSTACK_H
 #define NETSTACK_H
@@ -18,8 +20,19 @@
 
 typedef struct NsStack NsStack;
 
+/* Address families used by NsAddr. The stack deliberately does not depend on
+   the host socket headers; the bridge maps AF_INET/AF_INET6 to these. */
+enum {
+    NS_AF_UNSPEC = 0,
+    NS_AF_INET = 2,
+    NS_AF_INET6 = 10,
+};
+
+/* IPv4 addresses occupy b[0..3]; the remaining bytes are zero. IPv6 uses all
+   16 bytes. Comparisons include the family. */
 typedef struct NsAddr {
     uint8_t b[NS_ADDR_LEN];
+    uint8_t family;
 } NsAddr;
 
 enum {
@@ -80,6 +93,10 @@ int ns_stack_set_plain(NsStack *s, const NsAddr *local);
 int ns_stack_is_plain(const NsStack *s);
 const NsAddr *ns_stack_local(const NsStack *s);
 
+/* The plain address for one family, or NULL when that family has no address.
+   A plain stack may own an IPv4 address, an IPv6 address, or both. */
+const NsAddr *ns_stack_local_family(const NsStack *s, int family);
+
 /* Bind a listener to an explicit address. ns_listen() keeps its original
    service-address behaviour for the sharded model. Passing a NULL address
    is equivalent to ns_listen(). */
@@ -91,6 +108,7 @@ int ns_unlisten(NsStack *s, uint16_t port);
 
 void ns_addr_service(const NsStack *s, int shard, NsAddr *out);
 int ns_addr_shard(const NsAddr *a);
+int ns_addr_family(const NsAddr *a);
 void ns_addr_format(const NsAddr *a, char out[64]);
 
 int ns_listen(NsStack *s, uint16_t port);

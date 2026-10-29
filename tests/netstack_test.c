@@ -78,6 +78,35 @@ static void make_pair(Link *l, int nshards)
     CHECK(l->b != NULL);
 }
 
+static void set_addr4(NsAddr *a, uint8_t b0, uint8_t b1, uint8_t b2,
+                      uint8_t b3)
+{
+    memset(a, 0, sizeof(*a));
+    a->family = NS_AF_INET;
+    a->b[0] = b0;
+    a->b[1] = b1;
+    a->b[2] = b2;
+    a->b[3] = b3;
+}
+
+/* Two plain-mode stacks with stable IPv4 addresses, mirroring how the
+   node bridge configures the engine. */
+static void make_plain_pair(Link *l, NsAddr *local_a, NsAddr *local_b)
+{
+    memset(l, 0, sizeof(*l));
+    l->now = 1000;
+    l->a = ns_stack_new(prefix, 1, link_send, l);
+    l->b = ns_stack_new(prefix, 1, link_send, l);
+    CHECK(l->a != NULL);
+    CHECK(l->b != NULL);
+    set_addr4(local_a, 10, 254, 0, 1);
+    set_addr4(local_b, 10, 254, 0, 2);
+    CHECK(ns_stack_set_plain(l->a, local_a) == 0);
+    CHECK(ns_stack_set_plain(l->b, local_b) == 0);
+    CHECK(ns_stack_local_family(l->a, NS_AF_INET) != NULL);
+    CHECK(ns_stack_local_family(l->a, NS_AF_INET6) == NULL);
+}
+
 static void free_pair(Link *l)
 {
     ns_stack_free(l->a);
@@ -452,6 +481,75 @@ static void test_listener_validation(void)
     free_pair(&l);
 }
 
+static void test_ipv4_plain(void)
+{
+    Link l;
+    NsAddr local_a, local_b;
+    NsAddr conn_local, conn_remote;
+    uint16_t lport = 0, rport = 0;
+    uint64_t cid, sid;
+    char buf[32];
+    char text[64];
+    int n;
+
+    make_plain_pair(&l, &local_a, &local_b);
+    CHECK(ns_stack_is_plain(l.a));
+    CHECK(ns_listen_addr(l.b, &local_b, 8080) == 0);
+
+    cid = ns_connect_from(l.a, &local_a, 40000, &local_b, 8080);
+    CHECK(cid != 0);
+    pump(&l, 20);
+    CHECK(ns_conn_state(l.a, cid) == NS_ESTABLISHED);
+    CHECK(ns_accept_port(l.b, 8080, &sid) == 0);
+    CHECK(ns_conn_state(l.b, sid) == NS_ESTABLISHED);
+
+    CHECK(ns_conn_addr(l.a, cid, &conn_local, &lport,
+                       &conn_remote, &rport) == 0);
+    CHECK(conn_local.family == NS_AF_INET);
+    CHECK(conn_local.b[0] == 10 && conn_local.b[3] == 1);
+    CHECK(conn_remote.family == NS_AF_INET);
+    CHECK(conn_remote.b[0] == 10 && conn_remote.b[3] == 2);
+    CHECK(lport == 40000 && rport == 8080);
+    ns_addr_format(&conn_remote, text);
+    CHECK(strcmp(text, "10.254.0.2") == 0);
+
+    CHECK(ns_send(l.a, cid, "v4 hello", 8) == 8);
+    pump(&l, 10);
+    memset(buf, 0, sizeof(buf));
+    n = ns_recv(l.b, sid, buf, sizeof(buf));
+    CHECK(n == 8);
+    CHECK(memcmp(buf, "v4 hello", 8) == 0);
+
+    CHECK(ns_send(l.b, sid, "v4 world", 8) == 8);
+    pump(&l, 10);
+    memset(buf, 0, sizeof(buf));
+    n = ns_recv(l.a, cid, buf, sizeof(buf));
+    CHECK(n == 8);
+    CHECK(memcmp(buf, "v4 world", 8) == 0);
+
+    ns_close(l.a, cid);
+    pump(&l, 20);
+    CHECK(ns_conn_peer_closed(l.b, sid) == 1);
+    ns_close(l.b, sid);
+    pump(&l, 20);
+
+    /* ns_connect() uses the stack's stable IPv4 address as the source. */
+    cid = ns_connect(l.a, 0, &local_b, 8080, 40001);
+    CHECK(cid != 0);
+    pump(&l, 20);
+    CHECK(ns_conn_state(l.a, cid) == NS_ESTABLISHED);
+    CHECK(ns_accept_port(l.b, 8080, &sid) == 0);
+    CHECK(ns_conn_addr(l.a, cid, &conn_local, NULL, NULL, NULL) == 0);
+    CHECK(conn_local.family == NS_AF_INET);
+    CHECK(conn_local.b[0] == 10 && conn_local.b[3] == 1);
+    ns_close(l.a, cid);
+    pump(&l, 10);
+    ns_close(l.b, sid);
+    pump(&l, 10);
+
+    free_pair(&l);
+}
+
 int main(void)
 {
     test_addressing();
@@ -463,6 +561,7 @@ int main(void)
     test_unique_connection_addresses();
     test_interleaved_dispatch();
     test_listener_validation();
+    test_ipv4_plain();
 
     if (failures) {
         fprintf(stderr, "netstack: %d check(s) failed\n", failures);
