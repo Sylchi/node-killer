@@ -14,10 +14,6 @@
 #include <unistd.h>
 #include <pthread.h>
 
-#ifdef __linux__
-#include <sys/eventfd.h>
-#endif
-
 #include "netstack.h"
 #include "netstack_link.h"
 #include "netstack_util.h"
@@ -513,15 +509,17 @@ int node_netstack_is_vfd(int fd)
 static Vfd *vfd_alloc_locked(int domain, int type, int force)
 {
     int i;
+    int fds[2];
     int fd;
     Vfd *v = NULL;
-#ifdef __linux__
-    fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-#else
-    fd = -1;
-#endif
-    if (fd < 0)
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, fds) < 0)
         return NULL;
+    fcntl(fds[0], F_SETFL, O_NONBLOCK);
+    fcntl(fds[0], F_SETFD, FD_CLOEXEC);
+    fcntl(fds[1], F_SETFL, O_NONBLOCK);
+    fcntl(fds[1], F_SETFD, FD_CLOEXEC);
+    fd = fds[0];
+    close(fds[1]);
     for (i = 0; i < VFD_MAX; i++) {
         if (vfds[i].kind == VFD_FREE) {
             v = &vfds[i];
