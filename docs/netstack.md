@@ -1,7 +1,9 @@
 # qnode netstack: an owned TCP/IP stack with IPv6 shard dispatch
 
-Status: prototype. The code lives in `netstack.c` / `netstack.h` and is not yet
-wired into `node:net`; the existing OS-socket path is unchanged.
+Status: prototype, opt-in R&D. The code lives in `netstack.c` / `netstack.h`
+and is not wired into `node:net`. The supported sharded transport is the
+kernel TCP path described in `docs/sharded-net.md`; the existing OS-socket
+path remains the default.
 
 ## Motivation
 

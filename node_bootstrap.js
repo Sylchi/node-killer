@@ -28,7 +28,8 @@ const ERRNO_NAME = {
   32: "EPIPE", 33: "EDOM", 34: "ERANGE", 36: "ENAMETOOLONG", 38: "ENOSYS",
   39: "ENOTEMPTY", 40: "ELOOP", 75: "EOVERFLOW", 88: "ENOTSOCK",
   89: "EDESTADDRREQ", 91: "EPROTOTYPE", 92: "ENOPROTOOPT",
-  95: "EOPNOTSUPP", 97: "EAFNOSUPPORT", 98: "EADDRINUSE",
+  93: "EPROTONOSUPPORT", 95: "EOPNOTSUPP", 97: "EAFNOSUPPORT",
+  98: "EADDRINUSE",
   99: "EADDRNOTAVAIL", 100: "ENETDOWN", 101: "ENETUNREACH",
   102: "ENETRESET", 103: "ECONNABORTED", 104: "ECONNRESET",
   105: "ENOBUFS", 106: "EISCONN", 107: "ENOTCONN", 108: "ESHUTDOWN",
@@ -66,6 +67,7 @@ const ERRNO_MESSAGE = {
   ENOTEMPTY: "directory not empty",
   ELOOP: "too many symbolic links encountered",
   ENOTSOCK: "socket operation on non-socket",
+  EPROTONOSUPPORT: "protocol not supported",
   EADDRINUSE: "address already in use",
   EADDRNOTAVAIL: "address not available",
   ENETDOWN: "network is down",
@@ -1650,7 +1652,13 @@ class Readable extends Stream {
       this.readable = false;
       this.readableEnded = true;
       this.emit("end");
-      this.emit("close");
+      /* Sockets close when their descriptor is released, not when the
+         readable side ends: allowHalfOpen and pending writes still have work
+         to do. */
+      if (this._emitCloseOnEnd !== false && !this._closeEmitted) {
+        this._closeEmitted = true;
+        this.emit("close");
+      }
     }
   }
 
@@ -4089,6 +4097,24 @@ function loadCJS(filename, parent) {
 
 const kSocketFd = Symbol("fd");
 
+/* Address of slot 0 on a shard. The low 64 bits of the subnet are reserved
+   for the shard byte and the per-connection slot. */
+function shardAddress(subnet, shard) {
+  const n = shard === undefined ? 0 : Number(shard);
+  if (!Number.isInteger(n))
+    throw new RangeError("shard must be an integer");
+  return native.shardAddress(String(subnet), n);
+}
+
+/* Byte 8 of an IPv6 address, or -1 when the address is not IPv6. */
+function shardIndex(address) {
+  return native.shardIndex(String(address));
+}
+
+function isIpLiteral(host) {
+  return /^[0-9.]+$/.test(host) || host.indexOf(":") >= 0;
+}
+
 function normalizeConnectArgs(args) {
   let options = {};
   let cb;
@@ -4129,6 +4155,7 @@ class Socket extends Duplex {
     this._wqActive = false;
     this._endFinish = null;
     this._ref = true;
+    this._emitCloseOnEnd = false;
     this.remoteAddress = undefined;
     this.remotePort = undefined;
     this.localAddress = undefined;
@@ -4188,7 +4215,21 @@ class Socket extends Duplex {
          cache instead of paying for getaddrinfo on every socket. */
       let host = options.host || "127.0.0.1";
       let family = options.family === 6 ? 6 : 4;
-      if (!/^[0-9.]+$/.test(host) && host.indexOf(":") < 0) {
+      if (options.shard !== undefined || options.subnet !== undefined) {
+        try {
+          const subnet = options.subnet !== undefined
+            ? options.subnet : options.host;
+          host = shardAddress(subnet, options.shard);
+          family = 6;
+        } catch (e) {
+          self.destroy(e);
+          return;
+        }
+      }
+      if (options.localAddress !== undefined &&
+          String(options.localAddress).indexOf(":") >= 0)
+        family = 6;
+      if (!isIpLiteral(host)) {
         const r = dnsCached(host);
         const list = (r && !r[1] && r[0]) || [];
         const addr = list.find((a) => (family === 6
@@ -4200,6 +4241,10 @@ class Socket extends Duplex {
         host = addr.address;
         family = addr.family === C.AF_INET6 ? 6 : 4;
       }
+      if (options.family !== 4 && host.indexOf(":") >= 0)
+        family = 6;
+      if (family === 6 && /^[0-9.]+$/.test(host))
+        host = "::ffff:" + host;
       const r = native.socket(family === 6 ? C.AF_INET6 : C.AF_INET,
                               C.SOCK_STREAM, 0);
       if (r[1]) {
@@ -4207,6 +4252,23 @@ class Socket extends Duplex {
         return;
       }
       self._fd = r[0];
+      if (options.localAddress !== undefined) {
+        const local = String(options.localAddress);
+        const localFamily = local.indexOf(":") >= 0 ? 6 : 4;
+        if (localFamily !== family) {
+          self.destroy(sysError(C.EINVAL, "bind", local));
+          return;
+        }
+        if (family === 6 && options.freeBind &&
+            C.IPV6_FREEBIND !== undefined)
+          native.setsockopt(self._fd, C.IPPROTO_IPV6, C.IPV6_FREEBIND, 1);
+        const berr = native.bind(self._fd, local,
+                                 Number(options.localPort) || 0);
+        if (berr) {
+          self.destroy(sysError(berr, "bind", local));
+          return;
+        }
+      }
       if (options.noDelay !== false)
         self.setNoDelay(true);
       const err = native.connect(self._fd, host, options.port);
@@ -4279,8 +4341,10 @@ class Socket extends Duplex {
       this.readable = false;
       qjsos.setReadHandler(this._fd, null);
       this.push(null);
-      if (!this.allowHalfOpen)
+      if (!this.allowHalfOpen && !this._ending)
         this.end();
+      else
+        this._maybeClose();
       return;
     }
     this.bytesRead += buf.length;
@@ -4363,6 +4427,15 @@ class Socket extends Duplex {
 
   end(data, encoding, cb) {
     if (typeof data === "function") { cb = data; data = undefined; }
+    if (this.destroyed)
+      return this;
+    if (this._ending) {
+      if (data !== undefined && data !== null)
+        this.write(data, encoding);
+      if (cb)
+        this.once("finish", cb);
+      return this;
+    }
     const self = this;
     if (data !== undefined && data !== null)
       this.write(data, encoding);
@@ -4375,10 +4448,9 @@ class Socket extends Duplex {
       if (cb)
         self.once("finish", cb);
       self.emit("finish");
-      if (self.allowHalfOpen)
-        self._maybeClose();
-      else
-        self.destroySoon();
+      /* Sending FIN only closes the write side. Keep the socket readable
+         until the peer's FIN arrives, unless it already has. */
+      self._maybeClose();
     };
     this._endFinish = finish;
     this._maybeFinishEnd();
@@ -4411,7 +4483,10 @@ class Socket extends Duplex {
     }
     if (this._destroyTimer)
       clearTimeout(this._destroyTimer);
-    this.emit("close", !!err);
+    if (!this._closeEmitted) {
+      this._closeEmitted = true;
+      this.emit("close", !!err);
+    }
     if (err && this.listenerCount("error"))
       this.emit("error", err);
     else if (err && !this.listenerCount("error"))
@@ -4455,6 +4530,10 @@ class Server extends EventEmitter {
     this._connections = 0;
     this._sockets = new Set();
     this._fd = undefined;
+    this._listeners = [];
+    this.sharded = false;
+    this.shardCount = 0;
+    this.fallbackReason = null;
   }
 
   listen(...args) {
@@ -4484,50 +4563,189 @@ class Server extends EventEmitter {
     if (cb)
       this.once("listening", cb);
 
-    const r = native.socket(options.family === 6 ? C.AF_INET6 : C.AF_INET,
-                            C.SOCK_STREAM, 0);
-    if (r[1])
-      throw sysError(r[1], "socket");
-    const fd = this._fd = r[0];
+    const shards = options.shards === undefined ? 1 : Number(options.shards);
+    if (!Number.isInteger(shards) || shards < 1)
+      return this._fail(new RangeError("shards must be a positive integer"));
+    /* A subnet implies shard addressing even when only one listener is
+       requested; otherwise the option would be silently ignored. */
+    if (shards > 1 || options.subnet !== undefined)
+      return this._listenSharded(options, shards);
+    return this._listenSingle(options);
+  }
+
+  _fail(err) {
+    queueMicrotask(() => this.emit("error", err));
+    return this;
+  }
+
+  _configureListener(fd, options, sharded) {
     native.setsockopt(fd, C.SOL_SOCKET, C.SO_REUSEADDR, 1);
+    if (sharded) {
+      /* A shard address is specific, but V6ONLY keeps a wildcard fallback
+         from shadowing it and FREEBIND lets a routed /64 be used without
+         assigning every address to the interface first. */
+      if (C.IPV6_V6ONLY !== undefined)
+        native.setsockopt(fd, C.IPPROTO_IPV6, C.IPV6_V6ONLY, 1);
+      if (options.freeBind && C.IPV6_FREEBIND !== undefined)
+        native.setsockopt(fd, C.IPPROTO_IPV6, C.IPV6_FREEBIND, 1);
+    }
     /* reusePort lets several processes share one listening port; the kernel
        spreads incoming connections between them. */
     if (options.reusePort)
       native.setsockopt(fd, C.SOL_SOCKET, C.SO_REUSEPORT, 1);
-    if (options.port !== undefined) {
-      const err = native.bind(fd, options.host || "0.0.0.0",
-                              Number(options.port));
-      if (err) {
-        native.close(fd);
-        this._fd = undefined;
-        const e = sysError(err, "bind", options.host);
-        queueMicrotask(() => this.emit("error", e));
-        return this;
-      }
+  }
+
+  _bindAndListen(fd, host, port, options) {
+    if (port !== undefined && port !== null) {
+      const err = native.bind(fd, host, Number(port));
+      if (err)
+        return { err, syscall: "bind" };
     }
-    if (native.listen(fd, options.backlog || 511)) {
-      const err = native.listen(fd, 0);
-      native.close(fd);
-      this._fd = undefined;
-      queueMicrotask(() => this.emit("error", sysError(err, "listen")));
-      return this;
-    }
-    const name = native.getsockname(fd);
-    if (!name[1]) {
-      this._address = name[0][0];
-      this._port = name[0][2];
-      this._family = name[0][1] === C.AF_INET6 ? "IPv6" : "IPv4";
-    }
+    const err = native.listen(fd, options.backlog || 511);
+    if (err)
+      return { err, syscall: "listen" };
+    return null;
+  }
+
+  _registerListeners(listeners, sharded, count, fallbackReason) {
+    this._listeners = listeners;
+    this._fd = listeners[0].fd;
+    this._address = listeners[0].address;
+    this._port = listeners[0].port;
+    this._family = listeners[0].family;
+    this.sharded = sharded;
+    this.shardCount = sharded ? count : 0;
+    this.fallbackReason = fallbackReason || null;
     this.listening = true;
     this._attached = true;
-    qjsos.setReadHandler(fd, () => this._onConnection());
-    queueMicrotask(() => this.emit("listening"));
+    for (const l of listeners)
+      qjsos.setReadHandler(l.fd, () => this._onConnection(l));
+    queueMicrotask(() => {
+      this.emit("listening");
+      if (fallbackReason)
+        this.emit("shardedFallback", fallbackReason);
+    });
+  }
+
+  _listenSingle(options, fallbackReason) {
+    const want6 = options.family === 6 ||
+      (typeof options.host === "string" && options.host.indexOf(":") >= 0);
+    const r = native.socket(want6 ? C.AF_INET6 : C.AF_INET,
+                            C.SOCK_STREAM, 0);
+    if (r[1])
+      throw sysError(r[1], "socket");
+    const fd = r[0];
+    this._configureListener(fd, options, false);
+    const err = this._bindAndListen(fd, options.host || "0.0.0.0",
+                                    options.port, options);
+    if (err) {
+      native.close(fd);
+      this._fd = undefined;
+      return this._fail(sysError(err.err, err.syscall, options.host));
+    }
+    const name = native.getsockname(fd);
+    const listener = { fd, shard: undefined, address: undefined, port: 0,
+                       family: "IPv4" };
+    if (!name[1]) {
+      listener.address = name[0][0];
+      listener.port = name[0][2];
+      listener.family = name[0][1] === C.AF_INET6 ? "IPv6" : "IPv4";
+    }
+    this._registerListeners([listener], false, 0, fallbackReason);
     return this;
   }
 
-  _onConnection() {
-    for (;;) {
-      const r = native.accept(this._fd);
+  _isShardFallbackError(err) {
+    const code = err && err.code;
+    return code === "EADDRNOTAVAIL" || code === "EAFNOSUPPORT" ||
+           code === "EPROTONOSUPPORT" || code === "EINVAL" ||
+           code === "ENODEV";
+  }
+
+  _listenFallback(options, reason) {
+    let host = options.fallbackHost;
+    if (host === undefined)
+      host = reason && reason.code === "EAFNOSUPPORT" ? "0.0.0.0" : "::";
+    const o = Object.assign({}, options, {
+      host, subnet: undefined, shards: undefined, fallback: false,
+    });
+    if (typeof host !== "string" || host.indexOf(":") < 0) {
+      o.family = 4;
+      if (o.host === undefined || o.host === "::")
+        o.host = "0.0.0.0";
+    }
+    return this._listenSingle(o, reason);
+  }
+
+  _listenSharded(options, count) {
+    if (count > 256)
+      return this._fail(new RangeError("shards must be at most 256"));
+    const subnet = options.subnet !== undefined ? options.subnet : options.host;
+    if (typeof subnet !== "string" || subnet.indexOf(":") < 0)
+      return this._fail(new TypeError(
+        "sharded listen requires an IPv6 subnet or host"));
+    let addresses;
+    try {
+      addresses = [];
+      for (let i = 0; i < count; i++)
+        addresses.push(shardAddress(subnet, i));
+    } catch (e) {
+      return this._fail(e);
+    }
+
+    let port = options.port === undefined ? 0 : Number(options.port);
+    if (!Number.isInteger(port) || port < 0 || port > 65535)
+      return this._fail(new RangeError("invalid port"));
+
+    const listeners = [];
+    let failure = null;
+    for (let i = 0; i < count; i++) {
+      const r = native.socket(C.AF_INET6, C.SOCK_STREAM, 0);
+      if (r[1]) {
+        failure = sysError(r[1], "socket");
+        break;
+      }
+      const fd = r[0];
+      this._configureListener(fd, options, true);
+      const err = this._bindAndListen(fd, addresses[i], port, options);
+      if (err) {
+        native.close(fd);
+        failure = sysError(err.err, err.syscall, addresses[i]);
+        break;
+      }
+      const name = native.getsockname(fd);
+      let address = addresses[i];
+      let actualPort = port;
+      if (!name[1]) {
+        address = name[0][0];
+        actualPort = name[0][2];
+        if (port === 0)
+          port = actualPort;
+      }
+      listeners.push({ fd, shard: i, address, port: actualPort,
+                       family: "IPv6" });
+    }
+
+    if (failure) {
+      for (const l of listeners) {
+        qjsos.setReadHandler(l.fd, null);
+        native.close(l.fd);
+      }
+      if (options.fallback !== false && this._isShardFallbackError(failure))
+        return this._listenFallback(options, failure);
+      return this._fail(failure);
+    }
+    this._registerListeners(listeners, true, count);
+    return this;
+  }
+
+  _onConnection(listener) {
+    const fd = listener ? listener.fd : this._fd;
+    /* Draining one listener without a budget lets a busy shard starve the
+       others. A small budget keeps the accept path interleaved. */
+    const budget = listener && listener.shard !== undefined ? 64 : Infinity;
+    for (let accepted = 0; accepted < budget; accepted++) {
+      const r = native.accept(fd);
       if (r[1]) {
         if (r[1] === C.EAGAIN || r[1] === C.EWOULDBLOCK ||
             r[1] === C.EINTR)
@@ -4538,6 +4756,8 @@ class Server extends EventEmitter {
       const sock = new Socket();
       sock._fd = r[0];
       sock.server = this;
+      if (listener && listener.shard !== undefined)
+        sock.shard = listener.shard;
       sock.setNoDelay(true);
       this._connections++;
       const peer = native.getpeername(sock._fd);
@@ -4549,6 +4769,7 @@ class Server extends EventEmitter {
       if (!local[1]) {
         sock.localAddress = local[0][0];
         sock.localPort = local[0][2];
+        sock.localFamily = local[0][1] === C.AF_INET6 ? "IPv6" : "IPv4";
       }
       sock._attach();
       this._sockets.add(sock);
@@ -4557,6 +4778,8 @@ class Server extends EventEmitter {
         this._sockets.delete(sock);
       });
       this.emit("connection", sock);
+      if (!this.listening)
+        return;
     }
   }
 
@@ -4566,16 +4789,37 @@ class Server extends EventEmitter {
     return { address: this._address, family: this._family, port: this._port };
   }
 
+  /* All bound listener addresses. A sharded server returns one entry per
+     shard; an unsharded server returns a single entry without `shard`. */
+  addresses() {
+    const out = [];
+    if (!this.listening)
+      return out;
+    for (const l of this._listeners) {
+      const e = { address: l.address, family: l.family, port: l.port };
+      if (l.shard !== undefined)
+        e.shard = l.shard;
+      out.push(e);
+    }
+    return out;
+  }
+
   getConnections(cb) {
     queueMicrotask(() => cb(null, this._connections));
   }
 
   close(cb) {
-    if (this._fd !== undefined) {
+    if (this._listeners.length) {
+      for (const l of this._listeners) {
+        qjsos.setReadHandler(l.fd, null);
+        native.close(l.fd);
+      }
+      this._listeners = [];
+    } else if (this._fd !== undefined) {
       qjsos.setReadHandler(this._fd, null);
       native.close(this._fd);
-      this._fd = undefined;
     }
+    this._fd = undefined;
     this.listening = false;
     for (const sock of this._sockets) {
       if (sock._idle && !sock.destroyed)
@@ -4598,6 +4842,8 @@ const net = {
   createServer: (options, listener) => new Server(options, listener),
   createConnection,
   connect: createConnection,
+  shardAddress,
+  shardIndex,
   isIP(input) {
     const s = String(input);
     if (/^\d{1,3}(\.\d{1,3}){3}$/.test(s) &&
@@ -5033,6 +5279,12 @@ function agentKey(options) {
   const host = options.hostname || options.host || "localhost";
   const port = Number(options.port) || (protocol === "https:" ? 443 : 80);
   let key = protocol + "//" + host + ":" + port;
+  if (options.family !== undefined)
+    key += "|family" + options.family;
+  if (options.shard !== undefined)
+    key += "|shard" + options.shard + "@" + (options.subnet || host);
+  if (options.localAddress !== undefined)
+    key += "|local" + options.localAddress + ":" + (options.localPort || 0);
   if (protocol === "https:") {
     key += "|" + (options.servername || host);
     if (options.rejectUnauthorized === false)
@@ -5051,6 +5303,12 @@ function createSocketForRequest(o) {
   const host = o.hostname || o.host || "localhost";
   if (typeof o.createConnection === "function")
     return o.createConnection(Object.assign({}, o, { port, host }));
+  const connectOpts = { port, host };
+  for (const k of ["family", "localAddress", "localPort", "shard", "subnet",
+                   "freeBind", "noDelay"]) {
+    if (o[k] !== undefined)
+      connectOpts[k] = o[k];
+  }
   if (protocol === "https:") {
     const tlsOpts = {};
     for (const k of TLS_REQUEST_OPTIONS)
@@ -5058,10 +5316,10 @@ function createSocketForRequest(o) {
         tlsOpts[k] = o[k];
     if (tlsOpts.servername === undefined)
       tlsOpts.servername = host;
-    return tls.connect(Object.assign({}, tlsOpts, { port, host }));
+    return tls.connect(Object.assign({}, tlsOpts, connectOpts));
   }
   const s = new Socket();
-  s.connect({ port, host });
+  s.connect(connectOpts);
   return s;
 }
 
@@ -7372,8 +7630,10 @@ class TLSSocket extends Socket {
       this.readable = false;
       qjsos.setReadHandler(this._fd, null);
       this.push(null);
-      if (!this.allowHalfOpen)
+      if (!this.allowHalfOpen && !this._ending)
         this.end();
+      else
+        this._maybeClose();
       return;
     }
     if (want === C.TLS_WANT_WRITE) {
@@ -7444,6 +7704,15 @@ class TLSSocket extends Socket {
   end(data, encoding, cb) {
     if (typeof data === "function") { cb = data; data = undefined; }
     if (typeof encoding === "function") { cb = encoding; encoding = undefined; }
+    if (this.destroyed)
+      return this;
+    if (this._ending) {
+      if (data !== undefined && data !== null)
+        this.write(data, encoding);
+      if (cb)
+        this.once("finish", cb);
+      return this;
+    }
     const self = this;
     if (data !== undefined && data !== null)
       this.write(data, encoding);
@@ -7459,10 +7728,7 @@ class TLSSocket extends Socket {
       if (cb)
         self.once("finish", cb);
       self.emit("finish");
-      if (self.allowHalfOpen)
-        self._maybeClose();
-      else
-        self.destroySoon();
+      self._maybeClose();
     };
     this._endFinish = finish;
     this._maybeFinishEnd();
@@ -7560,6 +7826,8 @@ class TLSServer extends EventEmitter {
     const sock = new TLSSocket({
       isServer: true, fd, secureContext: this._context._ctxId, server: this,
     });
+    if (raw.shard !== undefined)
+      sock.shard = raw.shard;
     sock.on("secureConnect", () => this.emit("secureConnection", sock));
     sock.on("error", (e) => this.emit("clientError", e, sock));
     const peer = native.getpeername(fd);
@@ -7571,6 +7839,7 @@ class TLSServer extends EventEmitter {
     if (!local[1]) {
       sock.localAddress = local[0][0];
       sock.localPort = local[0][2];
+      sock.localFamily = local[0][1] === C.AF_INET6 ? "IPv6" : "IPv4";
     }
   }
 

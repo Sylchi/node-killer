@@ -1269,6 +1269,85 @@ static JSValue node_addr_obj(JSContext *ctx, struct sockaddr_storage *ss,
     return arr;
 }
 
+/* Parse an IPv6 address with an optional "/prefix" suffix. A missing
+   prefix defaults to /64, the shard layout used by node:net. */
+static int node_ipv6_subnet(JSContext *ctx, JSValueConst val, uint8_t addr[16],
+                            int *prefix_len)
+{
+    const char *s = node_cstr(ctx, val);
+    if (!s)
+        return -1;
+    const char *slash = strchr(s, '/');
+    size_t alen = slash ? (size_t)(slash - s) : strlen(s);
+    char abuf[INET6_ADDRSTRLEN];
+    int plen = 64;
+    if (alen == 0 || alen >= sizeof(abuf)) {
+        JS_FreeCString(ctx, s);
+        JS_ThrowTypeError(ctx, "invalid IPv6 subnet");
+        return -1;
+    }
+    memcpy(abuf, s, alen);
+    abuf[alen] = '\0';
+    if (slash) {
+        char *end;
+        long v = strtol(slash + 1, &end, 10);
+        if (end == slash + 1 || *end || v < 0 || v > 128) {
+            JS_FreeCString(ctx, s);
+            JS_ThrowRangeError(ctx, "invalid IPv6 prefix length");
+            return -1;
+        }
+        plen = (int)v;
+    }
+    JS_FreeCString(ctx, s);
+    if (inet_pton(AF_INET6, abuf, addr) != 1) {
+        JS_ThrowTypeError(ctx, "invalid IPv6 address '%s'", abuf);
+        return -1;
+    }
+    *prefix_len = plen;
+    return 0;
+}
+
+/* shardAddress("/64 prefix", shard) -> address in slot 0 of that shard.
+   The low 64 bits are zeroed first so callers can pass either a prefix or
+   any address inside it. */
+static JSValue js_node_shard_address(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv)
+{
+    uint8_t addr[16];
+    int plen;
+    int32_t shard;
+    if (node_ipv6_subnet(ctx, argv[0], addr, &plen) < 0)
+        return JS_EXCEPTION;
+    if (JS_ToInt32(ctx, &shard, argv[1]))
+        return JS_EXCEPTION;
+    if (plen != 64)
+        return JS_ThrowRangeError(ctx,
+            "shard addresses require a /64 IPv6 prefix");
+    if (shard < 0 || shard > 255)
+        return JS_ThrowRangeError(ctx, "shard must be between 0 and 255");
+    memset(addr + 8, 0, 8);
+    addr[8] = (uint8_t)shard;
+    char out[INET6_ADDRSTRLEN];
+    if (!inet_ntop(AF_INET6, addr, out, sizeof(out)))
+        return JS_ThrowInternalError(ctx, "cannot format IPv6 address");
+    return JS_NewString(ctx, out);
+}
+
+/* The inverse of shardAddress: byte 8 of an IPv6 address, or -1. */
+static JSValue js_node_shard_index(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv)
+{
+    const char *s = node_cstr(ctx, argv[0]);
+    if (!s)
+        return JS_EXCEPTION;
+    struct in6_addr addr;
+    int ok = inet_pton(AF_INET6, s, &addr);
+    JS_FreeCString(ctx, s);
+    if (ok != 1)
+        return JS_NewInt32(ctx, -1);
+    return JS_NewInt32(ctx, addr.s6_addr[8]);
+}
+
 static JSValue js_node_getsockname(JSContext *ctx, JSValueConst this_val,
                                    int argc, JSValueConst *argv)
 {
@@ -2661,6 +2740,8 @@ static const JSCFunctionListEntry js_node_funcs[] = {
     JS_CFUNC_DEF("getsockopt", 3, js_node_getsockopt),
     JS_CFUNC_DEF("getsockname", 1, js_node_getsockname),
     JS_CFUNC_DEF("getpeername", 1, js_node_getpeername),
+    JS_CFUNC_DEF("shardAddress", 2, js_node_shard_address),
+    JS_CFUNC_DEF("shardIndex", 1, js_node_shard_index),
     JS_CFUNC_DEF("shutdown", 2, js_node_shutdown),
     JS_CFUNC_DEF("dns", 1, js_node_dns),
 
@@ -2986,6 +3067,16 @@ int js_node_init(JSContext *ctx, JSRuntime *rt)
     NC("SO_ERROR", SO_ERROR);
     NC("TCP_NODELAY", TCP_NODELAY);
     NC("IPPROTO_TCP", IPPROTO_TCP);
+    NC("IPPROTO_IPV6", IPPROTO_IPV6);
+#ifdef IPV6_V6ONLY
+    NC("IPV6_V6ONLY", IPV6_V6ONLY);
+#endif
+#ifdef IPV6_FREEBIND
+    NC("IPV6_FREEBIND", IPV6_FREEBIND);
+#endif
+#ifdef IP_FREEBIND
+    NC("IP_FREEBIND", IP_FREEBIND);
+#endif
     NC("SHUT_RD", SHUT_RD);
     NC("SHUT_WR", SHUT_WR);
     NC("SHUT_RDWR", SHUT_RDWR);
@@ -3005,6 +3096,9 @@ int js_node_init(JSContext *ctx, JSRuntime *rt)
     NC("ECONNREFUSED", ECONNREFUSED);
     NC("EADDRINUSE", EADDRINUSE);
     NC("EADDRNOTAVAIL", EADDRNOTAVAIL);
+    NC("EINVAL", EINVAL);
+    NC("EAFNOSUPPORT", EAFNOSUPPORT);
+    NC("EPROTONOSUPPORT", EPROTONOSUPPORT);
     NC("WNOHANG", WNOHANG);
     NC("WIFEXITED", 0); /* helpers in JS use the macros below */
     NC("O_RDONLY", O_RDONLY);
