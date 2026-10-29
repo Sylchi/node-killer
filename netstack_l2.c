@@ -28,12 +28,26 @@
 #define NEIGH_INCOMPLETE 1
 #define NEIGH_REACHABLE 2
 
+#define ROUTE_FREE 0
+#define ROUTE_STATIC 1
+#define ROUTE_CONNECTED 2
+
 typedef struct NsL2Pkt {
     struct NsL2Pkt *next;
     NsAddr next_hop;
     size_t len;
     uint8_t data[];
 } NsL2Pkt;
+
+typedef struct NsRoute {
+    NsAddr dest;       /* network address, host bits zero */
+    NsAddr gateway;
+    uint8_t family;
+    uint8_t prefix_len;
+    uint8_t has_gateway;
+    uint8_t kind;      /* ROUTE_STATIC or ROUTE_CONNECTED */
+    uint64_t used;
+} NsRoute;
 
 typedef struct NsNeigh {
     NsAddr addr;
@@ -56,16 +70,11 @@ struct NsL2 {
 
     int has4;
     NsAddr local4;
-    uint8_t prefix4;
-    int has_gw4;
-    NsAddr gw4;
 
     int has6;
     NsAddr local6;
-    uint8_t prefix6;
-    int has_gw6;
-    NsAddr gw6;
 
+    NsRoute routes[NS_L2_MAX_ROUTES];
     NsNeigh neigh[NS_L2_MAX_NEIGHBORS];
     NsL2Pkt *pending;
     int npending;
@@ -185,29 +194,214 @@ static uint32_t mask4(int prefix_len)
     return 0xffffffffu << (32 - prefix_len);
 }
 
-static int on_link4(const NsL2 *l2, const NsAddr *a)
+/* Zero the host bits of an address in place. */
+static void addr_mask(NsAddr *addr, int prefix_len)
 {
-    uint32_t mask = mask4(l2->prefix4);
-    uint32_t x = rd32(a->b);
-    uint32_t local = rd32(l2->local4.b);
+    if (ns_addr_family(addr) == NS_AF_INET) {
+        wr32(addr->b, rd32(addr->b) & mask4(prefix_len));
+    } else {
+        int full = prefix_len / 8;
+        int rem = prefix_len % 8;
+        int i;
 
-    return (x & mask) == (local & mask);
+        if (rem) {
+            addr->b[full] &= (uint8_t)(0xff << (8 - rem));
+            full++;
+        }
+        for (i = full; i < 16; i++)
+            addr->b[i] = 0;
+    }
 }
 
-static int on_link6(const NsL2 *l2, const NsAddr *a)
+static int addr_in_prefix(const NsAddr *addr, const NsAddr *net, int prefix_len)
 {
-    int bits = l2->prefix6;
-    int full = bits / 8;
-    int rem = bits % 8;
-
-    if (full && memcmp(a->b, l2->local6.b, (size_t)full) != 0)
+    if (ns_addr_family(addr) != ns_addr_family(net))
         return 0;
-    if (rem) {
-        uint8_t mask = (uint8_t)(0xff << (8 - rem));
-        if ((a->b[full] & mask) != (l2->local6.b[full] & mask))
+    if (ns_addr_family(addr) == NS_AF_INET)
+        return (rd32(addr->b) & mask4(prefix_len)) == rd32(net->b);
+    {
+        int full = prefix_len / 8;
+        int rem = prefix_len % 8;
+
+        if (full && memcmp(addr->b, net->b, (size_t)full) != 0)
             return 0;
+        if (rem) {
+            uint8_t mask = (uint8_t)(0xff << (8 - rem));
+            if ((addr->b[full] & mask) != (net->b[full] & mask))
+                return 0;
+        }
     }
     return 1;
+}
+
+static NsRoute *route_find(NsL2 *l2, const NsAddr *dest, int prefix_len)
+{
+    int i;
+
+    for (i = 0; i < NS_L2_MAX_ROUTES; i++) {
+        NsRoute *r = &l2->routes[i];
+        if (r->kind != ROUTE_FREE && r->prefix_len == prefix_len &&
+            addr_eq(&r->dest, dest))
+            return r;
+    }
+    return NULL;
+}
+
+/* Prefer a free slot, then evict the least recently used static route.
+   Connected routes are never evicted because neighbours need them to decide
+   whether a gateway is reachable. */
+static NsRoute *route_alloc(NsL2 *l2)
+{
+    NsRoute *victim = NULL;
+    int i;
+
+    for (i = 0; i < NS_L2_MAX_ROUTES; i++)
+        if (l2->routes[i].kind == ROUTE_FREE)
+            return &l2->routes[i];
+    for (i = 0; i < NS_L2_MAX_ROUTES; i++) {
+        NsRoute *r = &l2->routes[i];
+        if (r->kind != ROUTE_STATIC)
+            continue;
+        if (!victim || r->used < victim->used)
+            victim = r;
+    }
+    return victim;
+}
+
+static int route_add_internal(NsL2 *l2, const NsAddr *dest, int prefix_len,
+                              const NsAddr *gateway, int kind)
+{
+    NsAddr net;
+    NsRoute *r;
+    int family;
+
+    if (!l2 || !dest)
+        return -NS_EINVAL;
+    family = ns_addr_family(dest);
+    if (family != NS_AF_INET && family != NS_AF_INET6)
+        return -NS_EINVAL;
+    if (prefix_len < 0 || prefix_len > (family == NS_AF_INET ? 32 : 128))
+        return -NS_EINVAL;
+    if (gateway && ns_addr_family(gateway) != family)
+        return -NS_EINVAL;
+
+    net = *dest;
+    net.family = (uint8_t)family;
+    addr_mask(&net, prefix_len);
+
+    r = route_find(l2, &net, prefix_len);
+    if (r && r->kind == ROUTE_CONNECTED && kind == ROUTE_STATIC)
+        return -NS_EINVAL; /* never replace the interface's connected route */
+    if (!r) {
+        r = route_alloc(l2);
+        if (!r)
+            return -NS_ENOSPC;
+        memset(r, 0, sizeof(*r));
+    }
+    r->dest = net;
+    r->family = (uint8_t)family;
+    r->prefix_len = (uint8_t)prefix_len;
+    r->kind = (uint8_t)kind;
+    r->has_gateway = gateway != NULL;
+    if (gateway) {
+        r->gateway = *gateway;
+        r->gateway.family = (uint8_t)family;
+    } else {
+        memset(&r->gateway, 0, sizeof(r->gateway));
+        r->gateway.family = (uint8_t)family;
+    }
+    r->used = ++l2->next_used;
+    return 0;
+}
+
+static const NsRoute *route_match(const NsL2 *l2, const NsAddr *dst)
+{
+    const NsRoute *best = NULL;
+    int i;
+
+    for (i = 0; i < NS_L2_MAX_ROUTES; i++) {
+        const NsRoute *r = &l2->routes[i];
+
+        if (r->kind == ROUTE_FREE ||
+            !addr_in_prefix(dst, &r->dest, r->prefix_len))
+            continue;
+        if (!best || r->prefix_len > best->prefix_len ||
+            (r->prefix_len == best->prefix_len &&
+             r->kind == ROUTE_CONNECTED && best->kind != ROUTE_CONNECTED))
+            best = r;
+    }
+    return best;
+}
+
+/* Match a route and record the use for LRU eviction. */
+static const NsRoute *route_match_touch(NsL2 *l2, const NsAddr *dst)
+{
+    const NsRoute *r = route_match(l2, dst);
+
+    if (r) {
+        NsRoute *mutable = &l2->routes[r - l2->routes];
+        mutable->used = ++l2->next_used;
+    }
+    return r;
+}
+
+/* Resolve the next hop for `dst`. Returns 1 on success, 0 when no route
+   matches, and -1 when the route's gateway is not reachable on-link. */
+static int route_next_hop(NsL2 *l2, const NsAddr *dst, NsAddr *next)
+{
+    const NsRoute *r = route_match_touch(l2, dst);
+    const NsRoute *g;
+
+    if (!r)
+        return 0;
+    if (!r->has_gateway) {
+        *next = *dst;
+        next->family = (uint8_t)ns_addr_family(dst);
+        return 1;
+    }
+    /* A gateway must be reachable through an on-link route, not recursively
+       through another gateway. */
+    g = route_match_touch(l2, &r->gateway);
+    if (!g || g->has_gateway)
+        return -1;
+    *next = r->gateway;
+    return 1;
+}
+
+static void route_flush_family(NsL2 *l2, int family)
+{
+    int i;
+
+    for (i = 0; i < NS_L2_MAX_ROUTES; i++)
+        if (l2->routes[i].kind != ROUTE_FREE &&
+            l2->routes[i].family == (uint8_t)family)
+            memset(&l2->routes[i], 0, sizeof(l2->routes[i]));
+}
+
+/* True when `dst` is the directed broadcast address of an on-link IPv4
+   route. */
+static int subnet_broadcast4(const NsL2 *l2, const NsAddr *dst)
+{
+    uint32_t addr;
+    int i;
+
+    if (ns_addr_family(dst) != NS_AF_INET)
+        return 0;
+    addr = rd32(dst->b);
+    for (i = 0; i < NS_L2_MAX_ROUTES; i++) {
+        const NsRoute *r = &l2->routes[i];
+        uint32_t mask;
+        uint32_t host;
+
+        if (r->kind == ROUTE_FREE || r->has_gateway ||
+            r->family != NS_AF_INET || r->prefix_len >= 31)
+            continue;
+        mask = mask4(r->prefix_len);
+        host = ~mask;
+        if ((addr & mask) == rd32(r->dest.b) && (addr & host) == host)
+            return 1;
+    }
+    return 0;
 }
 
 static int mac_eq(const uint8_t *a, const uint8_t *b)
@@ -829,6 +1023,8 @@ void ns_l2_attach(NsL2 *l2)
 int ns_l2_set_ipv4(NsL2 *l2, const NsAddr *local, int prefix_len,
                    const NsAddr *gateway)
 {
+    NsAddr zero;
+
     if (!l2 || !local || ns_addr_family(local) != NS_AF_INET ||
         prefix_len < 0 || prefix_len > 32)
         return -NS_EINVAL;
@@ -836,12 +1032,17 @@ int ns_l2_set_ipv4(NsL2 *l2, const NsAddr *local, int prefix_len,
         return -NS_EINVAL;
     l2->local4 = *local;
     l2->local4.family = NS_AF_INET;
-    l2->prefix4 = (uint8_t)prefix_len;
     l2->has4 = 1;
-    l2->has_gw4 = gateway != NULL;
+
+    route_flush_family(l2, NS_AF_INET);
+    if (route_add_internal(l2, &l2->local4, prefix_len, NULL,
+                           ROUTE_CONNECTED) < 0)
+        return -NS_ENOSPC;
     if (gateway) {
-        l2->gw4 = *gateway;
-        l2->gw4.family = NS_AF_INET;
+        memset(&zero, 0, sizeof(zero));
+        zero.family = NS_AF_INET;
+        if (route_add_internal(l2, &zero, 0, gateway, ROUTE_STATIC) < 0)
+            return -NS_ENOSPC;
     }
     return 0;
 }
@@ -849,6 +1050,8 @@ int ns_l2_set_ipv4(NsL2 *l2, const NsAddr *local, int prefix_len,
 int ns_l2_set_ipv6(NsL2 *l2, const NsAddr *local, int prefix_len,
                    const NsAddr *gateway)
 {
+    NsAddr zero;
+
     if (!l2 || !local || ns_addr_family(local) != NS_AF_INET6 ||
         prefix_len < 0 || prefix_len > 128)
         return -NS_EINVAL;
@@ -856,14 +1059,67 @@ int ns_l2_set_ipv6(NsL2 *l2, const NsAddr *local, int prefix_len,
         return -NS_EINVAL;
     l2->local6 = *local;
     l2->local6.family = NS_AF_INET6;
-    l2->prefix6 = (uint8_t)prefix_len;
     l2->has6 = 1;
-    l2->has_gw6 = gateway != NULL;
+
+    route_flush_family(l2, NS_AF_INET6);
+    if (route_add_internal(l2, &l2->local6, prefix_len, NULL,
+                           ROUTE_CONNECTED) < 0)
+        return -NS_ENOSPC;
     if (gateway) {
-        l2->gw6 = *gateway;
-        l2->gw6.family = NS_AF_INET6;
+        memset(&zero, 0, sizeof(zero));
+        zero.family = NS_AF_INET6;
+        if (route_add_internal(l2, &zero, 0, gateway, ROUTE_STATIC) < 0)
+            return -NS_ENOSPC;
     }
     return 0;
+}
+
+int ns_l2_add_route(NsL2 *l2, const NsAddr *dest, int prefix_len,
+                    const NsAddr *gateway)
+{
+    return route_add_internal(l2, dest, prefix_len, gateway, ROUTE_STATIC);
+}
+
+int ns_l2_del_route(NsL2 *l2, const NsAddr *dest, int prefix_len)
+{
+    NsAddr net;
+    NsRoute *r;
+    int family;
+
+    if (!l2 || !dest)
+        return -NS_EINVAL;
+    family = ns_addr_family(dest);
+    if (family != NS_AF_INET && family != NS_AF_INET6)
+        return -NS_EINVAL;
+    if (prefix_len < 0 || prefix_len > (family == NS_AF_INET ? 32 : 128))
+        return -NS_EINVAL;
+    net = *dest;
+    net.family = (uint8_t)family;
+    addr_mask(&net, prefix_len);
+    r = route_find(l2, &net, prefix_len);
+    if (!r)
+        return -NS_EINVAL;
+    memset(r, 0, sizeof(*r));
+    return 0;
+}
+
+int ns_l2_route_lookup(const NsL2 *l2, const NsAddr *dst, NsL2RouteInfo *route)
+{
+    const NsRoute *r;
+
+    if (!l2 || !dst)
+        return 0;
+    r = route_match(l2, dst);
+    if (!r)
+        return 0;
+    if (route) {
+        memset(route, 0, sizeof(*route));
+        route->dest = r->dest;
+        route->gateway = r->gateway;
+        route->prefix_len = r->prefix_len;
+        route->has_gateway = r->has_gateway;
+    }
+    return 1;
 }
 
 int ns_l2_send_ip(NsL2 *l2, const uint8_t *pkt, size_t len)
@@ -872,6 +1128,7 @@ int ns_l2_send_ip(NsL2 *l2, const uint8_t *pkt, size_t len)
     NsAddr dst, next;
     uint8_t mcast[NS_L2_MAC_LEN];
     uint8_t bcast[NS_L2_MAC_LEN];
+    int routed;
 
     if (!l2 || !pkt || len < IPV4_HDR) {
         if (l2)
@@ -896,19 +1153,21 @@ int ns_l2_send_ip(NsL2 *l2, const uint8_t *pkt, size_t len)
             return -1;
         }
         memset(bcast, 0xff, sizeof(bcast));
-        if (addr_broadcast4(&dst) ||
-            (l2->prefix4 < 31 && on_link4(l2, &dst) &&
-             (rd32(dst.b) & ~mask4(l2->prefix4)) ==
-                 ~mask4(l2->prefix4))) {
+        if (addr_broadcast4(&dst) || subnet_broadcast4(l2, &dst))
             return l2_emit_ip(l2, pkt, len, bcast);
-        }
         if (addr_multicast(&dst)) {
             mac_multicast4(&dst, mcast);
             return l2_emit_ip(l2, pkt, len, mcast);
         }
-        next = dst;
-        if (l2->has_gw4 && !on_link4(l2, &dst))
-            next = l2->gw4;
+        routed = route_next_hop(l2, &dst, &next);
+        if (routed <= 0) {
+            if (routed == 0)
+                l2->stats.no_route++;
+            else
+                l2->stats.gateway_unreachable++;
+            l2->stats.dropped++;
+            return -1;
+        }
         return neigh_send(l2, pkt, len, &next);
     }
 
@@ -933,9 +1192,15 @@ int ns_l2_send_ip(NsL2 *l2, const uint8_t *pkt, size_t len)
             mac_multicast6(&dst, mcast);
             return l2_emit_ip(l2, pkt, len, mcast);
         }
-        next = dst;
-        if (l2->has_gw6 && !on_link6(l2, &dst))
-            next = l2->gw6;
+        routed = route_next_hop(l2, &dst, &next);
+        if (routed <= 0) {
+            if (routed == 0)
+                l2->stats.no_route++;
+            else
+                l2->stats.gateway_unreachable++;
+            l2->stats.dropped++;
+            return -1;
+        }
         return neigh_send(l2, pkt, len, &next);
     }
 

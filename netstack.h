@@ -47,6 +47,7 @@ enum {
     NS_EINVAL = 5,
     NS_EADDRINUSE = 6,
     NS_EDESTADDRREQ = 7,
+    NS_ENOSPC = 8,
 };
 
 /* Connection states, in the order used by ns_conn_state(). */

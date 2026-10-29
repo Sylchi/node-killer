@@ -84,10 +84,12 @@ that may be strings, `Buffer`s, typed arrays or `ArrayBuffer`s.
   engine is unchanged; outbound packets are framed and resolved with ARP for
   IPv4 and neighbour solicitation for IPv6, and inbound frames are unwrapped
   before `ns_input()`. The neighbour cache queues a bounded number of packets
-  while resolution is in progress. One interface and one on-link prefix per
-  family are supported; the optional gateway is used only for off-link
-  destinations. The default MAC is `02:51:4e:00:00:01` and is set with
-  `QNODE_NETSTACK_MAC`.
+  while resolution is in progress. One interface is supported, with a
+  longest-prefix route table: configuring an address installs its connected
+  route, the optional gateway becomes a default route, and
+  `QNODE_NETSTACK_ROUTES` adds entries such as `10.9.0.0/16 via 10.254.0.2`.
+  A next hop must be on-link. The default MAC is `02:51:4e:00:00:01` and is set
+  with `QNODE_NETSTACK_MAC`.
 
 When a virtual socket binds, connects or sends to an address outside the
 managed prefix, the bridge creates a kernel socket, `dup2`s it onto the same

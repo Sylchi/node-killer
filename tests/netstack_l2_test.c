@@ -136,6 +136,301 @@ static void teardown(Sim *sim)
     sim->a = sim->b = NULL;
 }
 
+/* ---------------- routing-table fixture ---------------- */
+
+#define ROUTE_MAX_NODES 8
+
+typedef struct RouteSim {
+    NsL2 *nodes[ROUTE_MAX_NODES];
+    int nnodes;
+    NsL2 *a;
+    int capture_on;
+    size_t capture_len;
+    uint8_t capture[NS_MAX_PACKET];
+} RouteSim;
+
+static void route_sim_send(NsL2 *from, const uint8_t *frame, size_t len,
+                           void *opaque)
+{
+    RouteSim *sim = opaque;
+    int i;
+
+    if (from == sim->a && sim->capture_on) {
+        size_t n = len < sizeof(sim->capture) ? len : sizeof(sim->capture);
+        memcpy(sim->capture, frame, n);
+        sim->capture_len = n;
+    }
+    for (i = 0; i < sim->nnodes; i++)
+        if (sim->nodes[i] != from)
+            ns_l2_input(sim->nodes[i], frame, len);
+}
+
+static void put16(uint8_t *p, uint16_t v)
+{
+    p[0] = (uint8_t)(v >> 8);
+    p[1] = (uint8_t)v;
+}
+
+static void set_addr6_full(NsAddr *a, const uint8_t b[16])
+{
+    memset(a, 0, sizeof(*a));
+    a->family = NS_AF_INET6;
+    memcpy(a->b, b, 16);
+}
+
+/* Minimal IPv4/UDP packet. Only the header fields the L2 layer reads are
+   filled in; the stack is not involved in these tests. */
+static size_t make_v4(uint8_t *pkt, const NsAddr *dst)
+{
+    static const uint8_t src[4] = { 10, 0, 0, 1 };
+
+    memset(pkt, 0, 20 + 8);
+    pkt[0] = 0x45;
+    put16(pkt + 2, 20 + 8);
+    pkt[8] = 64;
+    pkt[9] = 17;
+    memcpy(pkt + 12, src, 4);
+    memcpy(pkt + 16, dst->b, 4);
+    put16(pkt + 20, 1234);
+    put16(pkt + 22, 5678);
+    put16(pkt + 24, 8);
+    return 20 + 8;
+}
+
+static size_t make_v6(uint8_t *pkt, const NsAddr *dst)
+{
+    static const uint8_t src[16] = {
+        0xfd, 0x00, 0x51, 0x4e, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1
+    };
+
+    memset(pkt, 0, 40 + 8);
+    pkt[0] = 0x60;
+    put16(pkt + 4, 8);
+    pkt[6] = 17;
+    pkt[7] = 64;
+    memcpy(pkt + 8, src, 16);
+    memcpy(pkt + 24, dst->b, 16);
+    put16(pkt + 40, 1234);
+    put16(pkt + 42, 5678);
+    put16(pkt + 44, 8);
+    return 40 + 8;
+}
+
+static NsL2 *route_add_node(RouteSim *sim, const uint8_t mac[NS_L2_MAC_LEN],
+                            const NsAddr *addr, int prefix_len)
+{
+    NsL2 *n = ns_l2_new(NULL, mac, route_sim_send, sim);
+
+    CHECK(n != NULL);
+    CHECK(sim->nnodes < ROUTE_MAX_NODES);
+    sim->nodes[sim->nnodes++] = n;
+    if (ns_addr_family(addr) == NS_AF_INET)
+        CHECK(ns_l2_set_ipv4(n, addr, prefix_len, NULL) == 0);
+    else
+        CHECK(ns_l2_set_ipv6(n, addr, prefix_len, NULL) == 0);
+    return n;
+}
+
+/* Send one packet from A and check that the last frame A emitted is addressed
+   to `expected`'s MAC. Resolution runs synchronously on this segment, so the
+   final frame is the data frame. */
+static void expect_next_hop(RouteSim *sim, NsL2 *expected, const uint8_t *pkt,
+                            size_t len)
+{
+    sim->capture_on = 1;
+    sim->capture_len = 0;
+    CHECK(ns_l2_send_ip(sim->a, pkt, len) == 0);
+    CHECK(sim->capture_len > 0);
+    CHECK(memcmp(sim->capture, ns_l2_mac(expected), NS_L2_MAC_LEN) == 0);
+}
+
+static void close_route_sim(RouteSim *sim)
+{
+    int i;
+
+    for (i = 0; i < sim->nnodes; i++)
+        ns_l2_free(sim->nodes[i]);
+    sim->nnodes = 0;
+    sim->a = NULL;
+}
+
+static void test_routing_table(void)
+{
+    static const uint8_t mac_a2[NS_L2_MAC_LEN] = { 0x02, 0, 0, 0, 1, 1 };
+    static const uint8_t mac_r0[NS_L2_MAC_LEN] = { 0x02, 0, 0, 0, 1, 2 };
+    static const uint8_t mac_r1[NS_L2_MAC_LEN] = { 0x02, 0, 0, 0, 1, 3 };
+    static const uint8_t mac_r2[NS_L2_MAC_LEN] = { 0x02, 0, 0, 0, 1, 4 };
+    static const uint8_t mac_r6[NS_L2_MAC_LEN] = { 0x02, 0, 0, 0, 1, 5 };
+    static const uint8_t mac_peer[NS_L2_MAC_LEN] = { 0x02, 0, 0, 0, 1, 6 };
+    static const uint8_t prefix7[16] = {
+        0x20, 0x01, 0x0d, 0xb8, 0x00, 0x07, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+    };
+    static const uint8_t prefix8[16] = {
+        0x20, 0x01, 0x0d, 0xb8, 0x00, 0x08, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+    };
+    RouteSim sim;
+    NsAddr a4, a6, gw0, gw1, gw2, gw6, peer4, dst, net, badgw;
+    NsAddr net7;
+    NsL2 *r0, *r1, *r2, *r6, *peer;
+    NsL2RouteInfo info;
+    uint8_t pkt[64];
+    uint8_t bcast[NS_L2_MAC_LEN];
+    uint64_t before;
+    size_t len;
+
+    memset(&sim, 0, sizeof(sim));
+    set_addr4(&a4, 10, 0, 0, 1);
+    set_addr4(&gw0, 10, 0, 0, 254);
+    set_addr4(&gw1, 10, 0, 0, 252);
+    set_addr4(&gw2, 10, 0, 0, 253);
+    set_addr4(&peer4, 10, 0, 0, 9);
+    set_addr6(&a6, 1);
+    set_addr6(&gw6, 0xfe);
+    set_addr6_full(&net7, prefix7);
+
+    sim.a = ns_l2_new(NULL, mac_a2, route_sim_send, &sim);
+    CHECK(sim.a != NULL);
+    sim.nodes[sim.nnodes++] = sim.a;
+    CHECK(ns_l2_set_ipv4(sim.a, &a4, 24, NULL) == 0);
+    CHECK(ns_l2_set_ipv6(sim.a, &a6, 64, NULL) == 0);
+
+    r0 = route_add_node(&sim, mac_r0, &gw0, 24);
+    r1 = route_add_node(&sim, mac_r1, &gw1, 24);
+    r2 = route_add_node(&sim, mac_r2, &gw2, 24);
+    r6 = route_add_node(&sim, mac_r6, &gw6, 64);
+    peer = route_add_node(&sim, mac_peer, &peer4, 24);
+    (void)r0;
+    (void)r1;
+    (void)r2;
+    (void)r6;
+    (void)peer;
+
+    /* Connected route: an on-link peer needs no gateway. */
+    set_addr4(&dst, 10, 0, 0, 9);
+    CHECK(ns_l2_route_lookup(sim.a, &dst, &info) == 1);
+    CHECK(info.prefix_len == 24);
+    CHECK(info.has_gateway == 0);
+    len = make_v4(pkt, &dst);
+    expect_next_hop(&sim, peer, pkt, len);
+
+    /* More specific /24 beats /16; /16 handles the rest of 192.168/16. */
+    set_addr4(&net, 192, 168, 0, 0);
+    CHECK(ns_l2_add_route(sim.a, &net, 16, &gw1) == 0);
+    set_addr4(&net, 192, 168, 5, 0);
+    CHECK(ns_l2_add_route(sim.a, &net, 24, &gw2) == 0);
+    set_addr4(&net, 0, 0, 0, 0);
+    CHECK(ns_l2_add_route(sim.a, &net, 0, &gw0) == 0);
+
+    set_addr4(&dst, 192, 168, 5, 7);
+    CHECK(ns_l2_route_lookup(sim.a, &dst, &info) == 1);
+    CHECK(info.prefix_len == 24);
+    CHECK(info.has_gateway == 1);
+    CHECK(memcmp(info.gateway.b, gw2.b, 4) == 0);
+    len = make_v4(pkt, &dst);
+    expect_next_hop(&sim, r2, pkt, len);
+
+    set_addr4(&dst, 192, 168, 9, 7);
+    len = make_v4(pkt, &dst);
+    expect_next_hop(&sim, r1, pkt, len);
+
+    set_addr4(&dst, 8, 8, 8, 8);
+    CHECK(ns_l2_route_lookup(sim.a, &dst, &info) == 1);
+    CHECK(info.prefix_len == 0);
+    CHECK(info.has_gateway == 1);
+    len = make_v4(pkt, &dst);
+    expect_next_hop(&sim, r0, pkt, len);
+
+    /* An on-link /24 route gets a directed broadcast address. */
+    set_addr4(&net, 192, 168, 20, 0);
+    CHECK(ns_l2_add_route(sim.a, &net, 24, NULL) == 0);
+    set_addr4(&dst, 192, 168, 20, 255);
+    memset(bcast, 0xff, sizeof(bcast));
+    sim.capture_on = 1;
+    sim.capture_len = 0;
+    len = make_v4(pkt, &dst);
+    CHECK(ns_l2_send_ip(sim.a, pkt, len) == 0);
+    CHECK(sim.capture_len > 0);
+    CHECK(memcmp(sim.capture, bcast, NS_L2_MAC_LEN) == 0);
+    CHECK(ns_l2_pending_count(sim.a) == 0);
+
+    /* IPv6 route through an on-link router. */
+    CHECK(ns_l2_add_route(sim.a, &net7, 64, &gw6) == 0);
+    set_addr6_full(&dst, prefix7);
+    dst.b[15] = 9;
+    CHECK(ns_l2_route_lookup(sim.a, &dst, &info) == 1);
+    CHECK(info.prefix_len == 64);
+    CHECK(info.has_gateway == 1);
+    CHECK(memcmp(info.gateway.b, gw6.b, 16) == 0);
+    len = make_v6(pkt, &dst);
+    expect_next_hop(&sim, r6, pkt, len);
+
+    /* A gateway that is not on-link cannot be used. */
+    set_addr4(&net, 172, 16, 0, 0);
+    set_addr4(&badgw, 192, 0, 2, 1);
+    CHECK(ns_l2_add_route(sim.a, &net, 12, &badgw) == 0);
+    set_addr4(&dst, 172, 16, 5, 5);
+    before = ns_l2_stats(sim.a)->gateway_unreachable;
+    sim.capture_on = 1;
+    sim.capture_len = 0;
+    len = make_v4(pkt, &dst);
+    CHECK(ns_l2_send_ip(sim.a, pkt, len) < 0);
+    CHECK(ns_l2_stats(sim.a)->gateway_unreachable == before + 1);
+    CHECK(sim.capture_len == 0);
+    CHECK(ns_l2_pending_count(sim.a) == 0);
+
+    /* Removing the default route makes an otherwise unmatched packet fail. */
+    set_addr4(&net, 0, 0, 0, 0);
+    CHECK(ns_l2_del_route(sim.a, &net, 0) == 0);
+    CHECK(ns_l2_del_route(sim.a, &net, 0) == -NS_EINVAL);
+    set_addr4(&dst, 8, 8, 8, 8);
+    before = ns_l2_stats(sim.a)->no_route;
+    len = make_v4(pkt, &dst);
+    CHECK(ns_l2_send_ip(sim.a, pkt, len) < 0);
+    CHECK(ns_l2_stats(sim.a)->no_route == before + 1);
+
+    /* Neither family has a default route; IPv6 misses are counted too. */
+    set_addr6_full(&dst, prefix8);
+    dst.b[15] = 1;
+    before = ns_l2_stats(sim.a)->no_route;
+    len = make_v6(pkt, &dst);
+    CHECK(ns_l2_send_ip(sim.a, pkt, len) < 0);
+    CHECK(ns_l2_stats(sim.a)->no_route == before + 1);
+
+    /* Adding the same prefix again replaces the gateway. */
+    set_addr4(&net, 10, 1, 0, 0);
+    CHECK(ns_l2_add_route(sim.a, &net, 16, &gw1) == 0);
+    CHECK(ns_l2_add_route(sim.a, &net, 16, &gw2) == 0);
+    set_addr4(&dst, 10, 1, 2, 3);
+    CHECK(ns_l2_route_lookup(sim.a, &dst, &info) == 1);
+    CHECK(memcmp(info.gateway.b, gw2.b, 4) == 0);
+
+    /* A static route cannot replace the connected route for the same
+       prefix. */
+    set_addr4(&net, 10, 0, 0, 0);
+    CHECK(ns_l2_add_route(sim.a, &net, 24, &gw1) == -NS_EINVAL);
+    set_addr4(&dst, 10, 0, 0, 9);
+    CHECK(ns_l2_route_lookup(sim.a, &dst, &info) == 1);
+    CHECK(info.has_gateway == 0);
+
+    /* Invalid route requests are rejected. */
+    CHECK(ns_l2_add_route(NULL, &net, 16, NULL) == -NS_EINVAL);
+    CHECK(ns_l2_add_route(sim.a, &net, 33, NULL) == -NS_EINVAL);
+    CHECK(ns_l2_add_route(sim.a, &net, 16, &gw6) == -NS_EINVAL);
+    CHECK(ns_l2_add_route(sim.a, &a6, 129, NULL) == -NS_EINVAL);
+
+    /* Reconfiguring an address family resets its routes. */
+    CHECK(ns_l2_set_ipv4(sim.a, &a4, 24, NULL) == 0);
+    set_addr4(&dst, 10, 1, 2, 3);
+    CHECK(ns_l2_route_lookup(sim.a, &dst, &info) == 0);
+    set_addr4(&dst, 192, 168, 5, 7);
+    CHECK(ns_l2_route_lookup(sim.a, &dst, &info) == 0);
+    set_addr4(&dst, 10, 0, 0, 9);
+    CHECK(ns_l2_route_lookup(sim.a, &dst, &info) == 1);
+    CHECK(info.prefix_len == 24);
+
+    close_route_sim(&sim);
+}
+
 static void test_arp_ipv4(void)
 {
     Sim sim;
@@ -393,6 +688,7 @@ int main(void)
     test_unresolved_timeout();
     test_local_delivery();
     test_broadcast_and_multicast();
+    test_routing_table();
 
     if (failures) {
         fprintf(stderr, "netstack_l2: %d check(s) failed\n", failures);

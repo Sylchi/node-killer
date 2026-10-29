@@ -187,6 +187,106 @@ static int parse_mac(const char *text, uint8_t out[NS_L2_MAC_LEN])
     return 0;
 }
 
+static char *trim_space(char *s)
+{
+    char *end;
+
+    while (*s == ' ' || *s == '\t')
+        s++;
+    end = s + strlen(s);
+    while (end > s && (end[-1] == ' ' || end[-1] == '\t'))
+        *--end = '\0';
+    return s;
+}
+
+/* Parse "address[/prefix]" where the family is inferred from the text.
+   A missing prefix means a host route (/32 or /128). */
+static int parse_route_addr(const char *text, NsAddr *out, int *prefix_len)
+{
+    char buf[INET6_ADDRSTRLEN];
+    const char *slash;
+    size_t n;
+    int family;
+    int plen;
+
+    if (!text || !text[0])
+        return -1;
+    slash = strchr(text, '/');
+    n = slash ? (size_t)(slash - text) : strlen(text);
+    if (n == 0 || n >= sizeof(buf))
+        return -1;
+    memcpy(buf, text, n);
+    buf[n] = '\0';
+    family = strchr(buf, ':') ? NS_AF_INET6 : NS_AF_INET;
+    if (family == NS_AF_INET6) {
+        if (parse_ns_addr6(buf, out) < 0)
+            return -1;
+        plen = 128;
+    } else {
+        if (parse_ns_addr4(buf, out) < 0)
+            return -1;
+        plen = 32;
+    }
+    if (slash) {
+        char *end;
+        long v = strtol(slash + 1, &end, 10);
+        if (end == slash + 1 || *end || v < 0 ||
+            v > (family == NS_AF_INET ? 32 : 128))
+            return -1;
+        plen = (int)v;
+    }
+    *prefix_len = plen;
+    return 0;
+}
+
+/* Parse QNODE_NETSTACK_ROUTES: semicolon- or comma-separated entries of the
+   form "DEST[/LEN]" or "DEST[/LEN] via GATEWAY". */
+static int apply_routes(NsLink *link)
+{
+    const char *env = getenv("QNODE_NETSTACK_ROUTES");
+    char list[1024];
+    char *tok;
+    char *save = NULL;
+
+    if (!env || !env[0])
+        return 0;
+    if (strlen(env) >= sizeof(list))
+        return -1;
+    snprintf(list, sizeof(list), "%s", env);
+
+    for (tok = strtok_r(list, ";,", &save); tok;
+         tok = strtok_r(NULL, ";,", &save)) {
+        char *spec = trim_space(tok);
+        char *via;
+        NsAddr dest, gw;
+        int plen;
+        int has_gw = 0;
+
+        if (!spec[0])
+            continue;
+        via = strstr(spec, " via ");
+        if (via) {
+            *via = '\0';
+            via = trim_space(via + 5);
+            has_gw = 1;
+        }
+        spec = trim_space(spec);
+        if (parse_route_addr(spec, &dest, &plen) < 0)
+            return -1;
+        if (has_gw) {
+            if (ns_addr_family(&dest) == NS_AF_INET) {
+                if (parse_ns_addr4(via, &gw) < 0)
+                    return -1;
+            } else if (parse_ns_addr6(via, &gw) < 0) {
+                return -1;
+            }
+        }
+        if (ns_link_l2_route(link, &dest, plen, has_gw ? &gw : NULL) < 0)
+            return -1;
+    }
+    return 0;
+}
+
 static int ns_init(void)
 {
     uint8_t prefix[NS_PREFIX_LEN];
@@ -295,7 +395,8 @@ static int ns_init(void)
         if (ns_link_l2_config(ns_link, &local4, ns_prefix4_len,
                               has_gw4 ? &gw4 : NULL) < 0 ||
             ns_link_l2_config(ns_link, &local6, ns_prefix6_len,
-                              has_gw6 ? &gw6 : NULL) < 0) {
+                              has_gw6 ? &gw6 : NULL) < 0 ||
+            apply_routes(ns_link) < 0) {
             ns_link_free(ns_link);
             ns_link = NULL;
             ns_stack_free(ns_stack);

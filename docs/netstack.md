@@ -133,8 +133,9 @@ Environment variables:
 | `QNODE_NETSTACK_TAP=1` | Use a TAP (Ethernet) link. Takes precedence over TUN. |
 | `QNODE_NETSTACK_TAP_NAME` | TAP interface name, e.g. `qn0`. Defaults to a kernel-assigned name. |
 | `QNODE_NETSTACK_MAC` | Source MAC for a TAP link. Defaults to `02:51:4e:00:00:01`. |
-| `QNODE_NETSTACK_GATEWAY4` | Optional default IPv4 gateway for off-link destinations. |
-| `QNODE_NETSTACK_GATEWAY6` | Optional default IPv6 gateway for off-link destinations. |
+| `QNODE_NETSTACK_GATEWAY4` | Optional default IPv4 gateway; shorthand for a `0.0.0.0/0` route. |
+| `QNODE_NETSTACK_GATEWAY6` | Optional default IPv6 gateway; shorthand for a `::/0` route. |
+| `QNODE_NETSTACK_ROUTES` | Extra static routes for a TAP link, separated by `;` or `,`. Each entry is `DEST[/LEN]` for an on-link route or `DEST[/LEN] via GATEWAY`. |
 
 ## Links
 
@@ -196,12 +197,21 @@ IPv4 address and neighbour solicitations for its IPv6 address, and resolves the
 kernel side before transmitting. The host does not need a static neighbour
 entry; ARP and NDP populate the cache in both directions.
 
-The stack uses the destination directly when it is on-link and the configured
-gateway when it is not. There is no full routing table and only one interface,
-so a TAP link reaches its on-link prefix plus destinations behind the optional
-`QNODE_NETSTACK_GATEWAY4`/`QNODE_NETSTACK_GATEWAY6` next hop. Without a
-gateway, an off-link destination is resolved as if it were on-link and normally
-fails.
+Outbound packets are routed through a per-interface route table using
+longest-prefix match. Configuring an address sets up a connected route for its
+on-link prefix; `QNODE_NETSTACK_GATEWAY4`/`QNODE_NETSTACK_GATEWAY6` add a
+default route through that next hop. Additional routes come from
+`QNODE_NETSTACK_ROUTES`, for example:
+
+```sh
+QNODE_NETSTACK_ROUTES='10.9.0.0/16 via 10.254.0.2; 2001:db8:9::/48 via fd00:dead:beef:99::2'
+```
+
+A gateway must itself be reachable through an on-link route; a route whose next
+hop is behind another gateway is rejected on send. Static routes may be evicted
+least-recently-used when the 32-entry table is full, while connected routes are
+never evicted. There is still only one interface, so this is the routing table
+for that interface rather than a multi-interface router.
 
 ## Link layer: Ethernet, ARP and NDP
 
@@ -238,8 +248,10 @@ written to `/dev/net/tun`.
 
 `NsL2Stats` exposes `rx_frames`, `tx_frames`, `rx_arp`, `tx_arp`, `rx_ndp`,
 `tx_ndp`, `local_delivered`, `neighbor_hits`, `neighbor_misses`,
-`neighbors_created`, `neighbor_timeouts`, `queued`, `queue_dropped` and
-`dropped`.
+`neighbors_created`, `neighbor_timeouts`, `queued`, `queue_dropped`, `dropped`,
+`no_route` and `gateway_unreachable`. `no_route` counts packets with no
+matching route; `gateway_unreachable` counts routes whose next hop is not
+reachable through an on-link route.
 
 Current link-layer limits:
 
@@ -247,8 +259,11 @@ Current link-layer limits:
   interface address, or neighbour-unreachability detection beyond expiry.
 - No IGMP/MLD membership; multicast and broadcast are framed and transmitted,
   but incoming multicast is only accepted for delivery to the IP engine.
-- One interface per stack, with one on-link prefix and one optional gateway per
-  address family.
+- One interface per stack. The route table has 32 entries per interface and
+  supports longest-prefix match, connected routes, default routes and static
+  routes through an on-link gateway; there is no multi-interface forwarding,
+  policy routing or dynamic routing protocol.
+- No path-MTU discovery for the link layer, and no proxy ARP/NDP.
 
 ## TCP behaviour
 

@@ -234,6 +234,14 @@ int ns_link_l2_config(NsLink *link, const NsAddr *local, int prefix_len,
     return ns_l2_set_ipv6(link->l2, local, prefix_len, gateway);
 }
 
+int ns_link_l2_route(NsLink *link, const NsAddr *dest, int prefix_len,
+                     const NsAddr *gateway)
+{
+    if (!link || link->kind != NS_LINK_TAP || !link->l2)
+        return -NS_EINVAL;
+    return ns_l2_add_route(link->l2, dest, prefix_len, gateway);
+}
+
 NsL2 *ns_link_l2(NsLink *link)
 {
     return link ? link->l2 : NULL;

@@ -56,6 +56,11 @@ void ns_link_tick(NsLink *link, uint64_t now_ms);
 int ns_link_l2_config(NsLink *link, const NsAddr *local, int prefix_len,
                       const NsAddr *gateway);
 
+/* Add a route to a TAP link's table. `gateway` may be NULL for an on-link
+   route. Returns 0 or a negative NsError. */
+int ns_link_l2_route(NsLink *link, const NsAddr *dest, int prefix_len,
+                     const NsAddr *gateway);
+
 /* The neighbour layer for a TAP link, or NULL for loopback/TUN. */
 NsL2 *ns_link_l2(NsLink *link);
 
