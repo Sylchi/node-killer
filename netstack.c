@@ -25,6 +25,18 @@
 #define NS_QUEUE_MAX 4096
 #define NS_DISPATCH_LOG_MAX 256
 
+/* Reassembly and path-MTU limits. A full datagram is at most 65535 bytes;
+   the bitmap tracks which of those bytes have arrived. */
+#define NS_REASM_MAX 8
+#define NS_REASM_TIMEOUT_MS 30000
+#define NS_REASM_MAX_LEN 65535
+#define NS_REASM_BITMAP ((NS_REASM_MAX_LEN + 7) / 8)
+#define NS_PMTU_ENTRIES 32
+#define NS_PMTU_LIFETIME_MS 600000
+#define NS_PMTU_V4_MIN 68
+#define NS_PMTU_V6_MIN 1280
+#define NS_MAX_IP_PACKET 65535
+
 #define NS_TCP_FIN 0x01
 #define NS_TCP_SYN 0x02
 #define NS_TCP_RST 0x04
@@ -33,7 +45,7 @@
 
 typedef struct NsPacket {
     struct NsPacket *next;
-    uint16_t len;
+    uint32_t len;
     uint8_t data[];
 } NsPacket;
 
@@ -120,6 +132,32 @@ typedef struct NsListener {
     int has_addr;
 } NsListener;
 
+/* One partially reassembled datagram. The key is family, source, destination,
+   upper-layer protocol and identification. */
+typedef struct NsReasm {
+    struct NsReasm *next;
+    NsAddr src;
+    NsAddr dst;
+    uint32_t id;
+    uint64_t expires;
+    size_t total;    /* upper-layer length, known once the last fragment lands */
+    size_t have;     /* unique payload bytes received */
+    uint8_t family;
+    uint8_t proto;
+    uint8_t has_hdr;
+    uint8_t hdr_len;
+    uint8_t hdr[60]; /* IPv4 header (with options) or IPv6 base header */
+    uint8_t *data;
+    uint8_t *bitmap;
+} NsReasm;
+
+typedef struct NsPmtu {
+    NsAddr dst;
+    uint64_t expires;
+    uint16_t mtu;
+    uint8_t valid;
+} NsPmtu;
+
 struct NsStack {
     uint8_t prefix[NS_PREFIX_LEN];
     int nshards;
@@ -138,6 +176,10 @@ struct NsStack {
     int has_plain4;
     int has_plain6;
     uint16_t ip_id;
+    uint32_t ip6_id;
+    NsReasm *reasm;
+    int nreasm;
+    NsPmtu pmtu[NS_PMTU_ENTRIES];
     uint64_t clock;
     uint32_t rnd;
     NsStats stats;
@@ -146,6 +188,15 @@ struct NsStack {
 };
 
 static void udp_free(NsUdp *u);
+static void reasm_destroy(NsStack *s, NsReasm *e);
+static void reasm_add(NsStack *s, int family, const NsAddr *src,
+                      const NsAddr *dst, uint8_t proto, uint32_t id,
+                      size_t off, int more, const uint8_t *hdr,
+                      size_t hdr_len, const uint8_t *data, size_t len);
+static void ip_dispatch(NsStack *s, const uint8_t *pkt, size_t len, int family,
+                        size_t ip_hdr, uint8_t proto);
+static int ip_emit(NsStack *s, const NsAddr *src, const NsAddr *dst,
+                   uint8_t proto, const uint8_t *l4, size_t l4_len);
 
 /* ---------------- byte order and checksums ---------------- */
 
@@ -344,6 +395,76 @@ static int is_service_addr(const NsAddr *a)
     return 1;
 }
 
+/* ---------------- path MTU ---------------- */
+
+static uint16_t pmtu_clamp(int family, uint32_t mtu)
+{
+    uint32_t min = family == NS_AF_INET ? NS_PMTU_V4_MIN : NS_PMTU_V6_MIN;
+
+    if (mtu < min)
+        mtu = min;
+    if (mtu > NS_MTU)
+        mtu = NS_MTU;
+    return (uint16_t)mtu;
+}
+
+static NsPmtu *pmtu_find(NsStack *s, const NsAddr *dst)
+{
+    int i;
+
+    for (i = 0; i < NS_PMTU_ENTRIES; i++)
+        if (s->pmtu[i].valid && addr_eq(&s->pmtu[i].dst, dst))
+            return &s->pmtu[i];
+    return NULL;
+}
+
+static uint16_t pmtu_lookup(NsStack *s, const NsAddr *dst)
+{
+    NsPmtu *e = pmtu_find(s, dst);
+
+    return e ? e->mtu : NS_MTU;
+}
+
+/* Record a path MTU. ICMP errors pass lower_only so a stale error cannot
+   undo a newer, smaller value; the public API replaces the entry. */
+static void pmtu_note(NsStack *s, const NsAddr *dst, uint32_t mtu,
+                      int lower_only)
+{
+    NsPmtu *e = pmtu_find(s, dst);
+    NsPmtu *slot = e;
+    uint16_t value;
+    int i;
+
+    if (!dst || addr_unspecified(dst))
+        return;
+    value = pmtu_clamp(ns_addr_family(dst), mtu);
+    if (slot) {
+        if (lower_only && value >= slot->mtu)
+            return;
+        if (slot->mtu != value)
+            s->stats.pmtu_updates++;
+        slot->mtu = value;
+        slot->expires = s->clock + NS_PMTU_LIFETIME_MS;
+        return;
+    }
+    for (i = 0; i < NS_PMTU_ENTRIES; i++) {
+        if (!s->pmtu[i].valid) {
+            slot = &s->pmtu[i];
+            break;
+        }
+        if (!slot || s->pmtu[i].expires < slot->expires)
+            slot = &s->pmtu[i];
+    }
+    if (!slot)
+        return;
+    slot->dst = *dst;
+    slot->dst.family = (uint8_t)ns_addr_family(dst);
+    slot->mtu = value;
+    slot->expires = s->clock + NS_PMTU_LIFETIME_MS;
+    slot->valid = 1;
+    s->stats.pmtu_updates++;
+}
+
 /* ---------------- stack and shard lifecycle ---------------- */
 
 NsStack *ns_stack_new(const uint8_t prefix[NS_PREFIX_LEN], int nshards,
@@ -412,6 +533,8 @@ void ns_stack_free(NsStack *s)
             u = next;
         }
     }
+    while (s->reasm)
+        reasm_destroy(s, s->reasm);
     free(s);
 }
 
@@ -702,45 +825,163 @@ static void accept_remove(NsShard *sh, NsConn *c)
     }
 }
 
+/* ---------------- IP output, fragmentation and PMTU ---------------- */
+
+static void ipv4_send_one(NsStack *s, const NsAddr *src, const NsAddr *dst,
+                          uint8_t proto, uint16_t id, size_t off, int mf,
+                          int df, const uint8_t *payload, size_t plen)
+{
+    uint8_t pkt[NS_MTU];
+    size_t total = NS_IPV4_HDR + plen;
+    uint16_t frag;
+
+    memset(pkt, 0, NS_IPV4_HDR);
+    pkt[0] = 0x45;
+    wr16(pkt + 2, (uint16_t)total);
+    wr16(pkt + 4, id);
+    frag = (uint16_t)((df ? 0x4000 : 0) | (mf ? 0x2000 : 0) |
+                      ((off / 8) & 0x1fff));
+    wr16(pkt + 6, frag);
+    pkt[8] = 64; /* TTL */
+    pkt[9] = proto;
+    memcpy(pkt + 12, src->b, 4);
+    memcpy(pkt + 16, dst->b, 4);
+    wr16(pkt + 10, ipv4_checksum(pkt, NS_IPV4_HDR));
+    if (plen)
+        memcpy(pkt + NS_IPV4_HDR, payload, plen);
+
+    s->stats.tx_packets++;
+    if (mf || off)
+        s->stats.fragments_tx++;
+    s->send(s, pkt, total, s->opaque);
+}
+
+static void ipv6_send_one(NsStack *s, const NsAddr *src, const NsAddr *dst,
+                          uint8_t proto, uint32_t id, size_t off, int mf,
+                          int with_frag, const uint8_t *payload, size_t plen)
+{
+    uint8_t pkt[NS_MTU];
+    size_t hdr = with_frag ? NS_IPV6_HDR + 8 : NS_IPV6_HDR;
+    size_t body = with_frag ? 8 + plen : plen;
+
+    memset(pkt, 0, NS_IPV6_HDR);
+    pkt[0] = 0x60;
+    wr16(pkt + 4, (uint16_t)body);
+    pkt[6] = with_frag ? 44 : proto;
+    pkt[7] = 64; /* hop limit */
+    memcpy(pkt + 8, src->b, 16);
+    memcpy(pkt + 24, dst->b, 16);
+    if (with_frag) {
+        pkt[40] = proto;
+        pkt[41] = 0;
+        wr16(pkt + 42, (uint16_t)((off & 0xfff8) | (mf ? 1 : 0)));
+        wr32(pkt + 44, id);
+    }
+    if (plen)
+        memcpy(pkt + hdr, payload, plen);
+
+    s->stats.tx_packets++;
+    if (with_frag)
+        s->stats.fragments_tx++;
+    s->send(s, pkt, NS_IPV6_HDR + body, s->opaque);
+}
+
+/* Emit one upper-layer segment, fragmenting it to the path MTU. The L4
+   checksum is computed by the caller over the whole segment, so fragments
+   are plain byte slices of it. */
+static int ip_emit(NsStack *s, const NsAddr *src, const NsAddr *dst,
+                   uint8_t proto, const uint8_t *l4, size_t l4_len)
+{
+    int family = ns_addr_family(dst);
+    size_t ip_hdr = family == NS_AF_INET ? NS_IPV4_HDR : NS_IPV6_HDR;
+    size_t total = ip_hdr + l4_len;
+    size_t max_data;
+    size_t off;
+    uint16_t pmtu;
+
+    if (!s->send || family != ns_addr_family(src))
+        return -NS_EMSGSIZE;
+    if (family == NS_AF_INET) {
+        if (total > NS_MAX_IP_PACKET)
+            return -NS_EMSGSIZE;
+    } else if (l4_len > NS_MAX_IP_PACKET) {
+        return -NS_EMSGSIZE;
+    }
+
+    pmtu = pmtu_lookup(s, dst);
+    if (total <= pmtu) {
+        if (family == NS_AF_INET)
+            ipv4_send_one(s, src, dst, proto, ++s->ip_id, 0, 0, 1, l4,
+                          l4_len);
+        else
+            ipv6_send_one(s, src, dst, proto, ++s->ip6_id, 0, 0, 0, l4,
+                          l4_len);
+        return 0;
+    }
+
+    if (family == NS_AF_INET) {
+        uint16_t id;
+
+        if (pmtu <= NS_IPV4_HDR)
+            return -NS_EMSGSIZE;
+        max_data = ((size_t)(pmtu - NS_IPV4_HDR) / 8) * 8;
+        if (max_data < 8)
+            return -NS_EMSGSIZE;
+        id = ++s->ip_id;
+        for (off = 0; off < l4_len; off += max_data) {
+            size_t chunk = l4_len - off < max_data ? l4_len - off : max_data;
+            int mf = off + chunk < l4_len;
+            ipv4_send_one(s, src, dst, proto, id, off, mf, 0, l4 + off,
+                          chunk);
+        }
+    } else {
+        uint32_t id;
+
+        if (pmtu <= NS_IPV6_HDR + 8)
+            return -NS_EMSGSIZE;
+        max_data = ((size_t)(pmtu - NS_IPV6_HDR - 8) / 8) * 8;
+        if (max_data < 8)
+            return -NS_EMSGSIZE;
+        id = ++s->ip6_id;
+        for (off = 0; off < l4_len; off += max_data) {
+            size_t chunk = l4_len - off < max_data ? l4_len - off : max_data;
+            int mf = off + chunk < l4_len;
+            ipv6_send_one(s, src, dst, proto, id, off, mf, 1, l4 + off,
+                          chunk);
+        }
+    }
+    return 0;
+}
+
+/* Largest TCP payload that fits the current path MTU. */
+static size_t tcp_segment_limit(NsStack *s, const NsAddr *dst)
+{
+    int family = ns_addr_family(dst);
+    size_t ip_hdr = family == NS_AF_INET ? NS_IPV4_HDR : NS_IPV6_HDR;
+    size_t mss;
+    uint16_t pmtu = pmtu_lookup(s, dst);
+
+    if (pmtu <= ip_hdr + NS_TCP_HDR)
+        return 1;
+    mss = pmtu - ip_hdr - NS_TCP_HDR;
+    if (mss > NS_MSS)
+        mss = NS_MSS;
+    return mss;
+}
+
 /* ---------------- TCP transmit ---------------- */
 
 static void ns_emit(NsConn *c, uint8_t flags, uint32_t seq, uint32_t ack,
                     const uint8_t *payload, size_t plen)
 {
     NsStack *s = c->shard->stack;
-    uint8_t pkt[NS_MAX_PACKET];
-    uint8_t *tcp;
+    uint8_t tcp[NS_TCP_HDR + NS_MSS];
     size_t tcp_len = NS_TCP_HDR + plen;
     int family = ns_addr_family(&c->local);
-    size_t ip_hdr = family == NS_AF_INET ? NS_IPV4_HDR : NS_IPV6_HDR;
-    size_t total = ip_hdr + tcp_len;
 
-    if (!s->send || total > sizeof(pkt) ||
-        family != ns_addr_family(&c->remote))
+    if (!s->send || plen > NS_MSS || family != ns_addr_family(&c->remote))
         return;
 
-    if (family == NS_AF_INET) {
-        memset(pkt, 0, NS_IPV4_HDR);
-        pkt[0] = 0x45;
-        wr16(pkt + 2, (uint16_t)total);
-        wr16(pkt + 4, ++s->ip_id);
-        wr16(pkt + 6, 0x4000); /* DF */
-        pkt[8] = 64;           /* TTL */
-        pkt[9] = 6;            /* TCP */
-        memcpy(pkt + 12, c->local.b, 4);
-        memcpy(pkt + 16, c->remote.b, 4);
-        wr16(pkt + 10, ipv4_checksum(pkt, NS_IPV4_HDR));
-    } else {
-        memset(pkt, 0, NS_IPV6_HDR);
-        pkt[0] = 0x60;
-        wr16(pkt + 4, (uint16_t)tcp_len);
-        pkt[6] = 6;  /* TCP */
-        pkt[7] = 64; /* hop limit */
-        memcpy(pkt + 8, c->local.b, 16);
-        memcpy(pkt + 24, c->remote.b, 16);
-    }
-
-    tcp = pkt + ip_hdr;
     wr16(tcp, c->lport);
     wr16(tcp + 2, c->rport);
     wr32(tcp + 4, seq);
@@ -755,8 +996,7 @@ static void ns_emit(NsConn *c, uint8_t flags, uint32_t seq, uint32_t ack,
     wr16(tcp + 16, tcp_checksum(c->local.b, c->remote.b, family, tcp,
                                 tcp_len));
 
-    s->stats.tx_packets++;
-    s->send(s, pkt, total, s->opaque);
+    ip_emit(s, &c->local, &c->remote, 6, tcp, tcp_len);
 }
 
 static NsSeg *seg_add(NsConn *c, uint32_t seq, uint32_t seq_len,
@@ -960,43 +1200,70 @@ static int icmp_can_reply(const NsAddr *src, const NsAddr *dst)
 static int icmp_emit(NsStack *s, const NsAddr *src, const NsAddr *dst,
                      uint8_t *msg, size_t len)
 {
-    uint8_t pkt[NS_MAX_PACKET];
     int family = ns_addr_family(dst);
-    size_t ip_hdr = family == NS_AF_INET ? NS_IPV4_HDR : NS_IPV6_HDR;
-    size_t total = ip_hdr + len;
+    int r;
 
     if (!s->send || family != ns_addr_family(src) || len < NS_ICMP_HDR ||
-        total > NS_MTU || total > sizeof(pkt))
+        len > NS_MAX_IP_PACKET)
         return -NS_EMSGSIZE;
 
     wr16(msg + 2, 0);
-    if (family == NS_AF_INET) {
-        memset(pkt, 0, NS_IPV4_HDR);
-        pkt[0] = 0x45;
-        wr16(pkt + 2, (uint16_t)total);
-        wr16(pkt + 4, ++s->ip_id);
-        pkt[8] = 64; /* TTL */
-        pkt[9] = 1;  /* ICMP */
-        memcpy(pkt + 12, src->b, 4);
-        memcpy(pkt + 16, dst->b, 4);
-        wr16(pkt + 10, ipv4_checksum(pkt, NS_IPV4_HDR));
+    if (family == NS_AF_INET)
         wr16(msg + 2, ipv4_checksum(msg, len));
-    } else {
-        memset(pkt, 0, NS_IPV6_HDR);
-        pkt[0] = 0x60;
-        wr16(pkt + 4, (uint16_t)len);
-        pkt[6] = 58; /* ICMPv6 */
-        pkt[7] = 64; /* hop limit */
-        memcpy(pkt + 8, src->b, 16);
-        memcpy(pkt + 24, dst->b, 16);
+    else
         wr16(msg + 2, l4_checksum(src->b, dst->b, family, 58, msg, len));
-    }
-    memcpy(pkt + ip_hdr, msg, len);
 
-    s->stats.tx_packets++;
-    s->stats.icmp_tx++;
-    s->send(s, pkt, total, s->opaque);
-    return 0;
+    r = ip_emit(s, src, dst, family == NS_AF_INET ? 1 : 58, msg, len);
+    if (r == 0)
+        s->stats.icmp_tx++;
+    return r;
+}
+
+/* Learn the path MTU from an ICMP error. The quoted packet's destination is
+   the peer the original datagram was sent to. */
+static void icmp_pmtu_input(NsStack *s, int family, const uint8_t *icmp,
+                            size_t icmp_len)
+{
+    const uint8_t *quote;
+    size_t quote_len;
+    size_t ip_hdr;
+    size_t addr_len;
+    NsAddr dst;
+    uint32_t mtu;
+
+    if (family == NS_AF_INET) {
+        if (icmp[0] != 3 || icmp[1] != 4 || icmp_len < NS_ICMP_HDR + NS_IPV4_HDR)
+            return;
+        mtu = rd16(icmp + 6);
+        if (mtu == 0)
+            mtu = NS_PMTU_V4_MIN;
+        quote = icmp + NS_ICMP_HDR;
+        quote_len = icmp_len - NS_ICMP_HDR;
+        if ((quote[0] >> 4) != 4)
+            return;
+        ip_hdr = (size_t)(quote[0] & 0x0f) * 4;
+        if (ip_hdr < NS_IPV4_HDR || quote_len < ip_hdr)
+            return;
+        addr_len = 4;
+        memset(&dst, 0, sizeof(dst));
+        dst.family = NS_AF_INET;
+        memcpy(dst.b, quote + 16, addr_len);
+    } else {
+        if (icmp[0] != 2 || icmp_len < NS_ICMP_HDR + NS_IPV6_HDR)
+            return;
+        mtu = rd32(icmp + 4);
+        if (mtu == 0)
+            return;
+        quote = icmp + NS_ICMP_HDR;
+        quote_len = icmp_len - NS_ICMP_HDR;
+        if ((quote[0] >> 4) != 6)
+            return;
+        addr_len = 16;
+        memset(&dst, 0, sizeof(dst));
+        dst.family = NS_AF_INET6;
+        memcpy(dst.b, quote + 24, addr_len);
+    }
+    pmtu_note(s, &dst, mtu, 1);
 }
 
 /* Answer an echo request from the address the request was sent to. */
@@ -1028,6 +1295,7 @@ static void icmp_input(NsShard *sh, const uint8_t *pkt, size_t len)
         return;
     }
     s->stats.icmp_rx++;
+    icmp_pmtu_input(s, family, icmp, icmp_len);
 
     memset(&sa, 0, sizeof(sa));
     memset(&da, 0, sizeof(da));
@@ -1112,17 +1380,21 @@ static void icmp_port_unreachable(NsShard *sh, const uint8_t *pkt, size_t len)
 int ns_icmp_echo(NsStack *s, const NsAddr *local, const NsAddr *remote,
                  uint16_t id, uint16_t seq, const void *payload, size_t len)
 {
-    uint8_t msg[NS_MAX_PACKET];
+    uint8_t *msg;
     int family;
     size_t total;
+    int r;
 
     if (!s || !local || !remote)
         return -NS_EINVAL;
     family = ns_addr_family(remote);
     if (family != ns_addr_family(local))
         return -NS_EINVAL;
+    if (len > (size_t)NS_MAX_IP_PACKET - NS_ICMP_HDR)
+        return -NS_EMSGSIZE;
     total = NS_ICMP_HDR + len;
-    if (total > sizeof(msg))
+    msg = malloc(total);
+    if (!msg)
         return -NS_EMSGSIZE;
     memset(msg, 0, NS_ICMP_HDR);
     msg[0] = family == NS_AF_INET ? 8 : 128;
@@ -1131,7 +1403,9 @@ int ns_icmp_echo(NsStack *s, const NsAddr *local, const NsAddr *remote,
     wr16(msg + 6, seq);
     if (len)
         memcpy(msg + NS_ICMP_HDR, payload, len);
-    return icmp_emit(s, local, remote, msg, total);
+    r = icmp_emit(s, local, remote, msg, total);
+    free(msg);
+    return r;
 }
 
 /* ---------------- UDP ---------------- */
@@ -1215,40 +1489,21 @@ static int udp_emit(NsStack *s, const NsAddr *src, const NsAddr *dst,
                     uint16_t sport, uint16_t dport, const void *buf,
                     size_t len)
 {
-    uint8_t pkt[NS_MAX_PACKET];
+    uint8_t small[NS_MAX_PACKET];
+    uint8_t *udp = small;
     int family = ns_addr_family(dst);
-    size_t ip_hdr = family == NS_AF_INET ? NS_IPV4_HDR : NS_IPV6_HDR;
     size_t udp_len = NS_UDP_HDR + len;
-    size_t total = ip_hdr + udp_len;
-    uint8_t *udp;
+    int r;
 
-    if (!s->send || family != ns_addr_family(src) ||
-        len > NS_MTU - ip_hdr - NS_UDP_HDR || total > sizeof(pkt) ||
-        udp_len > 65535)
+    if (!s->send || family != ns_addr_family(src) || udp_len > 65535 ||
+        (family == NS_AF_INET && NS_IPV4_HDR + udp_len > NS_MAX_IP_PACKET))
         return -NS_EMSGSIZE;
-
-    if (family == NS_AF_INET) {
-        memset(pkt, 0, NS_IPV4_HDR);
-        pkt[0] = 0x45;
-        wr16(pkt + 2, (uint16_t)total);
-        wr16(pkt + 4, ++s->ip_id);
-        wr16(pkt + 6, 0x4000); /* DF */
-        pkt[8] = 64;           /* TTL */
-        pkt[9] = 17;           /* UDP */
-        memcpy(pkt + 12, src->b, 4);
-        memcpy(pkt + 16, dst->b, 4);
-        wr16(pkt + 10, ipv4_checksum(pkt, NS_IPV4_HDR));
-    } else {
-        memset(pkt, 0, NS_IPV6_HDR);
-        pkt[0] = 0x60;
-        wr16(pkt + 4, (uint16_t)udp_len);
-        pkt[6] = 17; /* UDP */
-        pkt[7] = 64; /* hop limit */
-        memcpy(pkt + 8, src->b, 16);
-        memcpy(pkt + 24, dst->b, 16);
+    if (udp_len > sizeof(small)) {
+        udp = malloc(udp_len);
+        if (!udp)
+            return -NS_EMSGSIZE;
     }
 
-    udp = pkt + ip_hdr;
     wr16(udp, sport);
     wr16(udp + 2, dport);
     wr16(udp + 4, (uint16_t)udp_len);
@@ -1257,9 +1512,10 @@ static int udp_emit(NsStack *s, const NsAddr *src, const NsAddr *dst,
         memcpy(udp + NS_UDP_HDR, buf, len);
     wr16(udp + 6, udp_checksum(src->b, dst->b, family, udp, udp_len));
 
-    s->stats.tx_packets++;
-    s->send(s, pkt, total, s->opaque);
-    return 0;
+    r = ip_emit(s, src, dst, 17, udp, udp_len);
+    if (udp != small)
+        free(udp);
+    return r;
 }
 
 uint64_t ns_udp_open(NsStack *s, const NsAddr *local, uint16_t port, int reuse)
@@ -1558,6 +1814,282 @@ static void udp_input(NsShard *sh, const uint8_t *pkt, size_t len)
     u->qbytes += dlen;
 }
 
+/* ---------------- fragment reassembly ---------------- */
+
+static int reasm_bit_test(const uint8_t *bm, size_t i)
+{
+    return (bm[i >> 3] >> (i & 7)) & 1;
+}
+
+static void reasm_bit_set(uint8_t *bm, size_t i)
+{
+    bm[i >> 3] |= (uint8_t)(1u << (i & 7));
+}
+
+static NsReasm *reasm_find(NsStack *s, int family, const NsAddr *src,
+                           const NsAddr *dst, uint8_t proto, uint32_t id)
+{
+    NsReasm *e;
+
+    for (e = s->reasm; e; e = e->next)
+        if (e->family == family && e->proto == proto && e->id == id &&
+            addr_eq(&e->src, src) && addr_eq(&e->dst, dst))
+            return e;
+    return NULL;
+}
+
+static void reasm_destroy(NsStack *s, NsReasm *e)
+{
+    NsReasm **pp = &s->reasm;
+
+    while (*pp && *pp != e)
+        pp = &(*pp)->next;
+    if (*pp != e)
+        return;
+    *pp = e->next;
+    s->nreasm--;
+    free(e->data);
+    free(e->bitmap);
+    free(e);
+}
+
+static NsReasm *reasm_create(NsStack *s, int family, const NsAddr *src,
+                             const NsAddr *dst, uint8_t proto, uint32_t id)
+{
+    NsReasm *e;
+
+    /* Reclaim expired sets before enforcing the limit. */
+    e = s->reasm;
+    while (e) {
+        NsReasm *next = e->next;
+        if (s->clock >= e->expires) {
+            s->stats.reassembly_dropped++;
+            reasm_destroy(s, e);
+        }
+        e = next;
+    }
+    if (s->nreasm >= NS_REASM_MAX)
+        return NULL;
+
+    e = calloc(1, sizeof(*e));
+    if (!e)
+        return NULL;
+    e->data = malloc(NS_REASM_MAX_LEN);
+    e->bitmap = calloc(1, NS_REASM_BITMAP);
+    if (!e->data || !e->bitmap) {
+        free(e->data);
+        free(e->bitmap);
+        free(e);
+        return NULL;
+    }
+    e->family = (uint8_t)family;
+    e->proto = proto;
+    e->id = id;
+    e->src = *src;
+    e->src.family = (uint8_t)family;
+    e->dst = *dst;
+    e->dst.family = (uint8_t)family;
+    e->expires = s->clock + NS_REASM_TIMEOUT_MS;
+    e->next = s->reasm;
+    s->reasm = e;
+    s->nreasm++;
+    return e;
+}
+
+static void reasm_add(NsStack *s, int family, const NsAddr *src,
+                      const NsAddr *dst, uint8_t proto, uint32_t id,
+                      size_t off, int more, const uint8_t *hdr,
+                      size_t hdr_len, const uint8_t *data, size_t len)
+{
+    NsReasm *e;
+    size_t i;
+    size_t max_total = family == NS_AF_INET
+                           ? NS_MAX_IP_PACKET - NS_IPV4_HDR
+                           : NS_MAX_IP_PACKET;
+
+    e = reasm_find(s, family, src, dst, proto, id);
+    if (!e) {
+        e = reasm_create(s, family, src, dst, proto, id);
+        if (!e) {
+            s->stats.reassembly_dropped++;
+            return;
+        }
+    }
+    e->expires = s->clock + NS_REASM_TIMEOUT_MS;
+
+    if (off == 0 && !e->has_hdr && hdr && hdr_len <= sizeof(e->hdr)) {
+        memcpy(e->hdr, hdr, hdr_len);
+        e->hdr_len = (uint8_t)hdr_len;
+        e->has_hdr = 1;
+    }
+    if (off > max_total || len > max_total - off) {
+        s->stats.reassembly_dropped++;
+        reasm_destroy(s, e);
+        return;
+    }
+    if (!more) {
+        size_t end = off + len;
+        if (end > max_total || (e->total && e->total != end)) {
+            s->stats.reassembly_dropped++;
+            reasm_destroy(s, e);
+            return;
+        }
+        e->total = end;
+    }
+    if (e->total && off + len > e->total) {
+        s->stats.reassembly_dropped++;
+        reasm_destroy(s, e);
+        return;
+    }
+    for (i = 0; i < len; i++) {
+        size_t pos = off + i;
+        if (!reasm_bit_test(e->bitmap, pos)) {
+            e->data[pos] = data[i];
+            reasm_bit_set(e->bitmap, pos);
+            e->have++;
+        }
+    }
+
+    if (!e->total || e->have != e->total || !e->has_hdr)
+        return;
+
+    {
+        size_t payload_total = e->total;
+        size_t header_len = e->hdr_len;
+        size_t pkt_len = header_len + payload_total;
+        uint8_t *pkt = malloc(pkt_len);
+        uint8_t *copy = malloc(header_len);
+
+        if (!pkt || !copy) {
+            free(pkt);
+            free(copy);
+            s->stats.reassembly_dropped++;
+            reasm_destroy(s, e);
+            return;
+        }
+        memcpy(copy, e->hdr, header_len);
+        memcpy(pkt + header_len, e->data, payload_total);
+        if (family == NS_AF_INET) {
+            uint16_t frag;
+
+            if (pkt_len > NS_MAX_IP_PACKET) {
+                free(pkt);
+                free(copy);
+                s->stats.reassembly_dropped++;
+                reasm_destroy(s, e);
+                return;
+            }
+            memcpy(pkt, copy, header_len);
+            wr16(pkt + 2, (uint16_t)pkt_len);
+            frag = rd16(pkt + 6) & 0x4000; /* keep DF, clear MF/offset */
+            wr16(pkt + 6, frag);
+            wr16(pkt + 10, 0);
+            wr16(pkt + 10, ipv4_checksum(pkt, header_len));
+        } else {
+            memcpy(pkt, copy, NS_IPV6_HDR);
+            wr16(pkt + 4, (uint16_t)payload_total);
+            pkt[6] = e->proto;
+        }
+        free(copy);
+        s->stats.reassembled++;
+        reasm_destroy(s, e);
+        ip_dispatch(s, pkt, pkt_len, family, header_len, proto);
+        free(pkt);
+    }
+}
+
+/* Validate one complete IP packet and queue it for the owning shard. */
+static void ip_dispatch(NsStack *s, const uint8_t *pkt, size_t len, int family,
+                        size_t ip_hdr, uint8_t proto)
+{
+    const uint8_t *src = family == NS_AF_INET ? pkt + 12 : pkt + 8;
+    const uint8_t *dst = family == NS_AF_INET ? pkt + 16 : pkt + 24;
+    const uint8_t *l4;
+    size_t l4_len;
+    size_t off;
+    int shard;
+    NsShard *sh;
+    NsPacket *p;
+
+    if (len < ip_hdr) {
+        s->stats.dropped++;
+        return;
+    }
+    l4 = pkt + ip_hdr;
+    l4_len = len - ip_hdr;
+
+    if (proto == 17) {
+        uint16_t ulen;
+
+        if (l4_len < NS_UDP_HDR) {
+            s->stats.dropped++;
+            return;
+        }
+        ulen = rd16(l4 + 4);
+        if (ulen < NS_UDP_HDR || ulen > l4_len) {
+            s->stats.dropped++;
+            return;
+        }
+        len = ip_hdr + ulen;
+        l4_len = ulen;
+        if (rd16(l4 + 6) == 0) {
+            if (family != NS_AF_INET) {
+                s->stats.dropped++;
+                return;
+            }
+        } else if (l4_checksum(src, dst, family, 17, l4, l4_len) != 0) {
+            s->stats.dropped++;
+            return;
+        }
+    } else if (proto == 1 || proto == 58) {
+        if (l4_len < NS_ICMP_HDR) {
+            s->stats.dropped++;
+            return;
+        }
+    } else {
+        if (l4_len < NS_TCP_HDR) {
+            s->stats.dropped++;
+            return;
+        }
+        off = (size_t)(l4[12] >> 4) * 4;
+        if (off < NS_TCP_HDR || off > l4_len ||
+            tcp_checksum(src, dst, family, l4, l4_len) != 0) {
+            s->stats.dropped++;
+            return;
+        }
+    }
+
+    if (family == NS_AF_INET)
+        shard = 0;
+    else
+        shard = s->plain ? 0 : pkt[24 + 8];
+    if (shard < 0 || shard >= s->nshards) {
+        s->stats.dropped++;
+        return;
+    }
+
+    sh = &s->shards[shard];
+    if (sh->qlen >= NS_QUEUE_MAX) {
+        s->stats.dropped++;
+        return;
+    }
+    p = malloc(sizeof(*p) + len);
+    if (!p) {
+        s->stats.dropped++;
+        return;
+    }
+    p->next = NULL;
+    p->len = (uint32_t)len;
+    memcpy(p->data, pkt, len);
+    if (sh->qtail)
+        sh->qtail->next = p;
+    else
+        sh->qhead = p;
+    sh->qtail = p;
+    sh->qlen++;
+    s->stats.per_shard_rx[shard]++;
+}
+
 static void shard_process(NsShard *sh, NsPacket *p)
 {
     const uint8_t *pkt = p->data;
@@ -1675,34 +2207,20 @@ int ns_run(NsStack *s, int budget)
 
 void ns_input(NsStack *s, const uint8_t *pkt, size_t len)
 {
-    NsShard *sh;
-    NsPacket *p;
-    int shard;
     int family;
     int proto;
-    size_t ip_hdr;
-    const uint8_t *src;
-    const uint8_t *dst;
-    const uint8_t *l4;
-    size_t l4_len;
-    size_t off;
 
-    if (!s || len < 1) {
+    if (!s || len < 1)
         return;
-    }
     s->stats.rx_packets++;
 
     family = (pkt[0] >> 4) == 4 ? NS_AF_INET : NS_AF_INET6;
     if (family == NS_AF_INET) {
         uint16_t frag;
         uint16_t total;
+        size_t ip_hdr;
 
-        if (len < NS_IPV4_HDR || pkt[0] == 0) {
-            s->stats.dropped++;
-            return;
-        }
-        proto = pkt[9];
-        if (proto != 1 && proto != 6 && proto != 17) {
+        if ((pkt[0] >> 4) != 4 || len < NS_IPV4_HDR) {
             s->stats.dropped++;
             return;
         }
@@ -1717,33 +2235,78 @@ void ns_input(NsStack *s, const uint8_t *pkt, size_t len)
             return;
         }
         len = total;
-        /* Reassembly is not implemented; DF is fine, MF and fragments
-           are not. */
-        frag = rd16(pkt + 6);
-        if (frag & 0x3fff) {
-            s->stats.dropped++;
-            return;
-        }
         if (ipv4_checksum(pkt, ip_hdr) != 0) {
             s->stats.dropped++;
             return;
         }
-        src = pkt + 12;
-        dst = pkt + 16;
-        l4 = pkt + ip_hdr;
-        l4_len = len - ip_hdr;
-        /* IPv4 has no shard byte. The node integration always uses a
-           plain stack; route every IPv4 packet to shard 0. */
-        shard = 0;
+        proto = pkt[9];
+        if (proto != 1 && proto != 6 && proto != 17) {
+            s->stats.dropped++;
+            return;
+        }
+        frag = rd16(pkt + 6);
+        if (frag & 0x3fff) {
+            NsAddr src, dst;
+
+            memset(&src, 0, sizeof(src));
+            memset(&dst, 0, sizeof(dst));
+            src.family = dst.family = NS_AF_INET;
+            memcpy(src.b, pkt + 12, 4);
+            memcpy(dst.b, pkt + 16, 4);
+            s->stats.fragments_rx++;
+            reasm_add(s, family, &src, &dst, (uint8_t)proto, rd16(pkt + 4),
+                      (size_t)(frag & 0x1fff) * 8, (frag & 0x2000) != 0,
+                      pkt, ip_hdr, pkt + ip_hdr, len - ip_hdr);
+            return;
+        }
+        ip_dispatch(s, pkt, len, family, ip_hdr, (uint8_t)proto);
     } else {
-        int body;
+        size_t body;
         size_t min_hdr;
 
         if ((pkt[0] >> 4) != 6 || len < NS_IPV6_HDR) {
             s->stats.dropped++;
             return;
         }
+        body = rd16(pkt + 4);
+        if (body > len - NS_IPV6_HDR) {
+            s->stats.dropped++;
+            return;
+        }
+        len = NS_IPV6_HDR + body;
         proto = pkt[6];
+
+        /* Only the Fragment extension header is understood. A fragment
+           carries an upper-layer protocol in its next-header field. */
+        if (proto == 44) {
+            uint16_t word;
+            uint8_t inner;
+            size_t off;
+            NsAddr src, dst;
+
+            if (len < NS_IPV6_HDR + 8) {
+                s->stats.dropped++;
+                return;
+            }
+            inner = pkt[NS_IPV6_HDR];
+            if (inner != 6 && inner != 17 && inner != 58) {
+                s->stats.dropped++;
+                return;
+            }
+            word = rd16(pkt + NS_IPV6_HDR + 2);
+            off = (size_t)(word & 0xfff8);
+            memset(&src, 0, sizeof(src));
+            memset(&dst, 0, sizeof(dst));
+            src.family = dst.family = NS_AF_INET6;
+            memcpy(src.b, pkt + 8, 16);
+            memcpy(dst.b, pkt + 24, 16);
+            s->stats.fragments_rx++;
+            reasm_add(s, family, &src, &dst, inner,
+                      rd32(pkt + NS_IPV6_HDR + 4), off, (word & 1) != 0,
+                      pkt, NS_IPV6_HDR, pkt + NS_IPV6_HDR + 8,
+                      len - NS_IPV6_HDR - 8);
+            return;
+        }
         if (proto != 6 && proto != 17 && proto != 58) {
             s->stats.dropped++;
             return;
@@ -1754,90 +2317,8 @@ void ns_input(NsStack *s, const uint8_t *pkt, size_t len)
             s->stats.dropped++;
             return;
         }
-        body = rd16(pkt + 4);
-        if (body < (int)min_hdr || (size_t)body + NS_IPV6_HDR > len) {
-            s->stats.dropped++;
-            return;
-        }
-        len = (size_t)body + NS_IPV6_HDR;
-        ip_hdr = NS_IPV6_HDR;
-        src = pkt + 8;
-        dst = pkt + 24;
-        l4 = pkt + NS_IPV6_HDR;
-        l4_len = len - NS_IPV6_HDR;
-        shard = s->plain ? 0 : pkt[24 + 8];
+        ip_dispatch(s, pkt, len, family, NS_IPV6_HDR, (uint8_t)proto);
     }
-
-    if (shard < 0 || shard >= s->nshards) {
-        s->stats.dropped++;
-        return;
-    }
-
-    if (proto == 17) {
-        uint16_t ulen;
-
-        if (l4_len < NS_UDP_HDR) {
-            s->stats.dropped++;
-            return;
-        }
-        ulen = rd16(l4 + 4);
-        if (ulen < NS_UDP_HDR || ulen > l4_len) {
-            s->stats.dropped++;
-            return;
-        }
-        /* Trim any padding so the queued packet matches the UDP length. */
-        len = ip_hdr + ulen;
-        l4_len = ulen;
-        if (rd16(l4 + 6) == 0) {
-            /* No checksum is only legal for IPv4. */
-            if (family != NS_AF_INET) {
-                s->stats.dropped++;
-                return;
-            }
-        } else if (l4_checksum(src, dst, family, 17, l4, l4_len) != 0) {
-            s->stats.dropped++;
-            return;
-        }
-    } else if (proto == 1 || proto == 58) {
-        /* ICMP checksums are verified in icmp_input(), which has the
-           addresses needed for the ICMPv6 pseudo-header. */
-        if (l4_len < NS_ICMP_HDR) {
-            s->stats.dropped++;
-            return;
-        }
-    } else {
-        if (l4_len < NS_TCP_HDR) {
-            s->stats.dropped++;
-            return;
-        }
-        off = (size_t)(l4[12] >> 4) * 4;
-        if (off < NS_TCP_HDR || off > l4_len ||
-            tcp_checksum(src, dst, family, l4, l4_len) != 0) {
-            s->stats.dropped++;
-            return;
-        }
-    }
-
-    sh = &s->shards[shard];
-    if (sh->qlen >= NS_QUEUE_MAX) {
-        s->stats.dropped++;
-        return;
-    }
-    p = malloc(sizeof(*p) + len);
-    if (!p) {
-        s->stats.dropped++;
-        return;
-    }
-    p->next = NULL;
-    p->len = (uint16_t)len;
-    memcpy(p->data, pkt, len);
-    if (sh->qtail)
-        sh->qtail->next = p;
-    else
-        sh->qhead = p;
-    sh->qtail = p;
-    sh->qlen++;
-    s->stats.per_shard_rx[shard]++;
 }
 
 void ns_tick(NsStack *s, uint64_t now_ms)
@@ -1847,6 +2328,25 @@ void ns_tick(NsStack *s, uint64_t now_ms)
     if (!s)
         return;
     s->clock = now_ms;
+
+    /* Expire incomplete fragment sets and path-MTU observations. */
+    {
+        NsReasm *e = s->reasm;
+        int j;
+
+        while (e) {
+            NsReasm *next = e->next;
+            if (now_ms >= e->expires) {
+                s->stats.reassembly_dropped++;
+                reasm_destroy(s, e);
+            }
+            e = next;
+        }
+        for (j = 0; j < NS_PMTU_ENTRIES; j++)
+            if (s->pmtu[j].valid && now_ms >= s->pmtu[j].expires)
+                s->pmtu[j].valid = 0;
+    }
+
     for (i = 0; i < s->nshards; i++) {
         NsShard *sh = &s->shards[i];
         NsConn *c;
@@ -1977,13 +2477,15 @@ int ns_send(NsStack *s, uint64_t id, const void *buf, size_t len)
     NsConn *c = conn_by_id(s, id);
     const uint8_t *p = buf;
     size_t total = len;
+    size_t limit;
 
     if (!c)
         return -NS_ENOTCONN;
     if (c->state != NS_ESTABLISHED && c->state != NS_CLOSE_WAIT)
         return -NS_ENOTCONN;
+    limit = tcp_segment_limit(s, &c->remote);
     while (len > 0) {
-        size_t n = len > NS_MSS ? NS_MSS : len;
+        size_t n = len > limit ? limit : len;
         uint8_t flags = NS_TCP_ACK | (n == len ? NS_TCP_PSH : 0);
         NsSeg *seg = seg_add(c, c->snd_nxt, (uint32_t)n, flags, p, n,
                              s->clock);
@@ -2184,6 +2686,29 @@ int ns_conn_addr(NsStack *s, uint64_t id, NsAddr *local, uint16_t *lport,
         *remote = c->remote;
     if (rport)
         *rport = c->rport;
+    return 0;
+}
+
+int ns_path_mtu(NsStack *s, const NsAddr *dst)
+{
+    if (!s || !dst)
+        return -NS_EINVAL;
+    return (int)pmtu_lookup(s, dst);
+}
+
+int ns_path_mtu_set(NsStack *s, const NsAddr *dst, uint16_t mtu)
+{
+    NsPmtu *e;
+
+    if (!s || !dst)
+        return -NS_EINVAL;
+    if (mtu == 0) {
+        e = pmtu_find(s, dst);
+        if (e)
+            e->valid = 0;
+        return 0;
+    }
+    pmtu_note(s, dst, mtu, 0);
     return 0;
 }
 

@@ -73,8 +73,12 @@ that may be strings, `Buffer`s, typed arrays or `ArrayBuffer`s.
   implements the socket operations on top of `netstack.c`, and the real
   eventfd is what libev polls. UDP adds `sendto`/`recvfrom`/`disconnect`
   natives and shares the virtual-fd bridge with streams. ICMP answers echo
-  requests and generates port-unreachable errors for unmatched UDP datagrams;
-  it has no JavaScript API and is driven by packets arriving on the link.
+  requests, generates port-unreachable errors for unmatched UDP datagrams, and
+  learns path MTUs from fragmentation-needed / packet-too-big errors; it has no
+  JavaScript API and is driven by packets arriving on the link.
+  The shared IP emitter fragments datagrams to the cached path MTU, and inbound
+  fragments are reassembled before checksum validation and dispatch. Path MTU
+  is cached per destination and also sizes TCP segments (capped at `NS_MSS`).
 
 When a virtual socket binds, connects or sends to an address outside the
 managed prefix, the bridge creates a kernel socket, `dup2`s it onto the same
@@ -137,8 +141,8 @@ Concurrent TLS use from multiple workers is not safe yet. Crypto RNG state
 ```bash
 make test              # upstream quickjs-ng suite (qjs)
 make qnode-test        # qnode-only tests (crypto, workers, fetch, modules, net, dgram, WebSocket)
-make netstack-test     # owned TCP/UDP/ICMP engine in isolation
-make netstack-tun-test # optional TUN path (skips without user namespaces)
+make netstack-test     # owned TCP/UDP/ICMP engine, fragmentation and PMTU in isolation
+make netstack-tun-test # optional TUN path, including large fragmented datagrams
 ```
 
 Test262 cannot exercise the Node APIs, so qnode tests live in `tests/qnode/`.

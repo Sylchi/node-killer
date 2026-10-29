@@ -2,8 +2,9 @@
 
 Status: integrated. `node:net` hands managed IPv4 and IPv6 TCP streams and
 `node:dgram` UDP sockets to the in-process stack in `netstack.c` instead of the
-kernel. The stack also answers IPv4 and IPv6 ICMP echo requests and reports
-unreachable UDP ports. Unmanaged addresses still use kernel sockets, and
+kernel. The stack also answers IPv4 and IPv6 ICMP echo requests, reports
+unreachable UDP ports, fragments and reassembles IP packets, and learns path
+MTUs from ICMP errors. Unmanaged addresses still use kernel sockets, and
 `netstack: false` restores the kernel path per socket.
 
 The kernel-backed sharded transport is still available and is documented in
@@ -172,20 +173,60 @@ Implemented:
 - `SO_ERROR`, `SO_REUSEADDR`-style option bookkeeping and address queries
   used by `node:net`.
 
+TCP segments are sized from the cached path MTU (see below) and capped at
+`NS_MSS` (1400 bytes). A smaller PMTU therefore produces smaller segments
+without involving IP fragmentation.
+
 Current limits:
 
-- No IPv4/IPv6 fragmentation or reassembly. UDP datagrams larger than the
-  link MTU are rejected instead of being fragmented.
-- No out-of-order reassembly, SACK, window scaling, congestion control or
-  delayed ACK. The receive window is a fixed 64 KiB ring; peers that exceed it
-  are retransmitted into after the application reads.
+- No SACK, window scaling, congestion control or delayed ACK. Segments are
+  delivered in order; the receive window is a fixed 64 KiB ring, and peers that
+  exceed it are retransmitted into after the application reads.
 - No cross-process loopback. Two processes need a TUN link (or a future
   shared-memory/raw link).
-- Path MTU discovery is not implemented; the stack emits 1400-byte segments.
 - TLS over a virtual fd is routed through the bridge, but there is no
   dedicated regression test yet.
 - IPv4 is plain-only. There is no shard byte in an IPv4 header, so sharded
   listener allocation remains an IPv6 feature.
+
+## Fragmentation, reassembly and PMTU
+
+All outbound IP traffic (TCP, UDP and ICMP) goes through a shared emitter:
+
+- IPv4 fragments use one IP identification per datagram and set MF plus the
+  fragment offset. `DF` is set only when no fragmentation is needed.
+- IPv6 uses a Fragment extension header (next header 44) with a 32-bit
+  identification. Non-fragmented packets are emitted without the extension
+  header.
+- Fragment sizes are computed from the destination's path MTU and rounded down
+  to a multiple of 8 bytes.
+
+Inbound fragments are reassembled before checksum validation and dispatch:
+
+- The key is address family, source, destination, upper-layer protocol and
+  identification.
+- Up to 8 datagrams are reassembled concurrently. A set expires 30 seconds
+  after its most recent fragment, and incomplete, overlapping-invalid or
+  oversized sets are dropped and counted in `reassembly_dropped`.
+- Fragments may arrive out of order; the bitmap accepts overlapping duplicates.
+- IPv4 reassembly honours header options by preserving the first fragment's
+  header. Only the IPv6 Fragment extension header is parsed; other IPv6
+  extension headers remain unsupported.
+
+Path MTU is cached per destination:
+
+- 32 entries with a 10-minute lifetime; when full, the entry closest to
+  expiry is evicted first.
+- Values are clamped to the link MTU (1500) and the family minimum: 68 for
+  IPv4 and 1280 for IPv6. The lookup returns the link MTU when no entry exists.
+- ICMPv4 destination-unreachable / fragmentation-needed (type 3, code 4) and
+  ICMPv6 packet-too-big (type 2) lower the cached value. Reports never raise it,
+  so a stale error cannot undo a newer, smaller observation.
+- `ns_path_mtu()` reads the current value and `ns_path_mtu_set()` overrides it;
+  setting 0 removes the entry and restores the link MTU.
+
+`NsStats` exposes `fragments_rx`, `fragments_tx`, `reassembled`,
+`reassembly_dropped` and `pmtu_updates`.
 
 ## UDP behaviour
 
@@ -211,8 +252,10 @@ Limits and errors:
   queued payload per socket. Datagrams that arrive for a full queue are
   counted as drops; datagrams for no matching socket also generate an ICMP
   port-unreachable error.
-- `NS_EMSGSIZE`/`EMSGSIZE` when the payload does not fit in one link frame:
-  1472 bytes for IPv4 and 1452 bytes for IPv6, i.e. `1500 - IP header - 8`.
+- `NS_EMSGSIZE`/`EMSGSIZE` only when the datagram cannot be represented on the
+  wire: the IPv4 UDP payload maximum is 65507 bytes (`65535 - 20 - 8`) and the
+  IPv6 maximum is 65527 bytes (`65535 - 8`). Datagrams larger than the path
+  MTU up to those limits are fragmented by the IP layer rather than rejected.
 - `EADDRINUSE` on a conflicting bind; `EDESTADDRREQ` when an unconnected
   socket sends without a destination; `ENOTCONN` for a disconnected peer
   query. A receive buffer smaller than the datagram truncates it.
@@ -242,21 +285,25 @@ reporting:
   unreachable / port unreachable (type 1, code 4). The IPv4 error quotes the
   original IP header plus eight bytes; IPv6 quotes up to the 1280-byte
   minimum MTU.
+- ICMPv4 fragmentation-needed and ICMPv6 packet-too-big errors update the path
+  MTU cache as described above.
 - Errors are suppressed for packets whose source or destination is
   unspecified, multicast or broadcast.
 
 `ns_icmp_echo()` sends an echo request from a local to a remote address and is
-used by the C tests. There is no JavaScript ping API; a host `ping` reaches
-the stack through the TUN link. `NsStats.icmp_rx` and `NsStats.icmp_tx` count
-received messages (echo requests and errors) and emitted replies and errors.
+used by the C tests. Messages larger than the path MTU are fragmented. There is
+no JavaScript ping API; a host `ping` reaches the stack through the TUN link.
+`NsStats.icmp_rx` and `NsStats.icmp_tx` count received messages (echo requests
+and errors) and emitted replies and errors.
 
 Limits:
 
-- Only echo request/reply and UDP port-unreachable generation are implemented.
-  Redirect, time-exceeded, parameter-problem, fragment-needed and other ICMP
-  messages are neither generated nor acted on.
-- Incoming ICMP error messages are counted but not fed back to TCP or UDP
-  sockets, so there is no path-MTU discovery or error-driven socket failure.
+- Only echo request/reply, UDP port-unreachable generation and PMTU learning
+  from fragmentation-needed / packet-too-big are implemented. Redirect,
+  time-exceeded and parameter-problem messages are neither generated nor acted
+  on.
+- Other incoming ICMP errors are counted but not reported to TCP or UDP
+  sockets, so there is no error-driven socket failure or retransmission hint.
 - No broadcast or multicast echo replies are sent.
 
 ## Sharded transport relationship
@@ -277,9 +324,14 @@ make qnode-test          # includes netstack_socket.js and netstack_dgram.js
 
 `tests/netstack_test.c` covers IPv4 and IPv6 datagram round-trips, ephemeral
 ports, wildcard and exact binds, reuse rules, connected sockets, disconnect,
-queue ordering, truncation, checksum handling and the oversize error. It also
-checks IPv4/IPv6 echo request/reply fields and checksums, and the IPv4/IPv6
-UDP port-unreachable errors and their quoted packets.
+queue ordering, truncation, checksum handling and the protocol-maximum size
+errors. It also checks IPv4/IPv6 echo request/reply fields and checksums, the
+IPv4/IPv6 UDP port-unreachable errors and their quoted packets, and
+fragmentation/reassembly: multi-fragment datagrams in both families,
+out-of-order delivery, reduced path MTU sizing and the public PMTU API. PMTU
+learning is exercised with crafted ICMPv4 fragmentation-needed and ICMPv6
+packet-too-big messages, including the downward-only rule and family minimums,
+and TCP is checked to chunk writes at a reduced PMTU.
 
 `tests/qnode/netstack_socket.js` runs the TCP integration end to end over
 loopback: explicit and automatic netstack selection for both families,
@@ -290,16 +342,18 @@ forced IPv4 on `127.0.0.1`, and kernel fallback for unmanaged addresses.
 datagrams, auto-selection by address, send-first auto-binding, queued
 messages, connected sockets and peer filtering, `disconnect()`, kernel
 fallback, forced `127.0.0.1`, the `ERR_SOCKET_DGRAM_*` errors, `EADDRINUSE`
-and `EMSGSIZE`. The WebSocket suite
+and `EMSGSIZE` at the protocol maximum. The WebSocket suite
 in `tests/qnode/websocket.js` also runs over `node:net` and can be pointed at
 managed addresses for manual testing.
 
 `tests/qnode/netstack_tun.sh` starts a TUN-backed stack in `unshare -rn`, adds
 IPv6 and IPv4 host-side addresses, and exchanges TCP streams and UDP
-datagrams with kernel clients over both families. It also runs `ping -4` and
-`ping -6` against the owned stack to exercise real ICMP echo traffic. It skips
-(and succeeds) when user namespaces, `ip(8)` or `/dev/net/tun` are unavailable;
-the ICMP checks are skipped when `ping` is not installed.
+datagrams with kernel clients over both families. It also sends 6000-byte UDP
+datagrams and runs `ping -4`/`ping -6`, including 4000-byte payloads, to
+exercise IPv4 and IPv6 fragmentation, reassembly and real ICMP echo traffic
+against a kernel peer. It skips (and succeeds) when user namespaces, `ip(8)` or
+`/dev/net/tun` are unavailable; the ICMP checks are skipped when `ping` is not
+installed.
 
 The C test is `tests/netstack_test.c`; it links the stack directly and needs no
 runtime or privileges.

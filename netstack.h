@@ -72,6 +72,11 @@ typedef struct NsStats {
     uint64_t accepted;
     uint64_t icmp_rx;
     uint64_t icmp_tx;
+    uint64_t fragments_rx;   /* received packets carrying an IP fragment */
+    uint64_t fragments_tx;   /* emitted IP fragments, including the first */
+    uint64_t reassembled;    /* datagrams completed by reassembly */
+    uint64_t reassembly_dropped; /* incomplete, invalid or timed-out sets */
+    uint64_t pmtu_updates;   /* path-MTU cache changes (ICMP or API) */
     uint64_t per_shard_rx[NS_MAX_SHARDS];
 } NsStats;
 
@@ -177,9 +182,20 @@ int ns_udp_is_connected(NsStack *s, uint64_t id);
 
 /* Send an ICMP (IPv4) or ICMPv6 echo request from local to remote. The
    identifier and sequence number are echoed back by the peer. Returns 0, or
-   -NS_EMSGSIZE when the packet does not fit in one link frame. */
+   -NS_EMSGSIZE when the message cannot be represented on the wire (the IP
+   layer fragments it when the path MTU is smaller than the message). */
 int ns_icmp_echo(NsStack *s, const NsAddr *local, const NsAddr *remote,
                  uint16_t id, uint16_t seq, const void *payload, size_t len);
+
+/* Current path MTU for a destination. The link MTU is returned until an
+   ICMP "fragmentation needed" / "packet too big" error lowers it. The value
+   is clamped to the family minimum and never exceeds the link MTU. */
+int ns_path_mtu(NsStack *s, const NsAddr *dst);
+
+/* Override the cached path MTU for a destination (0 removes the entry and
+   restores the link MTU). Useful for tests and for callers with out-of-band
+   path information. Returns 0 or -NS_EINVAL. */
+int ns_path_mtu_set(NsStack *s, const NsAddr *dst, uint16_t mtu);
 
 int ns_shard_pending(NsStack *s, int shard);
 const NsStats *ns_stats(NsStack *s);

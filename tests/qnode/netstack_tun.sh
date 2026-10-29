@@ -110,6 +110,30 @@ s.bind(0, "10.254.0.2", () => {
 setTimeout(() => process.exit(2), 10000);
 EOF
 
+cat >"$tmp/client6udpbig.js" <<'EOF'
+const dgram = require("dgram");
+const payload = Buffer.alloc(6000, 0x5a);
+const s = dgram.createSocket({ type: "udp6", netstack: false });
+s.on("message", (msg) => process.exit(msg.equals(payload) ? 0 : 4));
+s.on("error", () => process.exit(1));
+s.bind(0, "fd00:dead:beef:99::2", () => {
+  s.send(payload, 7002, "fd00:dead:beef:99::1");
+});
+setTimeout(() => process.exit(2), 10000);
+EOF
+
+cat >"$tmp/client4udpbig.js" <<'EOF'
+const dgram = require("dgram");
+const payload = Buffer.alloc(6000, 0x5a);
+const s = dgram.createSocket({ type: "udp4", netstack: false });
+s.on("message", (msg) => process.exit(msg.equals(payload) ? 0 : 4));
+s.on("error", () => process.exit(1));
+s.bind(0, "10.254.0.2", () => {
+  s.send(payload, 7003, "10.254.0.1");
+});
+setTimeout(() => process.exit(2), 10000);
+EOF
+
 QNODE=$(cd "$(dirname "$QNODE")" && pwd)/$(basename "$QNODE")
 export QNODE
 set +e
@@ -137,15 +161,25 @@ unshare -rn sh -c '
   rcu6=$?
   "$QNODE" "$1/client4udp.js"
   rcu4=$?
+  "$QNODE" "$1/client6udpbig.js"
+  rcub6=$?
+  "$QNODE" "$1/client4udpbig.js"
+  rcub4=$?
 
   if command -v ping >/dev/null 2>&1; then
     ping -c 2 -w 5 -4 10.254.0.1 >"$1/ping4.out" 2>&1
     rcp4=$?
     ping -c 2 -w 5 -6 fd00:dead:beef:99::1 >"$1/ping6.out" 2>&1
     rcp6=$?
+    ping -c 1 -w 5 -4 -s 4000 10.254.0.1 >"$1/ping4big.out" 2>&1
+    rcp4big=$?
+    ping -c 1 -w 5 -6 -s 4000 fd00:dead:beef:99::1 >"$1/ping6big.out" 2>&1
+    rcp6big=$?
   else
     rcp4=0
     rcp6=0
+    rcp4big=0
+    rcp6big=0
     echo "netstack_tun: ping not found, skipping ICMP echo checks"
   fi
 
@@ -155,8 +189,12 @@ unshare -rn sh -c '
   [ "$rc4" -ne 0 ] && exit $rc4
   [ "$rcu6" -ne 0 ] && exit $rcu6
   [ "$rcu4" -ne 0 ] && exit $rcu4
+  [ "$rcub6" -ne 0 ] && exit $rcub6
+  [ "$rcub4" -ne 0 ] && exit $rcub4
   [ "$rcp4" -ne 0 ] && { cat "$1/ping4.out"; exit $rcp4; }
   [ "$rcp6" -ne 0 ] && { cat "$1/ping6.out"; exit $rcp6; }
+  [ "$rcp4big" -ne 0 ] && { cat "$1/ping4big.out"; exit $rcp4big; }
+  [ "$rcp6big" -ne 0 ] && { cat "$1/ping6big.out"; exit $rcp6big; }
   exit 0
 ' sh "$tmp"
 rc=$?

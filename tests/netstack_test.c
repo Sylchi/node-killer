@@ -28,6 +28,11 @@ typedef struct Link {
     int capture_on;
     size_t capture_len;
     uint8_t capture[NS_MAX_PACKET];
+    int hold_tx;
+    int held_n;
+    NsStack *held_dst[64];
+    size_t held_len[64];
+    uint8_t held[64][NS_MAX_PACKET];
     uint64_t now;
 } Link;
 
@@ -35,7 +40,7 @@ static void link_send(NsStack *stack, const uint8_t *pkt, size_t len,
                       void *opaque)
 {
     Link *l = opaque;
-    NsStack *peer;
+    NsStack *peer = (stack == l->a) ? l->b : l->a;
 
     if (l->drop_next > 0) {
         l->drop_next--;
@@ -52,8 +57,40 @@ static void link_send(NsStack *stack, const uint8_t *pkt, size_t len,
         memcpy(l->capture, pkt, len);
         l->capture_len = len;
     }
-    peer = (stack == l->a) ? l->b : l->a;
+    if (l->hold_tx) {
+        if (l->held_n < 64) {
+            if (len > sizeof(l->held[0]))
+                len = sizeof(l->held[0]);
+            memcpy(l->held[l->held_n], pkt, len);
+            l->held_len[l->held_n] = len;
+            l->held_dst[l->held_n] = peer;
+            l->held_n++;
+        }
+        return;
+    }
     ns_input(peer, pkt, len);
+}
+
+/* Deliver held packets in arrival order. */
+static void flush_held(Link *l)
+{
+    int i;
+
+    l->hold_tx = 0;
+    for (i = 0; i < l->held_n; i++)
+        ns_input(l->held_dst[i], l->held[i], l->held_len[i]);
+    l->held_n = 0;
+}
+
+/* Deliver held packets last-first to exercise out-of-order reassembly. */
+static void flush_held_reverse(Link *l)
+{
+    int i;
+
+    l->hold_tx = 0;
+    for (i = l->held_n - 1; i >= 0; i--)
+        ns_input(l->held_dst[i], l->held[i], l->held_len[i]);
+    l->held_n = 0;
 }
 
 /* One's-complement sum, folded to 16 bits. A valid IPv4 packet or ICMP
@@ -673,16 +710,24 @@ static void test_udp_ipv4(void)
     CHECK(n == 3);
     CHECK(memcmp(buf, "tru", 3) == 0);
 
-    /* Sending exceeds the largest datagram that fits in one link frame. */
+    /* Anything up to the IPv4 maximum is fragmented; only the wire limit
+       is an error. */
     {
-        char big[NS_MAX_PACKET];
+        uint8_t *big = malloc(65536);
         int max_v4 = 1500 - 20 - 8;
+        int max_udp = 65535 - 20 - 8;
 
-        memset(big, 'x', sizeof(big));
+        CHECK(big != NULL);
+        memset(big, 'x', 65536);
         CHECK(ns_udp_sendto(l.a, a, &local_b, bport, big, max_v4) == max_v4);
         CHECK(ns_udp_sendto(l.a, a, &local_b, bport, big, max_v4 + 1) ==
+              max_v4 + 1);
+        CHECK(ns_udp_sendto(l.a, a, &local_b, bport, big, max_udp) == max_udp);
+        CHECK(ns_udp_sendto(l.a, a, &local_b, bport, big, max_udp + 1) ==
               -NS_EMSGSIZE);
+        CHECK(ns_stats(l.a)->fragments_tx >= 1);
         pump(&l, 10);
+        free(big);
     }
 
     CHECK(ns_udp_close(l.a, a) == 0);
@@ -868,14 +913,21 @@ static void test_udp_ipv6(void)
     CHECK(n == 0);
 
     {
-        char big[NS_MAX_PACKET];
+        uint8_t *big = malloc(65536);
         int max_v6 = 1500 - 40 - 8;
+        int max_udp = 65535 - 8;
 
-        memset(big, 'y', sizeof(big));
+        CHECK(big != NULL);
+        memset(big, 'y', 65536);
         CHECK(ns_udp_sendto(l.a, a, &addr_b, bport, big, max_v6) == max_v6);
         CHECK(ns_udp_sendto(l.a, a, &addr_b, bport, big, max_v6 + 1) ==
+              max_v6 + 1);
+        CHECK(ns_udp_sendto(l.a, a, &addr_b, bport, big, max_udp) == max_udp);
+        CHECK(ns_udp_sendto(l.a, a, &addr_b, bport, big, max_udp + 1) ==
               -NS_EMSGSIZE);
+        CHECK(ns_stats(l.a)->fragments_tx >= 1);
         pump(&l, 10);
+        free(big);
     }
 
     CHECK(ns_udp_close(l.b, w) == 0);
@@ -935,16 +987,23 @@ static void test_icmp_echo_ipv4(void)
     CHECK(memcmp(icmp + 8, payload, 4) == 0);
     CHECK(csum_sum(icmp, icmp_len) == 0xffff);
 
-    /* The largest echo that fits in one IPv4 link frame is 1472 bytes. */
+    /* Messages beyond the link MTU are fragmented; only the IPv4 maximum
+       is rejected. */
     {
-        uint8_t big[NS_MAX_PACKET];
+        uint8_t *big = malloc(65536);
         int max_v4 = 1500 - V4_HDR - 8;
+        int max_icmp = 65535 - V4_HDR - 8;
 
-        memset(big, 'x', sizeof(big));
+        CHECK(big != NULL);
+        memset(big, 'x', 65536);
         CHECK(ns_icmp_echo(l.a, &local_a, &local_b, 1, 1, big, max_v4) == 0);
         CHECK(ns_icmp_echo(l.a, &local_a, &local_b, 1, 1, big, max_v4 + 1) ==
-              -NS_EMSGSIZE);
+              0);
+        CHECK(ns_icmp_echo(l.a, &local_a, &local_b, 1, 1, big, max_icmp) == 0);
+        CHECK(ns_icmp_echo(l.a, &local_a, &local_b, 1, 1, big,
+                           max_icmp + 1) == -NS_EMSGSIZE);
         pump(&l, 10);
+        free(big);
     }
 
     free_pair(&l);
@@ -1120,6 +1179,357 @@ static void test_icmp_suppression(void)
     free_pair(&l);
 }
 
+/* ---------------- fragmentation and PMTU ---------------- */
+
+static size_t craft_icmp4_frag_needed(uint8_t *pkt, const NsAddr *from,
+                                      const NsAddr *to, const NsAddr *qsrc,
+                                      const NsAddr *qdst, uint16_t mtu)
+{
+    const size_t ip_hdr = 20;
+    const size_t icmp_len = 8 + 20 + 8;
+    const size_t total = ip_hdr + icmp_len;
+    uint8_t *icmp = pkt + ip_hdr;
+    uint8_t *quote = icmp + 8;
+    uint16_t csum;
+
+    memset(pkt, 0, total);
+    pkt[0] = 0x45;
+    pkt[2] = (uint8_t)(total >> 8);
+    pkt[3] = (uint8_t)total;
+    pkt[8] = 64;
+    pkt[9] = 1;
+    memcpy(pkt + 12, from->b, 4);
+    memcpy(pkt + 16, to->b, 4);
+    csum = tsum_fold(tsum_add(0, pkt, ip_hdr));
+    pkt[10] = (uint8_t)(csum >> 8);
+    pkt[11] = (uint8_t)csum;
+
+    icmp[0] = 3;
+    icmp[1] = 4;
+    icmp[6] = (uint8_t)(mtu >> 8);
+    icmp[7] = (uint8_t)mtu;
+
+    quote[0] = 0x45;
+    quote[2] = 0;
+    quote[3] = 28;
+    quote[8] = 64;
+    quote[9] = 17;
+    memcpy(quote + 12, qsrc->b, 4);
+    memcpy(quote + 16, qdst->b, 4);
+    csum = tsum_fold(tsum_add(0, quote, 20));
+    quote[10] = (uint8_t)(csum >> 8);
+    quote[11] = (uint8_t)csum;
+    quote[20] = 0x12;
+    quote[21] = 0x34;
+    quote[22] = 0x43;
+    quote[23] = 0x21;
+    quote[25] = 8;
+
+    csum = tsum_fold(tsum_add(0, icmp, icmp_len));
+    icmp[2] = (uint8_t)(csum >> 8);
+    icmp[3] = (uint8_t)csum;
+    return total;
+}
+
+static size_t craft_icmp6_ptb(uint8_t *pkt, const NsAddr *from,
+                              const NsAddr *to, const NsAddr *qsrc,
+                              const NsAddr *qdst, uint32_t mtu)
+{
+    const size_t ip_hdr = 40;
+    const size_t quote_len = 40 + 8;
+    const size_t icmp_len = 8 + quote_len;
+    const size_t total = ip_hdr + icmp_len;
+    uint8_t *icmp = pkt + ip_hdr;
+    uint8_t *quote = icmp + 8;
+    uint32_t sum = 0;
+    uint8_t tail[4];
+    uint8_t next[4] = { 0, 0, 0, 58 };
+    uint16_t csum;
+
+    memset(pkt, 0, total);
+    pkt[0] = 0x60;
+    pkt[4] = (uint8_t)(icmp_len >> 8);
+    pkt[5] = (uint8_t)icmp_len;
+    pkt[6] = 58;
+    pkt[7] = 64;
+    memcpy(pkt + 8, from->b, NS_ADDR_LEN);
+    memcpy(pkt + 24, to->b, NS_ADDR_LEN);
+
+    icmp[0] = 2;
+    icmp[1] = 0;
+    icmp[4] = (uint8_t)(mtu >> 24);
+    icmp[5] = (uint8_t)(mtu >> 16);
+    icmp[6] = (uint8_t)(mtu >> 8);
+    icmp[7] = (uint8_t)mtu;
+
+    quote[0] = 0x60;
+    quote[4] = 0;
+    quote[5] = 8;
+    quote[6] = 17;
+    quote[7] = 64;
+    memcpy(quote + 8, qsrc->b, NS_ADDR_LEN);
+    memcpy(quote + 24, qdst->b, NS_ADDR_LEN);
+    quote[40] = 0x12;
+    quote[41] = 0x34;
+    quote[42] = 0x43;
+    quote[43] = 0x21;
+    quote[45] = 8;
+
+    tail[0] = (uint8_t)(icmp_len >> 24);
+    tail[1] = (uint8_t)(icmp_len >> 16);
+    tail[2] = (uint8_t)(icmp_len >> 8);
+    tail[3] = (uint8_t)icmp_len;
+    sum = tsum_add(sum, from->b, NS_ADDR_LEN);
+    sum = tsum_add(sum, to->b, NS_ADDR_LEN);
+    sum = tsum_add(sum, tail, 4);
+    sum = tsum_add(sum, next, 4);
+    sum = tsum_add(sum, icmp, icmp_len);
+    csum = tsum_fold(sum);
+    icmp[2] = (uint8_t)(csum >> 8);
+    icmp[3] = (uint8_t)csum;
+    return total;
+}
+
+static void test_fragment_reassembly_ipv4(void)
+{
+    Link l;
+    NsAddr local_a, local_b;
+    uint16_t bport = 0;
+    uint64_t a, b;
+    uint8_t *out, *in;
+    int n, i;
+
+    make_plain_pair(&l, &local_a, &local_b);
+    a = ns_udp_open(l.a, &local_a, 0, 0);
+    b = ns_udp_open(l.b, &local_b, 0, 0);
+    CHECK(a != 0 && b != 0);
+    CHECK(ns_udp_bound_addr(l.b, b, NULL, &bport) == 0);
+
+    out = malloc(4000);
+    in = malloc(4000);
+    CHECK(out != NULL && in != NULL);
+    for (i = 0; i < 4000; i++)
+        out[i] = (uint8_t)(i * 17 + 3);
+
+    CHECK(ns_udp_sendto(l.a, a, &local_b, bport, out, 4000) == 4000);
+    CHECK(ns_stats(l.a)->fragments_tx >= 3);
+    pump(&l, 10);
+    CHECK(ns_stats(l.b)->fragments_rx >= 3);
+    CHECK(ns_stats(l.b)->reassembled == 1);
+    n = ns_udp_recvfrom(l.b, b, in, 4000, NULL, NULL);
+    CHECK(n == 4000);
+    CHECK(memcmp(out, in, 4000) == 0);
+
+    /* The last fragment may arrive first. */
+    l.hold_tx = 1;
+    CHECK(ns_udp_sendto(l.a, a, &local_b, bport, out, 4000) == 4000);
+    CHECK(l.held_n >= 3);
+    flush_held_reverse(&l);
+    pump(&l, 10);
+    CHECK(ns_stats(l.b)->reassembled == 2);
+    n = ns_udp_recvfrom(l.b, b, in, 4000, NULL, NULL);
+    CHECK(n == 4000);
+    CHECK(memcmp(out, in, 4000) == 0);
+
+    /* A reduced path MTU shrinks the fragments. */
+    CHECK(ns_path_mtu(l.a, &local_b) == 1500);
+    CHECK(ns_path_mtu_set(l.a, &local_b, 1000) == 0);
+    CHECK(ns_path_mtu(l.a, &local_b) == 1000);
+    l.hold_tx = 1;
+    CHECK(ns_udp_sendto(l.a, a, &local_b, bport, out, 3000) == 3000);
+    CHECK(l.held_n >= 4);
+    for (i = 0; i < l.held_n; i++) {
+        CHECK(l.held_len[i] <= 1000);
+        CHECK(((l.held[i][2] << 8) | l.held[i][3]) <= 1000);
+    }
+    flush_held(&l);
+    pump(&l, 10);
+    n = ns_udp_recvfrom(l.b, b, in, 4000, NULL, NULL);
+    CHECK(n == 3000);
+    CHECK(memcmp(out, in, 3000) == 0);
+
+    CHECK(ns_path_mtu_set(l.a, &local_b, 0) == 0);
+    CHECK(ns_path_mtu(l.a, &local_b) == 1500);
+
+    free(out);
+    free(in);
+    CHECK(ns_udp_close(l.a, a) == 0);
+    CHECK(ns_udp_close(l.b, b) == 0);
+    free_pair(&l);
+}
+
+static void test_fragment_reassembly_ipv6(void)
+{
+    Link l;
+    NsAddr addr_a, addr_b;
+    uint16_t bport = 0;
+    uint64_t a, b;
+    uint8_t *out, *in;
+    int n, i;
+
+    make_pair(&l, 2);
+    set_addr6(&addr_a, 1);
+    set_addr6(&addr_b, 2);
+    a = ns_udp_open(l.a, &addr_a, 0, 0);
+    b = ns_udp_open(l.b, &addr_b, 0, 0);
+    CHECK(a != 0 && b != 0);
+    CHECK(ns_udp_bound_addr(l.b, b, NULL, &bport) == 0);
+
+    out = malloc(4000);
+    in = malloc(4000);
+    CHECK(out != NULL && in != NULL);
+    for (i = 0; i < 4000; i++)
+        out[i] = (uint8_t)(i * 29 + 5);
+
+    CHECK(ns_udp_sendto(l.a, a, &addr_b, bport, out, 4000) == 4000);
+    CHECK(ns_stats(l.a)->fragments_tx >= 3);
+    pump(&l, 10);
+    CHECK(ns_stats(l.b)->fragments_rx >= 3);
+    CHECK(ns_stats(l.b)->reassembled == 1);
+    n = ns_udp_recvfrom(l.b, b, in, 4000, NULL, NULL);
+    CHECK(n == 4000);
+    CHECK(memcmp(out, in, 4000) == 0);
+
+    /* An IPv6 fragment header must be present on every emitted piece. */
+    CHECK(ns_path_mtu_set(l.a, &addr_b, 1280) == 0);
+    l.hold_tx = 1;
+    CHECK(ns_udp_sendto(l.a, a, &addr_b, bport, out, 3000) == 3000);
+    CHECK(l.held_n >= 3);
+    for (i = 0; i < l.held_n; i++) {
+        CHECK(l.held_len[i] <= 1280);
+        CHECK(l.held[i][6] == 44);
+    }
+    flush_held_reverse(&l);
+    pump(&l, 10);
+    n = ns_udp_recvfrom(l.b, b, in, 4000, NULL, NULL);
+    CHECK(n == 3000);
+    CHECK(memcmp(out, in, 3000) == 0);
+    CHECK(ns_stats(l.b)->reassembled == 2);
+
+    CHECK(ns_path_mtu_set(l.a, &addr_b, 0) == 0);
+    CHECK(ns_path_mtu(l.a, &addr_b) == 1500);
+
+    free(out);
+    free(in);
+    CHECK(ns_udp_close(l.a, a) == 0);
+    CHECK(ns_udp_close(l.b, b) == 0);
+    free_pair(&l);
+}
+
+static void test_pmtu_icmp_ipv4(void)
+{
+    Link l;
+    NsAddr local_a, local_b;
+    uint8_t pkt[256];
+    size_t len;
+
+    make_plain_pair(&l, &local_a, &local_b);
+
+    len = craft_icmp4_frag_needed(pkt, &local_b, &local_a, &local_a,
+                                  &local_b, 1000);
+    ns_input(l.a, pkt, len);
+    CHECK(ns_run(l.a, 10) == 1);
+    CHECK(ns_stats(l.a)->icmp_rx == 1);
+    CHECK(ns_stats(l.a)->pmtu_updates >= 1);
+    CHECK(ns_path_mtu(l.a, &local_b) == 1000);
+
+    /* A larger stale report must not raise the cached value. */
+    len = craft_icmp4_frag_needed(pkt, &local_b, &local_a, &local_a,
+                                  &local_b, 1400);
+    ns_input(l.a, pkt, len);
+    CHECK(ns_run(l.a, 10) == 1);
+    CHECK(ns_path_mtu(l.a, &local_b) == 1000);
+
+    /* A smaller report does. */
+    len = craft_icmp4_frag_needed(pkt, &local_b, &local_a, &local_a,
+                                  &local_b, 800);
+    ns_input(l.a, pkt, len);
+    CHECK(ns_run(l.a, 10) == 1);
+    CHECK(ns_path_mtu(l.a, &local_b) == 800);
+
+    CHECK(ns_path_mtu_set(l.a, &local_b, 0) == 0);
+    CHECK(ns_path_mtu(l.a, &local_b) == 1500);
+    free_pair(&l);
+}
+
+static void test_pmtu_icmp_ipv6(void)
+{
+    Link l;
+    NsAddr addr_a, addr_b;
+    uint8_t pkt[256];
+    size_t len;
+
+    make_pair(&l, 2);
+    set_addr6(&addr_a, 1);
+    set_addr6(&addr_b, 2);
+
+    len = craft_icmp6_ptb(pkt, &addr_b, &addr_a, &addr_a, &addr_b, 1400);
+    ns_input(l.a, pkt, len);
+    CHECK(ns_run(l.a, 10) == 1);
+    CHECK(ns_stats(l.a)->icmp_rx == 1);
+    CHECK(ns_stats(l.a)->pmtu_updates >= 1);
+    CHECK(ns_path_mtu(l.a, &addr_b) == 1400);
+
+    /* Larger reports are ignored and the IPv6 minimum is enforced. */
+    len = craft_icmp6_ptb(pkt, &addr_b, &addr_a, &addr_a, &addr_b, 1600);
+    ns_input(l.a, pkt, len);
+    CHECK(ns_run(l.a, 10) == 1);
+    CHECK(ns_path_mtu(l.a, &addr_b) == 1400);
+    len = craft_icmp6_ptb(pkt, &addr_b, &addr_a, &addr_a, &addr_b, 1000);
+    ns_input(l.a, pkt, len);
+    CHECK(ns_run(l.a, 10) == 1);
+    CHECK(ns_path_mtu(l.a, &addr_b) == 1280);
+
+    CHECK(ns_path_mtu_set(l.a, &addr_b, 0) == 0);
+    CHECK(ns_path_mtu(l.a, &addr_b) == 1500);
+    free_pair(&l);
+}
+
+static void test_pmtu_tcp_chunking(void)
+{
+    Link l;
+    NsAddr local_a, local_b;
+    uint8_t out[3000];
+    uint8_t in[3000];
+    uint64_t cid, sid;
+    int i, n, got = 0;
+
+    make_plain_pair(&l, &local_a, &local_b);
+    CHECK(ns_listen_addr(l.b, &local_b, 8080) == 0);
+    cid = ns_connect_from(l.a, &local_a, 40000, &local_b, 8080);
+    CHECK(cid != 0);
+    pump(&l, 20);
+    CHECK(ns_conn_state(l.a, cid) == NS_ESTABLISHED);
+    CHECK(ns_accept_port(l.b, 8080, &sid) == 0);
+
+    for (i = 0; i < (int)sizeof(out); i++)
+        out[i] = (uint8_t)(i * 13 + 1);
+
+    CHECK(ns_path_mtu_set(l.a, &local_b, 1000) == 0);
+    l.hold_tx = 1;
+    CHECK(ns_send(l.a, cid, out, sizeof(out)) == (int)sizeof(out));
+    CHECK(l.held_n >= 4);
+    for (i = 0; i < l.held_n; i++) {
+        CHECK(l.held_len[i] <= 1000);
+        CHECK(((l.held[i][2] << 8) | l.held[i][3]) <= 1000);
+        CHECK(l.held[i][9] == 6);
+    }
+    flush_held(&l);
+    pump(&l, 20);
+    while (got < (int)sizeof(in)) {
+        n = ns_recv(l.b, sid, in + got, sizeof(in) - got);
+        CHECK(n > 0);
+        if (n <= 0)
+            break;
+        got += n;
+    }
+    CHECK(got == (int)sizeof(in));
+    CHECK(memcmp(out, in, sizeof(out)) == 0);
+
+    CHECK(ns_path_mtu_set(l.a, &local_b, 0) == 0);
+    free_pair(&l);
+}
+
 int main(void)
 {
     test_addressing();
@@ -1141,6 +1551,11 @@ int main(void)
     test_icmp_port_unreachable_ipv4();
     test_icmp_port_unreachable_ipv6();
     test_icmp_suppression();
+    test_fragment_reassembly_ipv4();
+    test_fragment_reassembly_ipv6();
+    test_pmtu_icmp_ipv4();
+    test_pmtu_icmp_ipv6();
+    test_pmtu_tcp_chunking();
 
     if (failures) {
         fprintf(stderr, "netstack: %d check(s) failed\n", failures);

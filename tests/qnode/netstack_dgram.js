@@ -196,6 +196,28 @@ async function main() {
     await close(server);
   }
 
+  /* 1c. Datagrams spanning multiple IP fragments are reassembled. */
+  for (const family of [4, 6]) {
+    const type = family === 4 ? "udp4" : "udp6";
+    const host = family === 4 ? ADDR4 : ADDR;
+    const server = dgram.createSocket({ type, netstack: true });
+    const addr = await bind(server, 0, host);
+    const client = dgram.createSocket({ type, netstack: true });
+    await bind(client, 0, host);
+    const payload = Buffer.alloc(6000);
+    for (let i = 0; i < payload.length; i++)
+      payload[i] = (i * 7 + family) & 0xff;
+    const got = recv(server);
+    await send(client, payload, addr.port, addr.address);
+    const { msg } = await got;
+    ok(type + " fragmented datagram round-trip", () => {
+      assert.strictEqual(msg.length, payload.length);
+      assert.ok(msg.equals(payload), "payload mismatch after reassembly");
+    });
+    await close(client);
+    await close(server);
+  }
+
   /* 2. The managed address alone selects the owned stack. */
   {
     const server = dgram.createSocket("udp4");
@@ -398,9 +420,11 @@ async function main() {
 
     const client = dgram.createSocket({ type: "udp4", netstack: true });
     await bind(client, 0, ADDR4);
-    const big = await sendFailure(client, Buffer.alloc(2000), addr.port,
+    /* 65507 is the IPv4 UDP payload maximum; the next byte cannot be
+       represented on the wire and is rejected instead of fragmented. */
+    const big = await sendFailure(client, Buffer.alloc(65508), addr.port,
                                   addr.address);
-    ok("oversized datagrams report EMSGSIZE", () => {
+    ok("datagrams past the IPv4 maximum report EMSGSIZE", () => {
       assert.strictEqual(big.code, "EMSGSIZE");
     });
     await close(client);
