@@ -702,6 +702,10 @@ static JSValue js_node_chmod(JSContext *ctx, JSValueConst this_val,
 static JSValue js_node_chown(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv)
 {
+#ifdef QNODE_FREESTANDING
+    (void)ctx; (void)this_val; (void)argc; (void)argv;
+    return JS_NewInt32(ctx, 0);
+#else
     const char *path = node_cstr(ctx, argv[0]);
     int32_t uid, gid;
     if (!path || JS_ToInt32(ctx, &uid, argv[1]) ||
@@ -712,6 +716,7 @@ static JSValue js_node_chown(JSContext *ctx, JSValueConst this_val,
     int err = chown(path, uid, gid) ? errno : 0;
     JS_FreeCString(ctx, path);
     return JS_NewInt32(ctx, err);
+#endif
 }
 
 static JSValue js_node_utimes(JSContext *ctx, JSValueConst this_val,
