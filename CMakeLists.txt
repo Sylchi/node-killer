@@ -401,7 +401,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 
     add_library(qnode_core STATIC node.c netstack.c netstack_l2.c
         netstack_link.c node_netstack.c)
-    target_compile_definitions(qnode_core PRIVATE ${qjs_defines})
+    target_compile_definitions(qnode_core PRIVATE ${qjs_defines} QNODE_FREESTANDING)
     target_include_directories(qnode_core PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
     target_link_libraries(qnode_core PRIVATE qjs qjs-libc
         qnode_zlib qnode_mbedtls qnode_sodium)
@@ -413,7 +413,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         PDB_NAME "qnode"
         COMPILE_PDB_NAME "qnode"
     )
-    target_compile_definitions(qnode_exe PRIVATE ${qjs_defines})
+    target_compile_definitions(qnode_exe PRIVATE ${qjs_defines} QNODE_FREESTANDING)
     target_link_libraries(qnode_exe PRIVATE qnode_core)
     target_link_options(qnode_exe PRIVATE -static)
 endif()

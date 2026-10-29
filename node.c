@@ -171,18 +171,39 @@ static JSValue js_node_getppid(JSContext *ctx, JSValueConst this_val,
 static JSValue js_node_getuid(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv)
 {
+#ifdef QNODE_FREESTANDING
+    (void)ctx; (void)this_val; (void)argc; (void)argv;
+    return JS_NewInt32(ctx, 1000);
+#else
     return JS_NewInt32(ctx, getuid());
+#endif
 }
 
 static JSValue js_node_getgid(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv)
 {
+#ifdef QNODE_FREESTANDING
+    (void)ctx; (void)this_val; (void)argc; (void)argv;
+    return JS_NewInt32(ctx, 1000);
+#else
     return JS_NewInt32(ctx, getgid());
+#endif
 }
 
 static JSValue js_node_umask(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv)
 {
+#ifdef QNODE_FREESTANDING
+    (void)ctx; (void)this_val; (void)argc; (void)argv;
+    if (argc > 0 && !JS_IsUndefined(argv[0])) {
+        int32_t mask;
+        if (JS_ToInt32(ctx, &mask, argv[0]))
+            return JS_EXCEPTION;
+        (void)mask;
+        return JS_NewInt32(ctx, 022);
+    }
+    return JS_NewInt32(ctx, 022);
+#else
     if (argc > 0 && !JS_IsUndefined(argv[0])) {
         int32_t mask;
         if (JS_ToInt32(ctx, &mask, argv[0]))
@@ -192,6 +213,7 @@ static JSValue js_node_umask(JSContext *ctx, JSValueConst this_val,
     int old = umask(0);
     umask(old);
     return JS_NewInt32(ctx, old);
+#endif
 }
 
 static JSValue js_node_kill(JSContext *ctx, JSValueConst this_val,
@@ -248,10 +270,15 @@ static JSValue js_node_hrtime(JSContext *ctx, JSValueConst this_val,
 static JSValue js_node_hostname(JSContext *ctx, JSValueConst this_val,
                                 int argc, JSValueConst *argv)
 {
+#ifdef QNODE_FREESTANDING
+    (void)ctx; (void)this_val; (void)argc; (void)argv;
+    return JS_NewString(ctx, "qnode");
+#else
     char buf[256];
     if (gethostname(buf, sizeof(buf)))
         buf[0] = '\0';
     return JS_NewString(ctx, buf);
+#endif
 }
 
 static JSValue js_node_exepath(JSContext *ctx, JSValueConst this_val,
