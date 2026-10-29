@@ -2224,36 +2224,54 @@ typedef struct {
     int used;
 } NodeTLSConn;
 
-static NodeTLSContext *node_tls_contexts[NODE_TLS_MAX_CTX];
-static NodeTLSConn node_tls_conns[NODE_TLS_MAX_CONN];
-static int node_tls_initialized;
-static mbedtls_x509_crt node_tls_system_ca;
-static int node_tls_system_ca_loaded;
+/* TLS handles are per JS context, and qnode runs one context per thread.
+   Keeping the registry and the RNG thread-local gives each worker an
+   independent handle namespace and avoids sharing mbedTLS state. */
+typedef struct {
+    NodeTLSContext *contexts[NODE_TLS_MAX_CTX];
+    NodeTLSConn conns[NODE_TLS_MAX_CONN];
+    int initialized;
+    mbedtls_x509_crt system_ca;
+    int system_ca_loaded;
+#if MBEDTLS_VERSION_MAJOR < 4
+    mbedtls_entropy_context entropy;
+    mbedtls_ctr_drbg_context drbg;
+#endif
+} NodeTLSState;
+
+static NODE_THREAD_LOCAL NodeTLSState *node_tls_state;
+
+static NodeTLSState *node_tls_state_get(void)
+{
+    if (!node_tls_state)
+        node_tls_state = calloc(1, sizeof(*node_tls_state));
+    return node_tls_state;
+}
 
 #if MBEDTLS_VERSION_MAJOR >= 4
-static int node_tls_rng_init(void)
+static int node_tls_rng_init(NodeTLSState *st)
 {
+    (void)st;
     return psa_crypto_init() == PSA_SUCCESS ? 0 : -1;
 }
 #else
-static mbedtls_entropy_context node_tls_entropy;
-static mbedtls_ctr_drbg_context node_tls_drbg;
-
-static int node_tls_rng_init(void)
+static int node_tls_rng_init(NodeTLSState *st)
 {
-    mbedtls_entropy_init(&node_tls_entropy);
-    mbedtls_ctr_drbg_init(&node_tls_drbg);
-    return mbedtls_ctr_drbg_seed(&node_tls_drbg, mbedtls_entropy_func,
-                                 &node_tls_entropy, NULL, 0);
+    mbedtls_entropy_init(&st->entropy);
+    mbedtls_ctr_drbg_init(&st->drbg);
+    return mbedtls_ctr_drbg_seed(&st->drbg, mbedtls_entropy_func,
+                                 &st->entropy, NULL, 0);
 }
 #endif
 
-static void node_tls_init(void)
+static int node_tls_init(NodeTLSState *st)
 {
-    if (node_tls_initialized)
-        return;
-    node_tls_rng_init();
-    node_tls_initialized = 1;
+    if (st->initialized)
+        return 0;
+    if (node_tls_rng_init(st) != 0)
+        return -1;
+    st->initialized = 1;
+    return 0;
 }
 
 static void node_tls_set_min_version(mbedtls_ssl_config *conf)
@@ -2266,22 +2284,24 @@ static void node_tls_set_min_version(mbedtls_ssl_config *conf)
 #endif
 }
 
-static void node_tls_set_rng(mbedtls_ssl_config *conf)
+static void node_tls_set_rng(NodeTLSState *st, mbedtls_ssl_config *conf)
 {
 #if MBEDTLS_VERSION_MAJOR < 4
-    mbedtls_ssl_conf_rng(conf, mbedtls_ctr_drbg_random, &node_tls_drbg);
+    mbedtls_ssl_conf_rng(conf, mbedtls_ctr_drbg_random, &st->drbg);
 #else
+    (void)st;
     (void)conf;
 #endif
 }
 
-static int node_tls_pk_parse_key(mbedtls_pk_context *pk,
+static int node_tls_pk_parse_key(NodeTLSState *st, mbedtls_pk_context *pk,
                                  const unsigned char *buf, size_t len)
 {
 #if MBEDTLS_VERSION_MAJOR == 3
     return mbedtls_pk_parse_key(pk, buf, len, NULL, 0,
-                                mbedtls_ctr_drbg_random, &node_tls_drbg);
+                                mbedtls_ctr_drbg_random, &st->drbg);
 #else
+    (void)st;
     return mbedtls_pk_parse_key(pk, buf, len, NULL, 0);
 #endif
 }
@@ -2348,12 +2368,12 @@ static void node_tls_conn_clear(NodeTLSConn *c)
     memset(c, 0, sizeof(*c));
 }
 
-static int node_tls_alloc_conn(void)
+static int node_tls_alloc_conn(NodeTLSState *st)
 {
     for (int i = 0; i < NODE_TLS_MAX_CONN; i++) {
-        if (!node_tls_conns[i].used) {
-            memset(&node_tls_conns[i], 0, sizeof(node_tls_conns[i]));
-            node_tls_conns[i].used = 1;
+        if (!st->conns[i].used) {
+            memset(&st->conns[i], 0, sizeof(st->conns[i]));
+            st->conns[i].used = 1;
             return i;
         }
     }
@@ -2448,7 +2468,7 @@ static int node_tls_bio_recv(void *ctx, unsigned char *buf, size_t len)
     return (int)n;
 }
 
-static int node_tls_load_system_ca(void)
+static int node_tls_load_system_ca(NodeTLSState *st)
 {
     static const char *paths[] = {
         "/etc/ssl/certs/ca-certificates.crt",
@@ -2460,34 +2480,65 @@ static int node_tls_load_system_ca(void)
     };
     const char *env;
 
-    if (node_tls_system_ca_loaded)
-        return node_tls_system_ca.raw.p ? 0 : -1;
-    node_tls_system_ca_loaded = 1;
-    mbedtls_x509_crt_init(&node_tls_system_ca);
+    if (st->system_ca_loaded)
+        return st->system_ca.raw.p ? 0 : -1;
+    st->system_ca_loaded = 1;
+    mbedtls_x509_crt_init(&st->system_ca);
 
     /* Match the OpenSSL default-path behaviour: SSL_CERT_FILE and
        SSL_CERT_DIR override the platform locations. */
     env = getenv("SSL_CERT_FILE");
     if (env && env[0] &&
-        mbedtls_x509_crt_parse_file(&node_tls_system_ca, env) >= 0 &&
-        node_tls_system_ca.raw.p)
+        mbedtls_x509_crt_parse_file(&st->system_ca, env) >= 0 &&
+        st->system_ca.raw.p)
         return 0;
 
     for (int i = 0; paths[i]; i++) {
-        if (mbedtls_x509_crt_parse_file(&node_tls_system_ca, paths[i]) >= 0 &&
-            node_tls_system_ca.raw.p)
+        if (mbedtls_x509_crt_parse_file(&st->system_ca, paths[i]) >= 0 &&
+            st->system_ca.raw.p)
             return 0;
     }
 
     env = getenv("SSL_CERT_DIR");
     if (env && env[0] &&
-        mbedtls_x509_crt_parse_path(&node_tls_system_ca, env) >= 0 &&
-        node_tls_system_ca.raw.p)
+        mbedtls_x509_crt_parse_path(&st->system_ca, env) >= 0 &&
+        st->system_ca.raw.p)
         return 0;
-    if (mbedtls_x509_crt_parse_path(&node_tls_system_ca, "/etc/ssl/certs") >= 0 &&
-        node_tls_system_ca.raw.p)
+    if (mbedtls_x509_crt_parse_path(&st->system_ca, "/etc/ssl/certs") >= 0 &&
+        st->system_ca.raw.p)
         return 0;
     return -1;
+}
+
+/* Release everything this thread's TLS layer still owns. Called when a worker
+   exits so mbedTLS allocations do not accumulate across worker lifetimes. */
+void node_tls_thread_cleanup(void)
+{
+    NodeTLSState *st = node_tls_state;
+    int i;
+
+    if (!st)
+        return;
+    for (i = 0; i < NODE_TLS_MAX_CONN; i++) {
+        if (st->conns[i].used)
+            node_tls_conn_clear(&st->conns[i]);
+    }
+    for (i = 0; i < NODE_TLS_MAX_CTX; i++) {
+        if (st->contexts[i]) {
+            node_tls_context_put(st->contexts[i]);
+            st->contexts[i] = NULL;
+        }
+    }
+    if (st->system_ca_loaded)
+        mbedtls_x509_crt_free(&st->system_ca);
+#if MBEDTLS_VERSION_MAJOR < 4
+    if (st->initialized) {
+        mbedtls_ctr_drbg_free(&st->drbg);
+        mbedtls_entropy_free(&st->entropy);
+    }
+#endif
+    free(st);
+    node_tls_state = NULL;
 }
 
 static void node_tls_raise(JSContext *ctx, mbedtls_ssl_context *ssl,
@@ -2526,10 +2577,15 @@ static JSValue js_node_tls_client_init(JSContext *ctx, JSValueConst this_val,
     const char *ca = NULL;
     NodeBytes alpn = { 0 };
     NodeTLSConn *conn;
+    NodeTLSState *st;
     mbedtls_x509_crt *ca_chain = NULL;
     int id, ret;
 
-    node_tls_init();
+    st = node_tls_state_get();
+    if (!st)
+        return JS_ThrowOutOfMemory(ctx);
+    if (node_tls_init(st) != 0)
+        return JS_ThrowPlainError(ctx, "cannot initialize TLS");
     if (JS_ToInt32(ctx, &fd, argv[0]))
         return JS_EXCEPTION;
     if (argc > 1 && !JS_IsUndefined(argv[1]) && !JS_IsNull(argv[1])) {
@@ -2554,10 +2610,10 @@ static JSValue js_node_tls_client_init(JSContext *ctx, JSValueConst this_val,
         }
     }
 
-    id = node_tls_alloc_conn();
+    id = node_tls_alloc_conn(st);
     if (id < 0)
         goto oom;
-    conn = &node_tls_conns[id];
+    conn = &st->conns[id];
     mbedtls_ssl_init(&conn->ssl);
     mbedtls_ssl_config_init(&conn->conf);
     mbedtls_x509_crt_init(&conn->ca);
@@ -2570,8 +2626,8 @@ static JSValue js_node_tls_client_init(JSContext *ctx, JSValueConst this_val,
             ca_chain = &conn->ca;
         }
     } else if (verify) {
-        if (node_tls_load_system_ca() == 0)
-            ca_chain = &node_tls_system_ca;
+        if (node_tls_load_system_ca(st) == 0)
+            ca_chain = &st->system_ca;
     }
 
     ret = mbedtls_ssl_config_defaults(&conn->conf, MBEDTLS_SSL_IS_CLIENT,
@@ -2580,7 +2636,7 @@ static JSValue js_node_tls_client_init(JSContext *ctx, JSValueConst this_val,
     if (ret != 0)
         goto fail;
     node_tls_set_min_version(&conn->conf);
-    node_tls_set_rng(&conn->conf);
+    node_tls_set_rng(st, &conn->conf);
     mbedtls_ssl_conf_authmode(&conn->conf, verify ? MBEDTLS_SSL_VERIFY_REQUIRED
                                                   : MBEDTLS_SSL_VERIFY_NONE);
     if (verify && ca_chain)
@@ -2615,7 +2671,7 @@ static JSValue js_node_tls_client_init(JSContext *ctx, JSValueConst this_val,
 
 fail:
     node_tls_conn_clear(conn);
-    node_tls_conns[id].used = 0;
+    st->conns[id].used = 0;
     node_free_bytes(ctx, &alpn);
     if (host) JS_FreeCString(ctx, host);
     if (ca) JS_FreeCString(ctx, ca);
@@ -2635,9 +2691,14 @@ static JSValue js_node_tls_server_context(JSContext *ctx, JSValueConst this_val,
 {
     const char *cert, *key, *ca = NULL;
     NodeTLSContext *c = NULL;
+    NodeTLSState *st;
     int slot = -1, ret;
 
-    node_tls_init();
+    st = node_tls_state_get();
+    if (!st)
+        return JS_ThrowOutOfMemory(ctx);
+    if (node_tls_init(st) != 0)
+        return JS_ThrowPlainError(ctx, "cannot initialize TLS");
     cert = node_cstr(ctx, argv[0]);
     if (!cert)
         return JS_EXCEPTION;
@@ -2656,7 +2717,7 @@ static JSValue js_node_tls_server_context(JSContext *ctx, JSValueConst this_val,
     }
 
     for (int i = 0; i < NODE_TLS_MAX_CTX; i++) {
-        if (!node_tls_contexts[i]) {
+        if (!st->contexts[i]) {
             slot = i;
             break;
         }
@@ -2675,7 +2736,7 @@ static JSValue js_node_tls_server_context(JSContext *ctx, JSValueConst this_val,
                                  strlen(cert) + 1);
     if (ret < 0 || !c->cert.raw.p)
         goto fail;
-    ret = node_tls_pk_parse_key(&c->key, (const unsigned char *)key,
+    ret = node_tls_pk_parse_key(st, &c->key, (const unsigned char *)key,
                                 strlen(key) + 1);
     if (ret != 0)
         goto fail;
@@ -2688,7 +2749,7 @@ static JSValue js_node_tls_server_context(JSContext *ctx, JSValueConst this_val,
 
     c->refs = 1;
     c->used = 1;
-    node_tls_contexts[slot] = c;
+    st->contexts[slot] = c;
 
     JS_FreeCString(ctx, cert);
     JS_FreeCString(ctx, key);
@@ -2717,20 +2778,25 @@ static JSValue js_node_tls_accept(JSContext *ctx, JSValueConst this_val,
     int32_t ctxid, fd;
     NodeTLSContext *sc;
     NodeTLSConn *conn;
+    NodeTLSState *st;
     int id, ret;
 
-    node_tls_init();
+    st = node_tls_state_get();
+    if (!st)
+        return JS_ThrowOutOfMemory(ctx);
+    if (node_tls_init(st) != 0)
+        return JS_ThrowPlainError(ctx, "cannot initialize TLS");
     if (JS_ToInt32(ctx, &ctxid, argv[0]) || JS_ToInt32(ctx, &fd, argv[1]))
         return JS_EXCEPTION;
     if (ctxid < 0 || ctxid >= NODE_TLS_MAX_CTX ||
-        !node_tls_contexts[ctxid])
+        !st->contexts[ctxid])
         return JS_ThrowRangeError(ctx, "invalid TLS context");
-    sc = node_tls_contexts[ctxid];
+    sc = st->contexts[ctxid];
 
-    id = node_tls_alloc_conn();
+    id = node_tls_alloc_conn(st);
     if (id < 0)
         return node_err(ctx, JS_NULL, ENOMEM);
-    conn = &node_tls_conns[id];
+    conn = &st->conns[id];
     mbedtls_ssl_init(&conn->ssl);
     mbedtls_ssl_config_init(&conn->conf);
     mbedtls_x509_crt_init(&conn->ca);
@@ -2741,7 +2807,7 @@ static JSValue js_node_tls_accept(JSContext *ctx, JSValueConst this_val,
     if (ret != 0)
         goto fail;
     node_tls_set_min_version(&conn->conf);
-    node_tls_set_rng(&conn->conf);
+    node_tls_set_rng(st, &conn->conf);
     mbedtls_ssl_conf_authmode(&conn->conf, MBEDTLS_SSL_VERIFY_NONE);
     if (sc->has_ca)
         mbedtls_ssl_conf_ca_chain(&conn->conf, &sc->ca, NULL);
@@ -2759,21 +2825,22 @@ static JSValue js_node_tls_accept(JSContext *ctx, JSValueConst this_val,
 
 fail:
     node_tls_conn_clear(conn);
-    node_tls_conns[id].used = 0;
+    st->conns[id].used = 0;
     node_tls_raise(ctx, NULL, ret, "cannot create TLS connection");
     return JS_EXCEPTION;
 }
 
 static NodeTLSConn *node_tls_conn(JSContext *ctx, JSValueConst v)
 {
+    NodeTLSState *st = node_tls_state;
     int32_t id;
     if (JS_ToInt32(ctx, &id, v))
         return NULL;
-    if (id < 0 || id >= NODE_TLS_MAX_CONN || !node_tls_conns[id].used) {
+    if (!st || id < 0 || id >= NODE_TLS_MAX_CONN || !st->conns[id].used) {
         JS_ThrowRangeError(ctx, "invalid TLS handle");
         return NULL;
     }
-    return &node_tls_conns[id];
+    return &st->conns[id];
 }
 
 /* tlsHandshake(id) -> 0 done, 1 want read, 2 want write */
@@ -2878,12 +2945,13 @@ static JSValue js_node_tls_shutdown(JSContext *ctx, JSValueConst this_val,
 static JSValue js_node_tls_free(JSContext *ctx, JSValueConst this_val,
                                 int argc, JSValueConst *argv)
 {
+    NodeTLSState *st = node_tls_state;
     int32_t id;
     if (JS_ToInt32(ctx, &id, argv[0]))
         return JS_EXCEPTION;
-    if (id >= 0 && id < NODE_TLS_MAX_CONN && node_tls_conns[id].used) {
-        node_tls_conn_clear(&node_tls_conns[id]);
-        node_tls_conns[id].used = 0;
+    if (st && id >= 0 && id < NODE_TLS_MAX_CONN && st->conns[id].used) {
+        node_tls_conn_clear(&st->conns[id]);
+        st->conns[id].used = 0;
     }
     return JS_UNDEFINED;
 }
@@ -2891,15 +2959,16 @@ static JSValue js_node_tls_free(JSContext *ctx, JSValueConst this_val,
 static JSValue js_node_tls_free_context(JSContext *ctx, JSValueConst this_val,
                                         int argc, JSValueConst *argv)
 {
+    NodeTLSState *st = node_tls_state;
     int32_t id;
     NodeTLSContext *c;
 
     if (JS_ToInt32(ctx, &id, argv[0]))
         return JS_EXCEPTION;
-    if (id < 0 || id >= NODE_TLS_MAX_CTX ||
-        !(c = node_tls_contexts[id]))
+    if (!st || id < 0 || id >= NODE_TLS_MAX_CTX ||
+        !(c = st->contexts[id]))
         return JS_UNDEFINED;
-    node_tls_contexts[id] = NULL;
+    st->contexts[id] = NULL;
     c->used = 0;
     node_tls_context_put(c);
     return JS_UNDEFINED;
@@ -3093,7 +3162,14 @@ static JSValue js_node_digest(JSContext *ctx, JSValueConst this_val,
         return JS_ThrowTypeError(ctx, "Digest method not supported: %s", name);
     }
 
-    node_tls_init();
+    {
+        NodeTLSState *st = node_tls_state_get();
+        if (!st || node_tls_init(st) != 0) {
+            JS_FreeCString(ctx, name);
+            node_free_bytes(ctx, &in);
+            return JS_ThrowPlainError(ctx, "cannot initialize TLS");
+        }
+    }
     outlen = mbedtls_md_get_size(info);
     out = js_malloc(ctx, outlen);
     if (!out) {
@@ -5158,6 +5234,16 @@ static void node_worker_rejection_tracker(JSContext *ctx,
     JS_FreeValue(ctx, global);
 }
 
+/* Worker exit hook: release thread-local TLS state before the runtime is
+   torn down. */
+static void node_worker_exit_func(JSContext *ctx, int exit_code, void *opaque)
+{
+    (void)ctx;
+    (void)exit_code;
+    (void)opaque;
+    node_tls_thread_cleanup();
+}
+
 /* Worker start hook: install the qnode runtime pieces, publish the startup
    value and evaluate the regular bootstrap. The bootstrap detects worker
    mode and imports the user script itself. */
@@ -5193,6 +5279,7 @@ static void node_worker_start_func(JSContext *ctx, const char *basename,
 void js_node_install_worker_hooks(void)
 {
     js_std_set_worker_start_func(node_worker_start_func, NULL);
+    js_std_set_worker_exit_func(node_worker_exit_func, NULL);
 }
 
 JSValue js_node_run_main(JSContext *ctx, const char *path)

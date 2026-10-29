@@ -9,5 +9,8 @@ int js_node_start(JSContext *ctx);
    main process before creating workers. */
 void js_node_install_worker_hooks(void);
 JSValue js_node_run_main(JSContext *ctx, const char *path);
+/* Free TLS state owned by the calling thread. Worker shutdown calls this
+   automatically; the main thread should call it before exiting. */
+void node_tls_thread_cleanup(void);
 
 #endif

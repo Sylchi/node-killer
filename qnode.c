@@ -507,6 +507,7 @@ done:
     }
 
     free(requires);
+    node_tls_thread_cleanup();
     JS_FreeContext(ctx);
     js_std_free_handlers(rt);
     JS_FreeRuntime(rt);

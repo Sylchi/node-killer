@@ -12,6 +12,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <pthread.h>
 
 #ifdef __linux__
 #include <sys/eventfd.h>
@@ -20,6 +21,8 @@
 #include "netstack.h"
 #include "netstack_link.h"
 #include "netstack_util.h"
+
+#include <pthread.h>
 
 #define VFD_MAX 512
 #define VFD_OPTS_MAX 16
@@ -59,6 +62,17 @@ typedef struct Vfd {
     int nopts;
     VfdOpt opts[VFD_OPTS_MAX];
 } Vfd;
+
+static pthread_mutex_t vfd_lock;
+
+static void vfd_lock_init(void)
+{
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&vfd_lock, &attr);
+    pthread_mutexattr_destroy(&attr);
+}
 
 static NsStack *ns_stack;
 static NsLink *ns_link;
@@ -300,6 +314,8 @@ static int ns_init(void)
     int has_gw4 = 0, has_gw6 = 0;
     int kind = NS_LINK_LOOPBACK;
 
+    vfd_lock_init();
+
     if (ns_ready)
         return 0;
     if (ns_tried)
@@ -428,6 +444,7 @@ int node_netstack_info(char *addr, size_t addrlen, char *addr4, size_t addr4len,
     const NsAddr *local6;
     const NsAddr *local4;
 
+    pthread_mutex_lock(&vfd_lock);
     if (!ns_init()) {
         local6 = ns_stack_local_family(ns_stack, NS_AF_INET6);
         local4 = ns_stack_local_family(ns_stack, NS_AF_INET);
@@ -437,8 +454,10 @@ int node_netstack_info(char *addr, size_t addrlen, char *addr4, size_t addr4len,
             ns_addr_format(local4, addr4);
         if (link)
             *link = ns_link_name(ns_link) ? ns_link_name(ns_link) : "loopback";
+        pthread_mutex_unlock(&vfd_lock);
         return 0;
     }
+    pthread_mutex_unlock(&vfd_lock);
     if (addr && addrlen)
         addr[0] = '\0';
     if (addr4 && addr4len)
@@ -450,14 +469,21 @@ int node_netstack_info(char *addr, size_t addrlen, char *addr4, size_t addr4len,
 
 int node_netstack_link_fd(void)
 {
-    if (ns_init() < 0)
+    int fd;
+    pthread_mutex_lock(&vfd_lock);
+    if (ns_init() < 0) {
+        pthread_mutex_unlock(&vfd_lock);
         return -1;
-    return ns_link_fd(ns_link);
+    }
+    fd = ns_link_fd(ns_link);
+    pthread_mutex_unlock(&vfd_lock);
+    return fd;
 }
 
 /* ---------------- descriptor table ---------------- */
 
-static Vfd *vfd_find(int fd)
+/* Internal: caller must hold vfd_lock */
+static Vfd *vfd_find_locked(int fd)
 {
     int i;
     if (fd < 0)
@@ -470,15 +496,25 @@ static Vfd *vfd_find(int fd)
 
 int node_netstack_is_vfd(int fd)
 {
-    if (!ns_ready)
+    Vfd *v;
+    int result;
+    pthread_mutex_lock(&vfd_lock);
+    if (!ns_ready) {
+        pthread_mutex_unlock(&vfd_lock);
         return 0;
-    return vfd_find(fd) != NULL;
+    }
+    v = vfd_find_locked(fd);
+    result = (v != NULL);
+    pthread_mutex_unlock(&vfd_lock);
+    return result;
 }
 
-static Vfd *vfd_alloc(int domain, int type, int force)
+/* Internal: caller must hold vfd_lock */
+static Vfd *vfd_alloc_locked(int domain, int type, int force)
 {
     int i;
     int fd;
+    Vfd *v = NULL;
 #ifdef __linux__
     fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
 #else
@@ -488,19 +524,21 @@ static Vfd *vfd_alloc(int domain, int type, int force)
         return NULL;
     for (i = 0; i < VFD_MAX; i++) {
         if (vfds[i].kind == VFD_FREE) {
-            Vfd *v = &vfds[i];
+            v = &vfds[i];
             memset(v, 0, sizeof(*v));
             v->fd = fd;
             v->kind = VFD_UNBOUND;
             v->domain = domain;
             v->type = type;
             v->force = force;
-            return v;
+            break;
         }
     }
-    close(fd);
-    errno = EMFILE;
-    return NULL;
+    if (!v) {
+        close(fd);
+        errno = EMFILE;
+    }
+    return v;
 }
 
 static void vfd_reset(Vfd *v)
@@ -771,33 +809,45 @@ int node_netstack_socket(int domain, int type, int mode)
 {
     Vfd *v;
     int base = type & 0xf;
+    int fd = -1;
 
     if (mode < 0 || (domain != AF_INET && domain != AF_INET6) ||
         (base != SOCK_STREAM && base != SOCK_DGRAM))
         return -1;
+    
+    pthread_mutex_lock(&vfd_lock);
     if (!ns_init()) {
-        v = vfd_alloc(domain, base, mode == 1);
-        if (!v)
-            return -1;
-        return v->fd;
+        pthread_mutex_unlock(&vfd_lock);
+        return -1;
     }
-    return -1;
+    v = vfd_alloc_locked(domain, base, mode == 1);
+    if (v)
+        fd = v->fd;
+    pthread_mutex_unlock(&vfd_lock);
+    return fd;
 }
 
 int node_netstack_bind(int fd, const struct sockaddr *sa, socklen_t len)
 {
-    Vfd *v = vfd_find(fd);
+    Vfd *v;
     NsAddr addr;
     uint16_t port;
     int wildcard;
+    int ret;
 
+    pthread_mutex_lock(&vfd_lock);
+    v = vfd_find_locked(fd);
     if (!v) {
+        pthread_mutex_unlock(&vfd_lock);
         errno = EBADF;
         return -1;
     }
-    if (sa_to_ns(sa, len, &addr, &port, &wildcard) < 0)
+    if (sa_to_ns(sa, len, &addr, &port, &wildcard) < 0) {
+        pthread_mutex_unlock(&vfd_lock);
         return -1;
+    }
     if (ns_family(&addr) != v->domain) {
+        pthread_mutex_unlock(&vfd_lock);
         errno = EAFNOSUPPORT;
         return -1;
     }
@@ -805,12 +855,18 @@ int node_netstack_bind(int fd, const struct sockaddr *sa, socklen_t len)
     if ((v->type & 0xf) == SOCK_DGRAM) {
         int owned = v->force || (!wildcard && addr_managed(&addr));
         if (v->kind == VFD_DGRAM) {
+            pthread_mutex_unlock(&vfd_lock);
             errno = EINVAL;
             return -1;
         }
-        if (!owned)
-            return vfd_to_kernel_bind(v, sa, len);
-        return vfd_udp_open(v, &addr, port);
+        if (!owned) {
+            ret = vfd_to_kernel_bind(v, sa, len);
+            pthread_mutex_unlock(&vfd_lock);
+            return ret;
+        }
+        ret = vfd_udp_open(v, &addr, port);
+        pthread_mutex_unlock(&vfd_lock);
+        return ret;
     }
 
     /* A wildcard bind stays pending until listen/connect tells us which
@@ -821,27 +877,35 @@ int node_netstack_bind(int fd, const struct sockaddr *sa, socklen_t len)
         v->bind_wildcard = wildcard;
         v->bind_addr = addr;
         v->bind_port = port;
+        pthread_mutex_unlock(&vfd_lock);
         return 0;
     }
-    return vfd_to_kernel_bind(v, sa, len);
+    ret = vfd_to_kernel_bind(v, sa, len);
+    pthread_mutex_unlock(&vfd_lock);
+    return ret;
 }
 
 int node_netstack_listen(int fd, int backlog)
 {
-    Vfd *v = vfd_find(fd);
+    Vfd *v;
     uint16_t port;
     NsAddr local;
     int err;
 
+    pthread_mutex_lock(&vfd_lock);
+    v = vfd_find_locked(fd);
     if (!v) {
+        pthread_mutex_unlock(&vfd_lock);
         errno = EBADF;
         return -1;
     }
     if ((v->type & 0xf) == SOCK_DGRAM) {
+        pthread_mutex_unlock(&vfd_lock);
         errno = EOPNOTSUPP;
         return -1;
     }
     if (v->kind == VFD_LISTEN) {
+        pthread_mutex_unlock(&vfd_lock);
         errno = EINVAL;
         return -1;
     }
@@ -851,6 +915,7 @@ int node_netstack_listen(int fd, int backlog)
         const NsAddr *stack_local = ns_stack_local_family(
             ns_stack, v->domain == AF_INET ? NS_AF_INET : NS_AF_INET6);
         if (!stack_local) {
+            pthread_mutex_unlock(&vfd_lock);
             errno = EAFNOSUPPORT;
             return -1;
         }
@@ -860,12 +925,14 @@ int node_netstack_listen(int fd, int backlog)
         port = v->bound ? v->bind_port : 0;
         err = ns_listen_port_ex(ns_stack, &local, port, &port);
         if (err < 0) {
+            pthread_mutex_unlock(&vfd_lock);
             errno = EADDRINUSE;
             return -1;
         }
         v->kind = VFD_LISTEN;
         v->local = local;
         v->lport = port;
+        pthread_mutex_unlock(&vfd_lock);
         return 0;
     }
 
@@ -874,8 +941,10 @@ int node_netstack_listen(int fd, int backlog)
         int kfd = vfd_kernel_socket(v);
         struct sockaddr_storage local;
         socklen_t llen;
-        if (kfd < 0)
+        if (kfd < 0) {
+            pthread_mutex_unlock(&vfd_lock);
             return -1;
+        }
         memset(&local, 0, sizeof(local));
         if (v->domain == AF_INET) {
             struct sockaddr_in *l4 = (struct sockaddr_in *)&local;
@@ -896,23 +965,28 @@ int node_netstack_listen(int fd, int backlog)
             int e = errno;
             close(kfd);
             errno = e;
+            pthread_mutex_unlock(&vfd_lock);
             return -1;
         }
         if (listen(kfd, backlog) < 0) {
             int e = errno;
             close(kfd);
             errno = e;
+            pthread_mutex_unlock(&vfd_lock);
             return -1;
         }
-        if (vfd_install_kernel(v, kfd) < 0)
+        if (vfd_install_kernel(v, kfd) < 0) {
+            pthread_mutex_unlock(&vfd_lock);
             return -1;
+        }
+        pthread_mutex_unlock(&vfd_lock);
         return 0;
     }
 }
 
 int node_netstack_accept(int fd, struct sockaddr *sa, socklen_t *len)
 {
-    Vfd *v = vfd_find(fd);
+    Vfd *v;
     Vfd *nv;
     uint64_t id;
     struct sockaddr_storage peer;
@@ -920,7 +994,10 @@ int node_netstack_accept(int fd, struct sockaddr *sa, socklen_t *len)
     NsAddr local, remote;
     uint16_t lport, rport;
 
+    pthread_mutex_lock(&vfd_lock);
+    v = vfd_find_locked(fd);
     if (!v || v->kind != VFD_LISTEN) {
+        pthread_mutex_unlock(&vfd_lock);
         errno = EBADF;
         return -1;
     }
@@ -928,12 +1005,14 @@ int node_netstack_accept(int fd, struct sockaddr *sa, socklen_t *len)
     node_netstack_pump();
 
     if (ns_accept_port(ns_stack, v->lport, &id) != 0) {
+        pthread_mutex_unlock(&vfd_lock);
         errno = EAGAIN;
         return -1;
     }
-    nv = vfd_alloc(v->domain, SOCK_STREAM, 0);
+    nv = vfd_alloc_locked(v->domain, SOCK_STREAM, 0);
     if (!nv) {
         ns_close(ns_stack, id);
+        pthread_mutex_unlock(&vfd_lock);
         errno = EMFILE;
         return -1;
     }
@@ -953,24 +1032,32 @@ int node_netstack_accept(int fd, struct sockaddr *sa, socklen_t *len)
     }
     if (ns_conn_readable(ns_stack, id))
         vfd_raise(nv);
+    pthread_mutex_unlock(&vfd_lock);
     return nv->fd;
 }
 
 int node_netstack_connect(int fd, const struct sockaddr *sa, socklen_t len)
 {
-    Vfd *v = vfd_find(fd);
+    Vfd *v;
     NsAddr remote, local;
     uint16_t rport, lport;
     uint64_t id;
     int state;
+    int ret;
 
+    pthread_mutex_lock(&vfd_lock);
+    v = vfd_find_locked(fd);
     if (!v) {
+        pthread_mutex_unlock(&vfd_lock);
         errno = EBADF;
         return -1;
     }
-    if (sa_to_ns(sa, len, &remote, &rport, NULL) < 0)
+    if (sa_to_ns(sa, len, &remote, &rport, NULL) < 0) {
+        pthread_mutex_unlock(&vfd_lock);
         return -1;
+    }
     if (ns_family(&remote) != v->domain) {
+        pthread_mutex_unlock(&vfd_lock);
         errno = EAFNOSUPPORT;
         return -1;
     }
@@ -978,16 +1065,22 @@ int node_netstack_connect(int fd, const struct sockaddr *sa, socklen_t len)
     if ((v->type & 0xf) == SOCK_DGRAM) {
         int owned = v->kind == VFD_DGRAM || v->force ||
                     addr_managed(&remote);
-        if (!owned)
-            return vfd_to_kernel_connect(v, sa, len);
+        if (!owned) {
+            ret = vfd_to_kernel_connect(v, sa, len);
+            pthread_mutex_unlock(&vfd_lock);
+            return ret;
+        }
         if (v->kind != VFD_DGRAM) {
             NsAddr any;
             memset(&any, 0, sizeof(any));
             any.family = (uint8_t)ns_addr_family(&remote);
-            if (vfd_udp_open(v, &any, 0) < 0)
+            if (vfd_udp_open(v, &any, 0) < 0) {
+                pthread_mutex_unlock(&vfd_lock);
                 return -1;
+            }
         }
         if (ns_udp_connect(ns_stack, v->udp, &remote, rport) < 0) {
+            pthread_mutex_unlock(&vfd_lock);
             errno = EINVAL;
             return -1;
         }
@@ -995,6 +1088,7 @@ int node_netstack_connect(int fd, const struct sockaddr *sa, socklen_t len)
         v->remote.family = (uint8_t)ns_addr_family(&remote);
         v->rport = rport;
         node_netstack_pump();
+        pthread_mutex_unlock(&vfd_lock);
         return 0;
     }
 
@@ -1002,6 +1096,7 @@ int node_netstack_connect(int fd, const struct sockaddr *sa, socklen_t len)
         const NsAddr *stack_local = ns_stack_local_family(
             ns_stack, ns_addr_family(&remote));
         if (!stack_local) {
+            pthread_mutex_unlock(&vfd_lock);
             errno = EAFNOSUPPORT;
             return -1;
         }
@@ -1012,6 +1107,7 @@ int node_netstack_connect(int fd, const struct sockaddr *sa, socklen_t len)
         lport = v->bound ? v->bind_port : 0;
         id = ns_connect_from(ns_stack, &local, lport, &remote, rport);
         if (!id) {
+            pthread_mutex_unlock(&vfd_lock);
             errno = ENETUNREACH;
             return -1;
         }
@@ -1025,25 +1121,34 @@ int node_netstack_connect(int fd, const struct sockaddr *sa, socklen_t len)
         node_netstack_pump();
         v->connect_reported = 1;
         state = ns_conn_state(ns_stack, id);
-        if (state == NS_ESTABLISHED || state == NS_CLOSE_WAIT)
+        if (state == NS_ESTABLISHED || state == NS_CLOSE_WAIT) {
+            pthread_mutex_unlock(&vfd_lock);
             return 0;
+        }
         if (state == NS_CLOSED) {
+            pthread_mutex_unlock(&vfd_lock);
             errno = ECONNREFUSED;
             return -1;
         }
+        pthread_mutex_unlock(&vfd_lock);
         errno = EINPROGRESS;
         return -1;
     }
 
-    return vfd_to_kernel_connect(v, sa, len);
+    ret = vfd_to_kernel_connect(v, sa, len);
+    pthread_mutex_unlock(&vfd_lock);
+    return ret;
 }
 
 ssize_t node_netstack_read(int fd, void *buf, size_t len)
 {
-    Vfd *v = vfd_find(fd);
+    Vfd *v;
     int n;
 
+    pthread_mutex_lock(&vfd_lock);
+    v = vfd_find_locked(fd);
     if (!v || v->kind != VFD_CONN) {
+        pthread_mutex_unlock(&vfd_lock);
         errno = EBADF;
         return -1;
     }
@@ -1051,6 +1156,7 @@ ssize_t node_netstack_read(int fd, void *buf, size_t len)
     node_netstack_pump();
     n = ns_recv(ns_stack, v->conn, buf, len);
     if (n < 0) {
+        pthread_mutex_unlock(&vfd_lock);
         if (n == -NS_EAGAIN)
             errno = EAGAIN;
         else
@@ -1058,20 +1164,25 @@ ssize_t node_netstack_read(int fd, void *buf, size_t len)
         return -1;
     }
     vfd_signal_all();
+    pthread_mutex_unlock(&vfd_lock);
     return n;
 }
 
 ssize_t node_netstack_write(int fd, const void *buf, size_t len)
 {
-    Vfd *v = vfd_find(fd);
+    Vfd *v;
     int n;
 
+    pthread_mutex_lock(&vfd_lock);
+    v = vfd_find_locked(fd);
     if (!v || v->kind != VFD_CONN) {
+        pthread_mutex_unlock(&vfd_lock);
         errno = EBADF;
         return -1;
     }
     n = ns_send(ns_stack, v->conn, buf, len);
     if (n < 0) {
+        pthread_mutex_unlock(&vfd_lock);
         if (n == -NS_EAGAIN)
             errno = EAGAIN;
         else if (n == -NS_ENOTCONN)
@@ -1081,25 +1192,32 @@ ssize_t node_netstack_write(int fd, const void *buf, size_t len)
         return -1;
     }
     node_netstack_pump();
+    pthread_mutex_unlock(&vfd_lock);
     return n;
 }
 
 ssize_t node_netstack_sendto(int fd, const struct sockaddr *sa, socklen_t salen,
                              const void *buf, size_t buflen)
 {
-    Vfd *v = vfd_find(fd);
+    Vfd *v;
     NsAddr remote;
     uint16_t rport;
     int owned;
     int n;
 
+    pthread_mutex_lock(&vfd_lock);
+    v = vfd_find_locked(fd);
     if (!v) {
+        pthread_mutex_unlock(&vfd_lock);
         errno = EBADF;
         return -1;
     }
-    if (sa_to_ns(sa, salen, &remote, &rport, NULL) < 0)
+    if (sa_to_ns(sa, salen, &remote, &rport, NULL) < 0) {
+        pthread_mutex_unlock(&vfd_lock);
         return -1;
+    }
     if (ns_family(&remote) != v->domain) {
+        pthread_mutex_unlock(&vfd_lock);
         errno = EAFNOSUPPORT;
         return -1;
     }
@@ -1110,11 +1228,14 @@ ssize_t node_netstack_sendto(int fd, const struct sockaddr *sa, socklen_t salen,
             NsAddr any;
             memset(&any, 0, sizeof(any));
             any.family = (uint8_t)ns_addr_family(&remote);
-            if (vfd_udp_open(v, &any, 0) < 0)
+            if (vfd_udp_open(v, &any, 0) < 0) {
+                pthread_mutex_unlock(&vfd_lock);
                 return -1;
+            }
         }
         n = ns_udp_sendto(ns_stack, v->udp, &remote, rport, buf, buflen);
         if (n < 0) {
+            pthread_mutex_unlock(&vfd_lock);
             if (n == -NS_EMSGSIZE)
                 errno = EMSGSIZE;
             else if (n == -NS_EDESTADDRREQ)
@@ -1126,6 +1247,7 @@ ssize_t node_netstack_sendto(int fd, const struct sockaddr *sa, socklen_t salen,
             return -1;
         }
         node_netstack_pump();
+        pthread_mutex_unlock(&vfd_lock);
         return n;
     }
 
@@ -1133,15 +1255,19 @@ ssize_t node_netstack_sendto(int fd, const struct sockaddr *sa, socklen_t salen,
        a real non-blocking datagram socket and hand the send to the kernel. */
     {
         int kfd = vfd_kernel_socket(v);
-        if (kfd < 0)
+        if (kfd < 0) {
+            pthread_mutex_unlock(&vfd_lock);
             return -1;
+        }
         if (vfd_install_kernel(v, kfd) < 0) {
             int e = errno;
             close(kfd);
+            pthread_mutex_unlock(&vfd_lock);
             errno = e;
             return -1;
         }
     }
+    pthread_mutex_unlock(&vfd_lock);
     do {
         n = (int)sendto(fd, buf, buflen, 0, sa, salen);
     } while (n < 0 && errno == EINTR);
@@ -1151,12 +1277,15 @@ ssize_t node_netstack_sendto(int fd, const struct sockaddr *sa, socklen_t salen,
 ssize_t node_netstack_recvfrom(int fd, void *buf, size_t len,
                                struct sockaddr *sa, socklen_t *salen)
 {
-    Vfd *v = vfd_find(fd);
+    Vfd *v;
     NsAddr src;
     uint16_t sport = 0;
     int n;
 
+    pthread_mutex_lock(&vfd_lock);
+    v = vfd_find_locked(fd);
     if (!v || v->kind != VFD_DGRAM) {
+        pthread_mutex_unlock(&vfd_lock);
         errno = EAGAIN;
         return -1;
     }
@@ -1164,6 +1293,7 @@ ssize_t node_netstack_recvfrom(int fd, void *buf, size_t len,
     node_netstack_pump();
     n = ns_udp_recvfrom(ns_stack, v->udp, buf, len, &src, &sport);
     if (n < 0) {
+        pthread_mutex_unlock(&vfd_lock);
         errno = n == -NS_EAGAIN ? EAGAIN : ENOTCONN;
         return -1;
     }
@@ -1171,30 +1301,39 @@ ssize_t node_netstack_recvfrom(int fd, void *buf, size_t len,
         ns_to_sa(&src, sport, sa, salen);
     /* More datagrams may still be queued; keep the eventfd readable. */
     vfd_signal_all();
+    pthread_mutex_unlock(&vfd_lock);
     return n;
 }
 
 int node_netstack_disconnect(int fd)
 {
-    Vfd *v = vfd_find(fd);
+    Vfd *v;
 
+    pthread_mutex_lock(&vfd_lock);
+    v = vfd_find_locked(fd);
     if (!v || v->kind != VFD_DGRAM) {
+        pthread_mutex_unlock(&vfd_lock);
         errno = ENOTCONN;
         return -1;
     }
     if (ns_udp_disconnect(ns_stack, v->udp) < 0) {
+        pthread_mutex_unlock(&vfd_lock);
         errno = ENOTCONN;
         return -1;
     }
     memset(&v->remote, 0, sizeof(v->remote));
     v->rport = 0;
+    pthread_mutex_unlock(&vfd_lock);
     return 0;
 }
 
 int node_netstack_close(int fd)
 {
-    Vfd *v = vfd_find(fd);
+    Vfd *v;
+    pthread_mutex_lock(&vfd_lock);
+    v = vfd_find_locked(fd);
     if (!v) {
+        pthread_mutex_unlock(&vfd_lock);
         errno = EBADF;
         return -1;
     }
@@ -1206,29 +1345,37 @@ int node_netstack_close(int fd)
         ns_udp_close(ns_stack, v->udp);
     node_netstack_pump();
     vfd_reset(v);
+    pthread_mutex_unlock(&vfd_lock);
     return 0;
 }
 
 int node_netstack_shutdown(int fd, int how)
 {
-    Vfd *v = vfd_find(fd);
+    Vfd *v;
+    pthread_mutex_lock(&vfd_lock);
+    v = vfd_find_locked(fd);
     if (!v || v->kind != VFD_CONN) {
+        pthread_mutex_unlock(&vfd_lock);
         errno = ENOTCONN;
         return -1;
     }
     if (how == SHUT_WR || how == SHUT_RDWR)
         ns_close(ns_stack, v->conn);
     node_netstack_pump();
+    pthread_mutex_unlock(&vfd_lock);
     return 0;
 }
 
 int node_netstack_getsockname(int fd, struct sockaddr *sa, socklen_t *len)
 {
-    Vfd *v = vfd_find(fd);
+    Vfd *v;
     NsAddr local;
     uint16_t lport = 0;
 
+    pthread_mutex_lock(&vfd_lock);
+    v = vfd_find_locked(fd);
     if (!v) {
+        pthread_mutex_unlock(&vfd_lock);
         errno = EBADF;
         return -1;
     }
@@ -1244,43 +1391,54 @@ int node_netstack_getsockname(int fd, struct sockaddr *sa, socklen_t *len)
         local.family = v->domain == AF_INET ? NS_AF_INET : NS_AF_INET6;
     }
     ns_to_sa(&local, lport, sa, len);
+    pthread_mutex_unlock(&vfd_lock);
     return 0;
 }
 
 int node_netstack_getpeername(int fd, struct sockaddr *sa, socklen_t *len)
 {
-    Vfd *v = vfd_find(fd);
+    Vfd *v;
     NsAddr remote;
     uint16_t rport = 0;
 
+    pthread_mutex_lock(&vfd_lock);
+    v = vfd_find_locked(fd);
     if (!v) {
+        pthread_mutex_unlock(&vfd_lock);
         errno = EBADF;
         return -1;
     }
     if (v->kind == VFD_DGRAM) {
         if (ns_udp_peer_addr(ns_stack, v->udp, &remote, &rport) < 0) {
+            pthread_mutex_unlock(&vfd_lock);
             errno = ENOTCONN;
             return -1;
         }
         ns_to_sa(&remote, rport, sa, len);
+        pthread_mutex_unlock(&vfd_lock);
         return 0;
     }
     if (v->kind != VFD_CONN) {
+        pthread_mutex_unlock(&vfd_lock);
         errno = ENOTCONN;
         return -1;
     }
     ns_conn_addr(ns_stack, v->conn, NULL, NULL, &remote, &rport);
     ns_to_sa(&remote, rport, sa, len);
+    pthread_mutex_unlock(&vfd_lock);
     return 0;
 }
 
 int node_netstack_setsockopt(int fd, int level, int opt, const void *val,
                              socklen_t len)
 {
-    Vfd *v = vfd_find(fd);
+    Vfd *v;
     int value = 0;
 
+    pthread_mutex_lock(&vfd_lock);
+    v = vfd_find_locked(fd);
     if (!v) {
+        pthread_mutex_unlock(&vfd_lock);
         errno = EBADF;
         return -1;
     }
@@ -1294,16 +1452,20 @@ int node_netstack_setsockopt(int fd, int level, int opt, const void *val,
         v->opts[v->nopts].value = value;
         v->nopts++;
     }
+    pthread_mutex_unlock(&vfd_lock);
     return 0;
 }
 
 int node_netstack_getsockopt(int fd, int level, int opt, void *val,
                              socklen_t *len)
 {
-    Vfd *v = vfd_find(fd);
+    Vfd *v;
     int value = 0;
 
+    pthread_mutex_lock(&vfd_lock);
+    v = vfd_find_locked(fd);
     if (!v) {
+        pthread_mutex_unlock(&vfd_lock);
         errno = EBADF;
         return -1;
     }
@@ -1321,17 +1483,22 @@ int node_netstack_getsockopt(int fd, int level, int opt, void *val,
         memcpy(val, &value, *len < sizeof(value) ? *len : sizeof(value));
         *len = sizeof(value);
     }
+    pthread_mutex_unlock(&vfd_lock);
     return 0;
 }
 
 int node_netstack_poll(int fd, int events)
 {
-    Vfd *v = vfd_find(fd);
+    Vfd *v;
     int revents = 0;
     (void)events;
 
-    if (!v)
+    pthread_mutex_lock(&vfd_lock);
+    v = vfd_find_locked(fd);
+    if (!v) {
+        pthread_mutex_unlock(&vfd_lock);
         return 0;
+    }
     if (v->kind == VFD_LISTEN &&
         ns_accept_ready_port(ns_stack, v->lport))
         revents |= 0x001; /* POLLIN */
@@ -1341,27 +1508,35 @@ int node_netstack_poll(int fd, int events)
     else if (v->kind == VFD_DGRAM &&
              ns_udp_readable(ns_stack, v->udp))
         revents |= 0x001;
+    pthread_mutex_unlock(&vfd_lock);
     return revents;
 }
 
 int node_netstack_pump(void)
 {
     int n = 0;
-    if (!ns_ready)
+    pthread_mutex_lock(&vfd_lock);
+    if (!ns_ready) {
+        pthread_mutex_unlock(&vfd_lock);
         return 0;
+    }
     if (ns_link_fd(ns_link) >= 0)
         ns_link_pump(ns_link, 128);
     ns_link_tick(ns_link, now_ms());
     n = ns_run(ns_stack, 256);
     ns_tick(ns_stack, now_ms());
     vfd_signal_all();
+    pthread_mutex_unlock(&vfd_lock);
     return n;
 }
 
 int node_netstack_tick(void)
 {
-    if (!ns_ready)
+    pthread_mutex_lock(&vfd_lock);
+    if (!ns_ready) {
+        pthread_mutex_unlock(&vfd_lock);
         return 0;
+    }
     ns_tick(ns_stack, now_ms());
     /* Retransmissions were just queued through the link; run them now so a
        loopback connection makes progress without another socket call. */
@@ -1370,5 +1545,6 @@ int node_netstack_tick(void)
         ns_link_pump(ns_link, 128);
     ns_run(ns_stack, 256);
     vfd_signal_all();
+    pthread_mutex_unlock(&vfd_lock);
     return 0;
 }
