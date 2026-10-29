@@ -937,9 +937,10 @@ class Timeout {
     this._id = this._repeat
       ? qjsos.setInterval(cb, this._delay)
       : qjsos.setTimeout(cb, this._delay);
+    qjsos.setTimerRef(this._id, this._ref);
   }
-  ref() { this._ref = true; return this; }
-  unref() { this._ref = false; return this; }
+  ref() { this._ref = true; qjsos.setTimerRef(this._id, true); return this; }
+  unref() { this._ref = false; qjsos.setTimerRef(this._id, false); return this; }
   hasRef() { return this._ref; }
   refresh() {
     this.close();

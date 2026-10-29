@@ -1013,6 +1013,7 @@ function registerBuiltins() {
   builtins.url = urlModule;
   builtins.util = util;
   builtins["util/types"] = util.types;
+  builtins.websocket = websocketModule;
   builtins.v8 = {
     getHeapStatistics: () => ({ total_heap_size: 0, used_heap_size: 0,
                                 heap_size_limit: 0 }),

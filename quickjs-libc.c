@@ -166,6 +166,7 @@ typedef struct {
     struct list_head link;
     int64_t timer_id;
     uint8_t repeats:1;
+    uint8_t is_ref:1;
     int64_t timeout;
     int64_t delay;
     JSValue func;
@@ -2468,6 +2469,34 @@ static JSValue js_os_setHandlerRef(JSContext *ctx, JSValueConst this_val,
     return JS_UNDEFINED;
 }
 
+/* Timers follow the same ref/unref rule as I/O handlers: an unref'd timer
+   is still serviced while other work keeps the loop alive, but it does not
+   keep the process running by itself. */
+static JSValue js_os_setTimerRef(JSContext *ctx, JSValueConst this_val,
+                                 int argc, JSValueConst *argv)
+{
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    JSThreadState *ts = js_get_thread_state(rt);
+    JSOSTimer *th;
+    struct list_head *el;
+    int64_t timer_id;
+    int is_ref;
+
+    if (JS_ToInt64(ctx, &timer_id, argv[0]))
+        return JS_EXCEPTION;
+    is_ref = JS_ToBool(ctx, argv[1]);
+    if (is_ref < 0)
+        return JS_EXCEPTION;
+    list_for_each(el, &ts->os_timers) {
+        th = list_entry(el, JSOSTimer, link);
+        if (th->timer_id == timer_id) {
+            th->is_ref = is_ref != 0;
+            break;
+        }
+    }
+    return JS_UNDEFINED;
+}
+
 /* True when at least one ref'd handler can produce events. */
 static bool js_os_has_ref_handler(JSThreadState *ts)
 {
@@ -2487,6 +2516,20 @@ static bool js_os_has_ref_handler(JSThreadState *ts)
             return true;
     }
 #endif
+    return false;
+}
+
+/* True when at least one timer keeps the event loop alive. */
+static bool js_os_has_ref_timer(JSThreadState *ts)
+{
+    JSOSTimer *th;
+    struct list_head *el;
+
+    list_for_each(el, &ts->os_timers) {
+        th = list_entry(el, JSOSTimer, link);
+        if (th->is_ref)
+            return true;
+    }
     return false;
 }
 
@@ -2683,6 +2726,7 @@ static JSValue js_os_setTimeout(JSContext *ctx, JSValueConst this_val,
     if (ts->next_timer_id > MAX_SAFE_INTEGER)
         ts->next_timer_id = 1;
     th->repeats = (magic > 0);
+    th->is_ref = 1;
     th->timeout = js__hrtime_ms() + delay;
     th->delay = delay;
     th->func = JS_DupValue(ctx, func);
@@ -2744,6 +2788,7 @@ static JSValue js_os_sleepAsync(JSContext *ctx, JSValueConst this_val,
         return JS_EXCEPTION;
     }
     th->timer_id = -1;
+    th->is_ref = 1;
     th->timeout = js__hrtime_ms() + delay;
     th->func = JS_DupValue(ctx, resolving_funcs[0]);
     list_add_tail(&th->link, &ts->os_timers);
@@ -3175,9 +3220,8 @@ static int js_os_poll_internal(JSContext *ctx, int timeout_ms, int flags)
     if (flags & JS_OS_POLL_RUN_TIMERS) {
         js_os_next_timer_delay(ts, &min_delay);
         timers_due = (min_delay == 0);
-        if (min_delay < 0)
-            if (!js_os_has_ref_handler(ts))
-                return -1; /* no more events */
+        if (!js_os_has_ref_timer(ts) && !js_os_has_ref_handler(ts))
+            return -1; /* no more events */
     }
 
     qn_last_delay = min_delay;
@@ -3365,9 +3409,8 @@ static int js_os_poll_internal(JSContext *ctx, int timeout_ms, int flags)
     if (flags & JS_OS_POLL_RUN_TIMERS) {
         js_os_next_timer_delay(ts, &min_delay);
         timers_due = (min_delay == 0);
-        if (min_delay < 0)
-            if (!js_os_has_ref_handler(ts))
-                return -1; /* no more events */
+        if (!js_os_has_ref_timer(ts) && !js_os_has_ref_handler(ts))
+            return -1; /* no more events */
     }
 
     nfds = 0;
@@ -5181,6 +5224,7 @@ static const JSCFunctionListEntry js_os_funcs[] = {
     JS_CFUNC_MAGIC_DEF("setReadHandler", 2, js_os_setReadHandler, 0 ),
     JS_CFUNC_MAGIC_DEF("setWriteHandler", 2, js_os_setReadHandler, 1 ),
     JS_CFUNC_DEF("setHandlerRef", 2, js_os_setHandlerRef ),
+    JS_CFUNC_DEF("setTimerRef", 2, js_os_setTimerRef ),
 #if defined(QJS_HAVE_LIBEV)
     JS_CFUNC_DEF("pollStats", 0, js_os_pollStats ),
 #endif
@@ -5650,7 +5694,7 @@ int js_std_has_pending(JSContext *ctx)
 #endif
     if (JS_IsJobPending(rt))
         return 1;
-    if (!list_empty(&ts->os_timers))
+    if (js_os_has_ref_timer(ts))
         return 1;
     list_for_each(el, &ts->os_rw_handlers) {
         rh = list_entry(el, JSOSRWHandler, link);

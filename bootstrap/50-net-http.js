@@ -22,6 +22,16 @@ function isIpLiteral(host) {
   return /^[0-9.]+$/.test(host) || host.indexOf(":") >= 0;
 }
 
+/* Native socket mode: 1 forces the owned TCP stack, -1 forces the kernel,
+   0 lets node_netstack pick by address. */
+function netstackMode(options) {
+  if (options && options.netstack === true)
+    return 1;
+  if (options && options.netstack === false)
+    return -1;
+  return 0;
+}
+
 function normalizeConnectArgs(args) {
   let options = {};
   let cb;
@@ -153,7 +163,10 @@ class Socket extends Duplex {
       if (family === 6 && /^[0-9.]+$/.test(host))
         host = "::ffff:" + host;
       const r = native.socket(family === 6 ? C.AF_INET6 : C.AF_INET,
-                              C.SOCK_STREAM, 0);
+                              C.SOCK_STREAM, 0,
+                              options.shard !== undefined ||
+                              options.subnet !== undefined
+                                ? -1 : netstackMode(options));
       if (r[1]) {
         self.destroy(sysError(r[1], "socket"));
         return;
@@ -183,7 +196,8 @@ class Socket extends Duplex {
         self._afterConnect();
       } else if (err === C.EINPROGRESS || err === C.EAGAIN ||
                  err === C.EWOULDBLOCK) {
-        qjsos.setWriteHandler(self._fd, () => {
+        const onReady = () => {
+          qjsos.setReadHandler(self._fd, null);
           qjsos.setWriteHandler(self._fd, null);
           const so = native.getsockopt(self._fd, C.SOL_SOCKET, C.SO_ERROR);
           const e = so[1] ? so[1] : so[0];
@@ -192,7 +206,11 @@ class Socket extends Duplex {
             return;
           }
           self._afterConnect();
-        });
+        };
+        if (native.isVirtualFd(self._fd))
+          qjsos.setReadHandler(self._fd, onReady);
+        else
+          qjsos.setWriteHandler(self._fd, onReady);
       } else {
         self.destroy(sysError(err, "connect", options.host));
       }
@@ -536,9 +554,11 @@ class Server extends EventEmitter {
 
   _listenSingle(options, fallbackReason) {
     const want6 = options.family === 6 ||
+      options.netstack === true ||
       (typeof options.host === "string" && options.host.indexOf(":") >= 0);
     const r = native.socket(want6 ? C.AF_INET6 : C.AF_INET,
-                            C.SOCK_STREAM, 0);
+                            C.SOCK_STREAM, 0,
+                            netstackMode(options));
     if (r[1])
       throw sysError(r[1], "socket");
     const fd = r[0];
@@ -607,7 +627,8 @@ class Server extends EventEmitter {
     const listeners = [];
     let failure = null;
     for (let i = 0; i < count; i++) {
-      const r = native.socket(C.AF_INET6, C.SOCK_STREAM, 0);
+      const r = native.socket(C.AF_INET6, C.SOCK_STREAM, 0,
+                              options.netstack === true ? 1 : -1);
       if (r[1]) {
         failure = sysError(r[1], "socket");
         break;
@@ -751,6 +772,21 @@ const net = {
   connect: createConnection,
   shardAddress,
   shardIndex,
+  /* Diagnostics for the owned IPv6 TCP engine. `address` is the stable
+     local address to listen on / connect to when using netstack: true. */
+  netstackInfo() {
+    try {
+      const info = native.netstackInfo();
+      return { enabled: !!info[0], address: info[1] || null,
+               link: info[2] || null, fd: info[3] };
+    } catch (e) {
+      return { enabled: false, address: null, link: null, fd: -1 };
+    }
+  },
+  netstackAddress() {
+    const info = this.netstackInfo();
+    return info.enabled ? info.address : null;
+  },
   isIP(input) {
     const s = String(input);
     if (/^\d{1,3}(\.\d{1,3}){3}$/.test(s) &&
@@ -998,6 +1034,7 @@ class HttpServer extends EventEmitter {
     let chunked = false;
     let chunkState = null;
     let idleTimer = null;
+    let upgraded = false;
 
     /* Idle keep-alive connections are closed after keepAliveTimeout, like
        Node does. Without this a finished exchange leaves a ref'd socket
@@ -1051,6 +1088,8 @@ class HttpServer extends EventEmitter {
     };
 
     const processBuffer = () => {
+      if (upgraded)
+        return;
       for (;;) {
         if (!current) {
           const idx = bufferIndexOf(buf, Buffer.from("\r\n\r\n"));
@@ -1068,6 +1107,29 @@ class HttpServer extends EventEmitter {
           req.headers = parsed.headers;
           req.rawHeaders = parsed.rawHeaders;
           req._keepAlive = (req.headers.connection || "").toLowerCase() !== "close";
+
+          /* An Upgrade request (WebSocket, etc.) or CONNECT takes over the
+             socket: hand the remaining bytes to the listener and never run
+             the HTTP parser on this connection again. */
+          const connection = req.headers.connection || "";
+          const wantsUpgrade = req.headers.upgrade !== undefined &&
+            /(?:^|,)\s*upgrade\s*(?:,|$)/i.test(connection);
+          if (wantsUpgrade || req.method === "CONNECT") {
+            const event = req.method === "CONNECT" ? "connect" : "upgrade";
+            req.complete = true;
+            req._keepAlive = false;
+            buf = Buffer.alloc(0);
+            current = null;
+            upgraded = true;
+            clearIdle();
+            socket._idle = false;
+            if (this.listenerCount(event))
+              this.emit(event, req, socket, rest);
+            else
+              socket.destroy();
+            return;
+          }
+
           buf = rest;
           current = req;
           const te = (req.headers["transfer-encoding"] || "").toLowerCase();
@@ -1121,6 +1183,8 @@ class HttpServer extends EventEmitter {
     };
 
     socket.on("data", (chunk) => {
+      if (upgraded)
+        return;
       clearIdle();
       buf = Buffer.concat([buf, chunk]);
       try {

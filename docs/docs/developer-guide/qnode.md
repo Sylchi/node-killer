@@ -10,14 +10,17 @@ changes.
 |---|---|
 | `qnode.c` | CLI entry point: runtime/context setup, argument parsing, event loop drain |
 | `node.c` | Native layer: filesystem, sockets, DNS, child processes, zlib, TLS, crypto, module loading |
+| `node_netstack.c` | Virtual-fd bridge between `node.c` sockets and the owned TCP stack |
 | `node.h` | Entry points used by `qnode.c` and the worker hook |
 | `bootstrap/` | Node compatibility layer, split into ordered parts |
-| `netstack.c` | Experimental userspace TCP stack; linked only into `netstack_test` |
+| `netstack.c` | Owned IPv6 TCP engine (no kernel sockets) |
+| `netstack_link.c` | Loopback and Linux TUN links for the owned stack |
 | `vendor/` | zlib, mbedTLS, libsodium, libev, wasm3 |
 | `tests/` | Test262-compatible tests plus qnode-only tests |
 
 `node.c` is compiled only on Linux. The upstream `qjs` and `qjsc` targets do
-not depend on it.
+not depend on it. `netstack.c` itself is portable; the Linux-only pieces are
+the TUN link and the `eventfd` virtual descriptors.
 
 ## Boot sequence
 
@@ -57,6 +60,37 @@ C functions follow a common shape: they take `JSValueConst` arguments,
 return `JSValue`, and use `node_get_bytes()`/`node_free_bytes()` for buffers
 that may be strings, `Buffer`s, typed arrays or `ArrayBuffer`s.
 
+## Networking
+
+`node:net` has two server engines:
+
+- **Kernel TCP** for IPv4, UDP, `netstack: false`, and the sharded transport
+  (`subnet`/`shards`). This is the existing path and remains fully
+  interoperable with the host.
+- **Owned TCP** for IPv6 streams inside the managed prefix (default
+  `fd00:dead:beef:99::/64`). `native.socket()` returns an `eventfd`-backed
+  virtual fd; `node_netstack.c` implements the socket operations on top of
+  `netstack.c`, and the real eventfd is what libev polls.
+
+When a virtual socket binds or connects to an address outside the managed
+prefix, the bridge creates a kernel socket, `dup2`s it onto the same descriptor
+and marks the slot free. The JS layer therefore never has to recreate a
+`Socket` just because the engine changed. `native.isVirtualFd(fd)` exposes the
+distinction, which the bootstrap uses to choose read vs. write readiness for
+non-blocking connect.
+
+The stack is driven by three native calls: socket operations pump it
+synchronously; an unref'd timer calls `netstackTick()` for RTO retransmits; and
+a TUN link additionally installs a read handler that calls `netstackPump()`.
+The loopback link needs no timer or privileges, but it is process-local. See
+`docs/netstack.md` for the packet engine, environment variables and limits.
+
+WebSocket support lives in `bootstrap/85-websocket.js`. `http.Server` emits
+the standard `'upgrade'`/`'connect'` events, and `node:websocket` provides both
+the WHATWG `WebSocket` client and a Node-style `WebSocketServer` that can
+attach to an existing HTTP server or listen on its own port. The global
+`WebSocket` is installed in `99-entry.js`.
+
 ## Module loading
 
 - CommonJS resolution and evaluation live in
@@ -75,7 +109,10 @@ that may be strings, `Buffer`s, typed arrays or `ArrayBuffer`s.
 ## Event loop and workers
 
 The event loop is quickjs-libc's libev loop, reached through the `qjs:os`
-module. `setTimeout`, sockets and DNS all register handlers there.
+module. `setTimeout`, sockets and DNS all register handlers there. Both I/O
+handlers and timers support Node's ref/unref semantics: an unref'd timer is
+serviced while the loop runs for other work, but does not keep the process
+alive by itself.
 
 Workers are real threads. Each worker gets its own context and re-runs the
 bootstrap with `__qnode_worker_mode` set; `bootstrap/99-entry.js` then loads
@@ -90,8 +127,10 @@ Concurrent TLS use from multiple workers is not safe yet. Crypto RNG state
 ## Testing
 
 ```bash
-make test        # upstream quickjs-ng suite (qjs)
-make qnode-test  # qnode-only tests (crypto, workers, fetch, modules, net)
+make test              # upstream quickjs-ng suite (qjs)
+make qnode-test        # qnode-only tests (crypto, workers, fetch, modules, net, WebSocket)
+make netstack-test     # owned TCP engine in isolation
+make netstack-tun-test # optional TUN path (skips without user namespaces)
 ```
 
 Test262 cannot exercise the Node APIs, so qnode tests live in `tests/qnode/`.

@@ -84,14 +84,22 @@ typedef struct NsShard {
     uint16_t next_port;
 } NsShard;
 
+typedef struct NsListener {
+    NsAddr addr;
+    uint16_t port;
+    int has_addr;
+} NsListener;
+
 struct NsStack {
     uint8_t prefix[NS_PREFIX_LEN];
     int nshards;
     NsShard shards[NS_MAX_SHARDS];
     NsLinkSendFn send;
     void *opaque;
-    uint16_t listeners[NS_MAX_LISTENERS];
+    NsListener listeners[NS_MAX_LISTENERS];
     int nlisteners;
+    int plain;
+    NsAddr plain_addr;
     uint64_t clock;
     uint32_t rnd;
     NsStats stats;
@@ -279,34 +287,146 @@ void ns_stack_free(NsStack *s)
     free(s);
 }
 
+void ns_stack_set_send(NsStack *s, NsLinkSendFn send, void *opaque)
+{
+    if (!s)
+        return;
+    s->send = send;
+    s->opaque = opaque;
+}
+
+/* ---------------- plain mode ---------------- */
+
+int ns_stack_set_plain(NsStack *s, const NsAddr *local)
+{
+    if (!s || !local)
+        return -NS_EINVAL;
+    s->plain = 1;
+    s->plain_addr = *local;
+    return 0;
+}
+
+int ns_stack_is_plain(const NsStack *s)
+{
+    return s ? s->plain : 0;
+}
+
+const NsAddr *ns_stack_local(const NsStack *s)
+{
+    return s ? &s->plain_addr : NULL;
+}
+
 /* ---------------- listeners ---------------- */
 
-static int find_listener(const NsStack *s, uint16_t port)
+static int listener_match(const NsListener *l, const NsAddr *dst,
+                          uint16_t port)
+{
+    if (l->port != port)
+        return 0;
+    if (!l->has_addr)
+        return is_service_addr(dst);
+    return addr_eq(&l->addr, dst);
+}
+
+static int find_listener_at(const NsStack *s, const NsAddr *dst,
+                            uint16_t port)
 {
     int i;
     for (i = 0; i < s->nlisteners; i++)
-        if (s->listeners[i] == port)
+        if (listener_match(&s->listeners[i], dst, port))
+            return i;
+    return -1;
+}
+
+static int find_listener_port(const NsStack *s, uint16_t port)
+{
+    int i;
+    for (i = 0; i < s->nlisteners; i++)
+        if (s->listeners[i].port == port)
             return i;
     return -1;
 }
 
 int ns_listen(NsStack *s, uint16_t port)
 {
+    return ns_listen_addr(s, NULL, port);
+}
+
+int ns_listen_addr(NsStack *s, const NsAddr *local, uint16_t port)
+{
+    NsListener *l;
+
     if (!s || port == 0 || s->nlisteners >= NS_MAX_LISTENERS)
         return -NS_EINVAL;
-    if (find_listener(s, port) >= 0)
+    if (find_listener_port(s, port) >= 0)
         return -NS_EINVAL;
-    s->listeners[s->nlisteners++] = port;
+    l = &s->listeners[s->nlisteners++];
+    l->port = port;
+    l->has_addr = local != NULL;
+    if (local)
+        l->addr = *local;
+    else
+        memset(&l->addr, 0, sizeof(l->addr));
     return 0;
+}
+
+/* Register a listener for an ephemeral port and report the chosen port.
+   Ports in the ephemeral range are scanned upward from a per-stack cursor. */
+int ns_listen_port(NsStack *s, uint16_t port, uint16_t *out_port)
+{
+    return ns_listen_port_ex(s, NULL, port, out_port);
+}
+
+int ns_listen_port_ex(NsStack *s, const NsAddr *local, uint16_t port,
+                      uint16_t *out_port)
+{
+    uint16_t p;
+    int err;
+
+    if (!s || !out_port)
+        return -NS_EINVAL;
+    if (port != 0)
+        return ns_listen_addr(s, local, port);
+    p = s->shards[0].next_port;
+    for (;;) {
+        err = ns_listen_addr(s, local, p);
+        if (err == 0) {
+            s->shards[0].next_port = p + 1;
+            *out_port = p;
+            return 0;
+        }
+        p++;
+        if (p == 0)
+            return -NS_EINVAL;
+    }
+}
+
+int ns_unlisten(NsStack *s, uint16_t port)
+{
+    int i;
+    if (!s)
+        return -NS_EINVAL;
+    for (i = 0; i < s->nlisteners; i++) {
+        if (s->listeners[i].port != port)
+            continue;
+        memmove(&s->listeners[i], &s->listeners[i + 1],
+                (size_t)(s->nlisteners - i - 1) * sizeof(s->listeners[0]));
+        s->nlisteners--;
+        return 0;
+    }
+    return -NS_EINVAL;
 }
 
 int ns_listener_addr(const NsStack *s, uint16_t port, int shard, NsAddr *out)
 {
     if (!s || !out || shard < 0 || shard >= s->nshards)
         return -NS_EINVAL;
-    if (find_listener(s, port) < 0)
+    if (find_listener_port(s, port) < 0)
         return -NS_EINVAL;
-    ns_addr_service(s, shard, out);
+    if (s->plain)
+        *out = s->plain_addr;
+    else
+        ns_addr_service(s, shard, out);
     return 0;
 }
 
@@ -605,14 +725,18 @@ static void conn_input(NsConn *c, uint8_t flags, uint32_t seq, uint32_t ack,
     }
 }
 
-static NsConn *server_accept_syn(NsShard *sh, const NsAddr *src, uint16_t sport,
+static NsConn *server_accept_syn(NsShard *sh, const NsAddr *src,
+                                 const NsAddr *dst, uint16_t sport,
                                  uint16_t dport, uint32_t seq, uint64_t now)
 {
     NsStack *s = sh->stack;
     NsConn *c = conn_new(sh, NS_SYN_RCVD);
     if (!c)
         return NULL;
-    shard_alloc_addr(sh, &c->local);
+    if (s->plain)
+        c->local = *dst;
+    else
+        shard_alloc_addr(sh, &c->local);
     c->remote = *src;
     c->lport = dport;
     c->rport = sport;
@@ -650,8 +774,8 @@ static void shard_process(NsShard *sh, NsPacket *p)
 
     c = conn_find(sh, &da, dport, &sa, sport);
     if (!c && (flags & NS_TCP_SYN) && !(flags & NS_TCP_ACK)) {
-        if (is_service_addr(&da) && find_listener(s, dport) >= 0) {
-            c = server_accept_syn(sh, &sa, sport, dport, seq, now);
+        if (find_listener_at(s, &da, dport) >= 0) {
+            c = server_accept_syn(sh, &sa, &da, sport, dport, seq, now);
             if (!c) {
                 s->stats.dropped++;
                 return;
@@ -660,7 +784,7 @@ static void shard_process(NsShard *sh, NsPacket *p)
             return;
         }
     }
-    if (!c && (flags & (NS_TCP_SYN | NS_TCP_ACK)) ==
+    if (!c && !s->plain && (flags & (NS_TCP_SYN | NS_TCP_ACK)) ==
                    (NS_TCP_SYN | NS_TCP_ACK)) {
         /* The server allocates a new address for the connection and sends
            the SYN-ACK from it; migrate the pending client endpoint. */
@@ -735,7 +859,7 @@ void ns_input(NsStack *s, const uint8_t *pkt, size_t len)
     }
     len = (size_t)body + NS_IPV6_HDR;
 
-    shard = pkt[24 + 8];
+    shard = s->plain ? 0 : pkt[24 + 8];
     if (shard < 0 || shard >= s->nshards) {
         s->stats.dropped++;
         return;
@@ -831,32 +955,48 @@ void ns_tick(NsStack *s, uint64_t now_ms)
     }
 }
 
-uint64_t ns_connect(NsStack *s, int local_shard, const NsAddr *service,
-                    uint16_t port, uint16_t local_port)
+static uint64_t conn_connect(NsStack *s, NsShard *sh, const NsAddr *local,
+                             uint16_t local_port, const NsAddr *remote,
+                             uint16_t remote_port)
 {
-    NsShard *sh;
-    NsConn *c;
-
-    if (!s || !service || port == 0 || local_shard < 0 ||
-        local_shard >= s->nshards)
-        return 0;
-    if (ns_addr_shard(service) >= s->nshards)
-        return 0;
-
-    sh = &s->shards[local_shard];
-    c = conn_new(sh, NS_SYN_SENT);
+    NsConn *c = conn_new(sh, NS_SYN_SENT);
     if (!c)
         return 0;
-    c->remote = *service;
-    shard_alloc_addr(sh, &c->local);
+    c->remote = *remote;
+    if (local)
+        c->local = *local;
+    else
+        shard_alloc_addr(sh, &c->local);
     c->lport = local_port ? local_port : sh->next_port++;
-    c->rport = port;
+    c->rport = remote_port;
     c->iss = ns_rand(s);
     c->snd_una = c->iss;
     c->snd_nxt = c->iss + 1;
     seg_add(c, c->iss, 1, NS_TCP_SYN, NULL, 0, s->clock);
     ns_emit(c, NS_TCP_SYN, c->iss, 0, NULL, 0);
     return c->id;
+}
+
+uint64_t ns_connect(NsStack *s, int local_shard, const NsAddr *service,
+                    uint16_t port, uint16_t local_port)
+{
+    if (!s || !service || port == 0 || local_shard < 0 ||
+        local_shard >= s->nshards)
+        return 0;
+    if (ns_addr_shard(service) >= s->nshards)
+        return 0;
+    return conn_connect(s, &s->shards[local_shard],
+                        s->plain ? &s->plain_addr : NULL, local_port,
+                        service, port);
+}
+
+uint64_t ns_connect_from(NsStack *s, const NsAddr *local, uint16_t local_port,
+                         const NsAddr *remote, uint16_t remote_port)
+{
+    if (!s || !local || !remote || remote_port == 0)
+        return 0;
+    return conn_connect(s, &s->shards[0], local, local_port, remote,
+                        remote_port);
 }
 
 int ns_send(NsStack *s, uint64_t id, const void *buf, size_t len)
@@ -951,7 +1091,37 @@ int ns_accept(NsStack *s, uint64_t *id_out)
             if (!sh->accept_head)
                 sh->accept_tail = NULL;
             c->accept_next = NULL;
-            if (c->state != NS_ESTABLISHED)
+            if (c->state == NS_SYN_SENT || c->state == NS_SYN_RCVD)
+                continue;
+            c->accepted = 1;
+            *id_out = c->id;
+            s->stats.accepted++;
+            return 0;
+        }
+    }
+    return -NS_EAGAIN;
+}
+
+int ns_accept_port(NsStack *s, uint16_t port, uint64_t *id_out)
+{
+    int i;
+
+    if (!s || !id_out)
+        return -NS_EINVAL;
+    for (i = 0; i < s->nshards; i++) {
+        NsShard *sh = &s->shards[i];
+        NsConn *c, *prev = NULL;
+        for (c = sh->accept_head; c; prev = c, c = c->accept_next) {
+            if (c->lport != port)
+                continue;
+            if (prev)
+                prev->accept_next = c->accept_next;
+            else
+                sh->accept_head = c->accept_next;
+            if (sh->accept_tail == c)
+                sh->accept_tail = prev;
+            c->accept_next = NULL;
+            if (c->state == NS_SYN_SENT || c->state == NS_SYN_RCVD)
                 continue;
             c->accepted = 1;
             *id_out = c->id;
@@ -963,6 +1133,57 @@ int ns_accept(NsStack *s, uint64_t *id_out)
 }
 
 /* ---------------- introspection ---------------- */
+
+int ns_accept_ready(NsStack *s)
+{
+    int i;
+    if (!s)
+        return 0;
+    for (i = 0; i < s->nshards; i++)
+        if (s->shards[i].accept_head)
+            return 1;
+    return 0;
+}
+
+int ns_accept_ready_port(NsStack *s, uint16_t port)
+{
+    int i;
+    if (!s)
+        return 0;
+    for (i = 0; i < s->nshards; i++) {
+        NsConn *c;
+        for (c = s->shards[i].accept_head; c; c = c->accept_next)
+            if (c->lport == port)
+                return 1;
+    }
+    return 0;
+}
+
+int ns_conn_readable(NsStack *s, uint64_t id)
+{
+    NsConn *c = conn_by_id(s, id);
+    if (!c)
+        return 1;
+    return c->rlen > 0 || c->peer_closed || c->state == NS_CLOSED;
+}
+
+int ns_conn_writable(NsStack *s, uint64_t id)
+{
+    NsConn *c = conn_by_id(s, id);
+    if (!c)
+        return 1;
+    return (c->state == NS_ESTABLISHED || c->state == NS_CLOSE_WAIT) &&
+           !c->local_closed;
+}
+
+int ns_conn_established(NsStack *s, uint64_t id)
+{
+    NsConn *c = conn_by_id(s, id);
+    if (!c)
+        return 0;
+    return c->state == NS_ESTABLISHED || c->state == NS_CLOSE_WAIT ||
+           c->state == NS_FIN_WAIT_1 || c->state == NS_FIN_WAIT_2;
+}
 
 int ns_conn_state(NsStack *s, uint64_t id)
 {

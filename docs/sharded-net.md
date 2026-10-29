@@ -1,13 +1,19 @@
 # Sharded IPv6 transport for `node:net`
 
 Status: implemented on the kernel TCP path. The owned TCP/IP stack in
-`netstack.c` remains an opt-in R&D track; see `docs/netstack.md`.
+`netstack.c` is now integrated as the default engine for the managed IPv6
+prefix; see `docs/netstack.md`. Sharded listeners continue to use kernel TCP,
+so the two can coexist in one process.
 
 The sharded transport uses ordinary kernel TCP sockets, one per IPv6 shard
 address. The kernel already demultiplexes by the full 4-tuple, so this keeps
 interoperability and hardware offload while removing the shared accept queue
 from the hot path: a connection is steered to a shard by its destination
 address, and only that shard's listener accepts it.
+
+Setting `shards` or `subnet` selects kernel sockets even when the owned stack
+is enabled, because the owned stack does not implement per-shard threads or
+per-connection address allocation yet.
 
 ## Address layout
 
@@ -141,8 +147,9 @@ kernel hashes new connections across processes sharing a shard address.
   existing single-listener behavior.
 - If the fallback listener is used, `sock.shard` is `undefined` and
   `server.sharded` is `false`.
-- This path does not replace kernel TCP. The owned stack, per-connection
-  addresses, and SYN-ACK migration are described in `docs/netstack.md`.
+- This path does not replace kernel TCP for sharded listeners. The owned
+  stack, loopback/TUN links, and automatic selection by managed address are
+  described in `docs/netstack.md`.
 
 ## Tests
 

@@ -152,6 +152,10 @@ netstack-test: $(BUILD_DIR)
 	cmake --build $(BUILD_DIR) --target netstack_test
 	$(BUILD_DIR)/netstack-test
 
+netstack-tun-test: $(BUILD_DIR)
+	cmake --build $(BUILD_DIR) --target qnode_exe -j $(JOBS)
+	QNODE=$(abspath $(BUILD_DIR))/qnode sh $(CURDIR)/tests/qnode/netstack_tun.sh
+
 worker-test: $(BUILD_DIR)
 	cmake --build $(BUILD_DIR) --target qnode_exe -j $(JOBS)
 	$(abspath $(BUILD_DIR))/qnode $(CURDIR)/tests/qnode/worker_threads.js

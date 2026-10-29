@@ -1,122 +1,201 @@
-# qnode netstack: an owned TCP/IP stack with IPv6 shard dispatch
+# Owned TCP/IP stack (`netstack`)
 
-Status: prototype, opt-in R&D. The code lives in `netstack.c` / `netstack.h`
-and is not wired into `node:net`. The supported sharded transport is the
-kernel TCP path described in `docs/sharded-net.md`; the existing OS-socket
-path remains the default.
+Status: integrated. `node:net` now hands managed IPv6 TCP streams to the
+in-process stack in `netstack.c` instead of the kernel. IPv4, UDP and
+unmanaged addresses still use kernel sockets, and `netstack: false` restores
+the kernel path per socket.
 
-## Motivation
+The kernel-backed sharded transport is still available and is documented in
+`docs/sharded-net.md`. The two features share the same `/64` address layout
+and the same `net.shardAddress()` helpers, but they use different engines:
+sharded listeners use kernel TCP, the managed prefix uses the owned stack.
 
-qnode currently delegates TCP and UDP to the kernel. That is the right default,
-but it leaves three things outside our control:
+## Architecture
 
-- per-connection state is shared in the kernel and demultiplexed by a global
-  hash table;
-- every read/write crosses a syscall boundary;
-- there is no natural way to pin one connection to one worker without a shared
-  accept queue or `SO_REUSEPORT` guesswork.
+```
+  node:net / http / WebSocket
+             |
+       native.socket/read/write/...
+             |
+   node_netstack.c  (virtual fd bridge)
+      |            |
+   eventfd      netstack.c  (IPv6 + TCP state machine)
+                   |
+              netstack_link.c
+              /             \
+       loopback          Linux TUN
+```
 
-The netstack is an in-process alternative with a deliberately different
-demultiplexing rule: **the destination IPv6 address selects the worker shard**.
-Because IPv6 gives every connection a practically unlimited supply of
-addresses, each connection can own an address. A packet's dispatch decision is
-then a single byte load, not a hash of a 4-tuple, and connections owned by one
-shard touch no other shard's state.
+- `netstack.c` is transport-agnostic. It consumes complete IPv6 packets and
+  emits complete IPv6 packets; it never opens a kernel socket.
+- `netstack_link.c` is the link: an in-process loopback or a Linux TUN device.
+- `node_netstack.c` exposes the stack as descriptors. Each virtual fd is an
+  `eventfd`; `node.c` routes socket natives to the bridge when the descriptor
+  is virtual, and libev polls the underlying eventfd as usual.
+- `bootstrap/50-net-http.js` treats a virtual fd like any other non-blocking
+  socket. Connect completion uses the read handler, because a virtual fd has
+  no writable-side event of its own.
+
+## Selecting the owned stack
+
+`net.connect()` and `net.createServer()` accept a `netstack` option:
+
+```js
+const net = require("node:net");
+
+// Force this socket onto the owned stack.
+const server = net.createServer({ netstack: true }, (sock) => {
+  sock.end("hello from userspace TCP");
+});
+
+server.listen({ port: 8080, host: net.netstackAddress(), netstack: true });
+
+// Force the kernel even for an address in the managed prefix.
+const kernelSocket = net.connect({ host: "...", port: 80, netstack: false });
+```
+
+The default is automatic:
+
+- An IPv6 stream socket whose bind or connect address lies inside the managed
+  prefix stays on the owned stack.
+- Any other address is converted to a real kernel socket in place, so the
+  descriptor number and the JS `Socket` object stay valid.
+- IPv4 (`127.0.0.1`, `0.0.0.0`, ...) always uses the kernel. So do UDP
+  sockets, `shards`/`subnet` listeners, and sockets created when the stack
+  could not be initialised.
+
+`net.netstackInfo()` reports the engine:
+
+```js
+net.netstackInfo();
+// { enabled: true, address: "fd00:dead:beef:99::1",
+//   link: "loopback", fd: -1 }
+```
+
+`fd` is the TUN descriptor, or `-1` on the loopback link.
+`net.netstackAddress()` is shorthand for the `address` field.
 
 ## Addressing
 
-A stack owns a `/64` prefix. The 64 host bits are split as:
+The default prefix is `fd00:dead:beef:99::/64`. The stack owns one stable
+local address in that prefix, the first host address (`::1` by default):
+`fd00:dead:beef:99::1`. In plain mode, client connections use that address as
+their source and listeners may bind any explicit address inside the prefix.
+
+The low 64 bits of an address still follow the sharded layout used by the
+kernel path:
 
 ```
 |<------------- /64 prefix ------------->|< shard >|<------ slot ------>
  0                                      7 8        9                 15
 ```
 
-- `byte 8` is the shard id. It is also the dispatch key.
-- `bytes 9..15` are a per-shard slot index (56 bits, big endian).
-- Slot `0` on each shard is reserved for that shard's *service address*, the
-  address a listener advertises for the initial SYN.
-- Slot `n >= 1` is a per-connection address.
+Plain mode keeps the current single-shard design: every packet is dispatched
+to shard 0, and the destination address is recorded as the connection's local
+address. The shard byte is therefore available for a future threaded
+dispatcher without changing the wire format, but it is not used for
+demultiplexing yet.
 
-`ns_input()` reads `destination.b[8]`, validates it against the shard count,
-and appends the packet to that shard's queue. It never inspects ports to pick a
-shard.
+Environment variables:
 
-### Connection migration on SYN-ACK
+| Variable | Meaning |
+| --- | --- |
+| `QNODE_NETSTACK=0` | Disable the owned stack; all sockets use the kernel. |
+| `QNODE_NETSTACK_PREFIX` | Override the managed `/64`, e.g. `fd00:1:2:3::/64`. |
+| `QNODE_NETSTACK_TUN=1` | Use a TUN link instead of the in-process loopback. |
+| `QNODE_NETSTACK_TUN_NAME` | TUN interface name, e.g. `qn0`. Defaults to a kernel-assigned name. |
 
-A client sends its SYN to a listener's service address. The server allocates a
-fresh address from the connection's shard and sends the SYN-ACK **from that
-fresh address**. The client recognizes the SYN-ACK as belonging to its pending
-connection (same local address/port and peer port), records the new source as
-the remote endpoint, and sends the final ACK there. From then on every packet
-in both directions is addressed to a per-connection address, so dispatch is
-purely address-based at both ends.
+## Links
 
-This is connection migration in the QUIC sense. It works between two netstack
-instances; it is not wire-compatible with a peer that expects the SYN-ACK to
-come from the address it sent the SYN to.
+### Loopback
 
-## Shards and interleaved dispatch
+The default link injects emitted packets straight back into the same stack.
+It needs no privileges and is what the integration tests use. A client and
+server in the same process can talk over the owned stack with no external
+interface, route or address configuration.
 
-Each shard owns:
+Because the stack is process-local, loopback does **not** connect two qnode
+processes, and it does not reach the host network.
 
-- a FIFO of inbound packets;
-- its connection list and slot allocator;
-- its accept queue and retransmission timers.
+### TUN
 
-`ns_run()` drains one packet from each non-empty shard per round, up to a
-budget. A busy shard cannot starve the others, which is what "interleaved"
-means here. The queues and per-shard state are the seams for real threads: a
-future version can give each shard a thread and an eventfd wakeup, with the
-only cross-shard traffic being the inbound packet queue (already a bounded
-MPSC hand-off) and address allocation.
+Set `QNODE_NETSTACK_TUN=1` to move packet I/O to a TUN device:
 
-## Prototype scope
+```sh
+sudo ip tuntap add dev qn0 mode tun user "$USER"
+sudo ip link set qn0 up
+sudo ip -6 addr add fd00:dead:beef:99::2/64 dev qn0
+
+QNODE_NETSTACK=1 QNODE_NETSTACK_TUN=1 QNODE_NETSTACK_TUN_NAME=qn0 \
+  ./qnode app.js
+```
+
+The stack keeps `fd00:dead:beef:99::1`; `::2` is the host side of the link.
+Add routes so the host knows which destinations belong to the stack, and
+ensure the managed prefix is routed to the TUN device. Incoming packets wake
+the TUN read handler, and an unref'd 20 ms heartbeat drives retransmission
+timers. The heartbeat only runs while other work keeps the event loop alive, so
+an idle `qnode -e` still exits.
+
+Creating a TUN device normally needs `CAP_NET_ADMIN` (or a user namespace).
+The loopback link remains the default because it works unprivileged.
+
+## TCP behaviour
 
 Implemented:
 
-- IPv6 header encode/decode and TCP segment encode/decode with checksums;
-- address allocation and shard mapping;
-- listener service addresses;
-- TCP handshake with SYN-ACK address migration;
-- in-order data transfer with ACKs, PSH, and a receive ring;
-- FIN close (FIN_WAIT_1/2, CLOSE_WAIT, LAST_ACK, TIME_WAIT);
-- fixed-RTO retransmission of unacked data;
-- per-shard packet queues and round-robin dispatch;
-- statistics and a dispatch trace for tests.
+- IPv6 header and TCP segment encode/decode with checksums;
+- SYN / SYN-ACK / ACK handshake and accept queue;
+- in-order data transfer, ACK, PSH and a receive ring;
+- FIN close with `FIN_WAIT_1`, `FIN_WAIT_2`, `CLOSE_WAIT`, `LAST_ACK` and
+  `TIME_WAIT`;
+- fixed-RTO retransmission of unacknowledged data, including data dropped
+  because the peer's receive buffer was full;
+- non-blocking accept/read/write/shutdown through the virtual fd bridge;
+- `SO_ERROR`, `SO_REUSEADDR`-style option bookkeeping and address queries
+  used by `node:net`.
 
-Not implemented yet:
+Current limits:
 
-- out-of-order reassembly, SACK, window scaling, congestion control;
-- TIME_WAIT reuse rules beyond a fixed expiry;
-- UDP, ICMPv6, fragmentation;
-- a TUN device or raw-socket link (the prototype link is an in-process
-  callback);
-- `node:net` integration and a JS binding.
+- IPv6 TCP only. UDP, ICMPv6, fragmentation and IPv4 are not implemented; they
+  stay on the kernel path.
+- No out-of-order reassembly, SACK, window scaling, congestion control or
+  delayed ACK. The receive window is a fixed 64 KiB ring; peers that exceed it
+  are retransmitted into after the application reads.
+- No cross-process loopback. Two processes need a TUN link (or a future
+  shared-memory/raw link).
+- Path MTU discovery is not implemented; the stack emits 1400-byte segments.
+- TLS over a virtual fd is routed through the bridge, but there is no
+  dedicated regression test yet.
+- `netstack: true` with an IPv4 domain still falls back to the kernel, because
+  virtual fds are IPv6-only.
 
-## Link abstraction
+## Sharded transport relationship
 
-The stack is transport-agnostic. A link is a callback:
-
-```c
-typedef void (*NsLinkSendFn)(NsStack *stack, const uint8_t *pkt, size_t len,
-                             void *opaque);
-```
-
-The prototype test wires two stacks together by calling the peer's
-`ns_input()` from the callback. A production link would write the packet to a
-TUN/TAP fd (Linux) or to a shared-memory ring between processes. The stack
-already emits and accepts complete IPv6 packets, so the link never needs to
-understand TCP.
+The kernel sharded server (`subnet` + `shards`) is still the supported path
+for spreading accepted connections across multiple kernel listeners. Setting
+`shards` or `subnet` forces kernel sockets, even if `netstack: true` is also
+present, because the owned stack does not yet implement per-shard threads or
+connection-address allocation.
 
 ## Testing
 
-Build and run the prototype with `make netstack-test` (or build the
-`netstack_test` target and run `netstack-test` directly). The test covers:
+```sh
+make netstack-test       # C engine: handshake, data, close, retransmit, dispatch
+make netstack-tun-test   # optional TUN path in a private user+network namespace
+make qnode-test          # includes tests/qnode/netstack_socket.js
+```
 
-- address encoding and shard extraction;
-- handshake, address migration, and accept;
-- bidirectional in-order data transfer;
-- close/EOF;
-- retransmission after a dropped packet;
-- round-robin dispatch across shards.
+`tests/qnode/netstack_socket.js` runs the JS integration end to end over
+loopback: explicit and automatic netstack selection, concurrent connections,
+a 200 KiB binary echo (multiple MSS and retransmission rounds), and an IPv4
+kernel fallback case. The WebSocket suite in `tests/qnode/websocket.js` also
+runs over `node:net` and can be pointed at managed addresses for manual
+testing.
+
+`tests/qnode/netstack_tun.sh` starts a TUN-backed stack in `unshare -rn`, adds
+the host side address, and connects to it with a kernel client. It skips (and
+succeeds) when user namespaces, `ip(8)` or `/dev/net/tun` are unavailable.
+
+The C test is `tests/netstack_test.c`; it links the stack directly and needs no
+runtime or privileges.

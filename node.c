@@ -60,6 +60,7 @@
 #include "quickjs.h"
 #include "quickjs-libc.h"
 #include "node.h"
+#include "node_netstack.h"
 #include "qjs-wasm.h"
 
 #ifndef NODE_PATH_MAX
@@ -832,9 +833,14 @@ static JSValue js_node_read(JSContext *ctx, JSValueConst this_val,
     if (!buf)
         return JS_EXCEPTION;
     ssize_t n;
-    do {
-        n = position >= 0 ? pread(fd, buf, len, position) : read(fd, buf, len);
-    } while (n < 0 && errno == EINTR);
+    if (node_netstack_is_vfd(fd)) {
+        n = node_netstack_read(fd, buf, (size_t)len);
+    } else {
+        do {
+            n = position >= 0 ? pread(fd, buf, len, position)
+                              : read(fd, buf, len);
+        } while (n < 0 && errno == EINTR);
+    }
     if (n < 0) {
         int err = errno;
         js_free(ctx, buf);
@@ -853,6 +859,8 @@ static JSValue js_node_poll1(JSContext *ctx, JSValueConst this_val,
     struct pollfd pfd;
     if (JS_ToInt32(ctx, &fd, argv[0]) || JS_ToInt32(ctx, &events, argv[1]))
         return JS_EXCEPTION;
+    if (node_netstack_is_vfd(fd))
+        return JS_NewInt32(ctx, node_netstack_poll(fd, events));
     pfd.fd = fd;
     pfd.events = (short)events;
     pfd.revents = 0;
@@ -874,10 +882,14 @@ static JSValue js_node_write(JSContext *ctx, JSValueConst this_val,
         if (JS_ToInt64(ctx, &position, argv[2]))
             return JS_EXCEPTION;
     ssize_t n;
-    do {
-        n = position >= 0 ? pwrite(fd, b.data, b.len, position)
-                          : write(fd, b.data, b.len);
-    } while (n < 0 && errno == EINTR);
+    if (node_netstack_is_vfd(fd)) {
+        n = node_netstack_write(fd, b.data, b.len);
+    } else {
+        do {
+            n = position >= 0 ? pwrite(fd, b.data, b.len, position)
+                              : write(fd, b.data, b.len);
+        } while (n < 0 && errno == EINTR);
+    }
     int err = n < 0 ? errno : 0;
     node_free_bytes(ctx, &b);
     if (n < 0)
@@ -891,6 +903,8 @@ static JSValue js_node_close(JSContext *ctx, JSValueConst this_val,
     int32_t fd;
     if (JS_ToInt32(ctx, &fd, argv[0]))
         return JS_EXCEPTION;
+    if (node_netstack_is_vfd(fd))
+        return JS_NewInt32(ctx, node_netstack_close(fd) ? errno : 0);
     return JS_NewInt32(ctx, close(fd) ? errno : 0);
 }
 
@@ -1057,6 +1071,8 @@ static JSValue js_node_set_nonblock(JSContext *ctx, JSValueConst this_val,
     int32_t fd;
     if (JS_ToInt32(ctx, &fd, argv[0]))
         return JS_EXCEPTION;
+    if (node_netstack_is_vfd(fd))
+        return JS_NewInt32(ctx, 0);
     int fl = fcntl(fd, F_GETFL);
     if (fl < 0)
         return JS_NewInt32(ctx, errno);
@@ -1068,13 +1084,24 @@ static JSValue js_node_set_nonblock(JSContext *ctx, JSValueConst this_val,
 static JSValue js_node_socket(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv)
 {
-    int32_t domain = AF_INET, type = SOCK_STREAM, proto = 0;
+    int32_t domain = AF_INET, type = SOCK_STREAM, proto = 0, mode = 0;
     if (argc > 0 && !JS_IsUndefined(argv[0]))
         if (JS_ToInt32(ctx, &domain, argv[0])) return JS_EXCEPTION;
     if (argc > 1 && !JS_IsUndefined(argv[1]))
         if (JS_ToInt32(ctx, &type, argv[1])) return JS_EXCEPTION;
     if (argc > 2 && !JS_IsUndefined(argv[2]))
         if (JS_ToInt32(ctx, &proto, argv[2])) return JS_EXCEPTION;
+    if (argc > 3 && !JS_IsUndefined(argv[3]))
+        if (JS_ToInt32(ctx, &mode, argv[3])) return JS_EXCEPTION;
+
+    /* The owned TCP stack owns managed IPv6 streams. Everything else, and
+       every failure to initialise the stack, falls through to the kernel. */
+    if (proto == 0) {
+        int vfd = node_netstack_socket(domain, type, mode);
+        if (vfd >= 0)
+            return node_ok(ctx, JS_NewInt32(ctx, vfd));
+    }
+
     int fd = socket(domain, type | SOCK_CLOEXEC, proto);
     if (fd < 0)
         return node_err(ctx, JS_NULL, errno);
@@ -1116,8 +1143,12 @@ static JSValue js_node_bind(JSContext *ctx, JSValueConst this_val,
     struct sockaddr_storage ss;
     socklen_t len;
     int err = node_sockaddr(ctx, host, port, &ss, &len, true);
-    if (!err && bind(fd, (struct sockaddr *)&ss, len))
-        err = errno;
+    if (!err) {
+        if (node_netstack_is_vfd(fd))
+            err = node_netstack_bind(fd, (struct sockaddr *)&ss, len) ? errno : 0;
+        else if (bind(fd, (struct sockaddr *)&ss, len))
+            err = errno;
+    }
     if (host) JS_FreeCString(ctx, host);
     return JS_NewInt32(ctx, err);
 }
@@ -1130,6 +1161,8 @@ static JSValue js_node_listen(JSContext *ctx, JSValueConst this_val,
         return JS_EXCEPTION;
     if (argc > 1 && !JS_IsUndefined(argv[1]))
         if (JS_ToInt32(ctx, &backlog, argv[1])) return JS_EXCEPTION;
+    if (node_netstack_is_vfd(fd))
+        return JS_NewInt32(ctx, node_netstack_listen(fd, backlog) ? errno : 0);
     return JS_NewInt32(ctx, listen(fd, backlog) ? errno : 0);
 }
 
@@ -1142,6 +1175,12 @@ static JSValue js_node_accept(JSContext *ctx, JSValueConst this_val,
     struct sockaddr_storage ss;
     socklen_t len = sizeof(ss);
     int nfd;
+    if (node_netstack_is_vfd(fd)) {
+        nfd = node_netstack_accept(fd, (struct sockaddr *)&ss, &len);
+        if (nfd < 0)
+            return node_err(ctx, JS_NULL, errno);
+        return node_ok(ctx, JS_NewInt32(ctx, nfd));
+    }
     do {
         nfd = accept(fd, (struct sockaddr *)&ss, &len);
     } while (nfd < 0 && errno == EINTR);
@@ -1167,8 +1206,12 @@ static JSValue js_node_connect(JSContext *ctx, JSValueConst this_val,
     struct sockaddr_storage ss;
     socklen_t len;
     int err = node_sockaddr(ctx, host, port, &ss, &len, false);
-    if (!err && connect(fd, (struct sockaddr *)&ss, len))
-        err = errno;
+    if (!err) {
+        if (node_netstack_is_vfd(fd))
+            err = node_netstack_connect(fd, (struct sockaddr *)&ss, len);
+        else if (connect(fd, (struct sockaddr *)&ss, len))
+            err = errno;
+    }
     JS_FreeCString(ctx, host);
     return JS_NewInt32(ctx, err);
 }
@@ -1182,6 +1225,9 @@ static JSValue js_node_setsockopt(JSContext *ctx, JSValueConst this_val,
         return JS_EXCEPTION;
     if (argc > 3 && !JS_IsUndefined(argv[3]))
         if (JS_ToInt32(ctx, &val, argv[3])) return JS_EXCEPTION;
+    if (node_netstack_is_vfd(fd))
+        return JS_NewInt32(ctx, node_netstack_setsockopt(fd, level, opt, &val,
+                                                         sizeof(val)) ? errno : 0);
     return JS_NewInt32(ctx, setsockopt(fd, level, opt, &val, sizeof(val)) ? errno : 0);
 }
 
@@ -1193,6 +1239,11 @@ static JSValue js_node_getsockopt(JSContext *ctx, JSValueConst this_val,
     if (JS_ToInt32(ctx, &fd, argv[0]) || JS_ToInt32(ctx, &level, argv[1]) ||
         JS_ToInt32(ctx, &opt, argv[2]))
         return JS_EXCEPTION;
+    if (node_netstack_is_vfd(fd)) {
+        if (node_netstack_getsockopt(fd, level, opt, &val, &len))
+            return node_err(ctx, JS_NULL, errno);
+        return node_ok(ctx, JS_NewInt32(ctx, val));
+    }
     if (getsockopt(fd, level, opt, &val, &len))
         return node_err(ctx, JS_NULL, errno);
     return node_ok(ctx, JS_NewInt32(ctx, val));
@@ -1369,6 +1420,11 @@ static JSValue js_node_getsockname(JSContext *ctx, JSValueConst this_val,
         return JS_EXCEPTION;
     struct sockaddr_storage ss;
     socklen_t len = sizeof(ss);
+    if (node_netstack_is_vfd(fd)) {
+        if (node_netstack_getsockname(fd, (struct sockaddr *)&ss, &len))
+            return node_err(ctx, JS_NULL, errno);
+        return node_ok(ctx, node_addr_obj(ctx, &ss, len));
+    }
     if (getsockname(fd, (struct sockaddr *)&ss, &len))
         return node_err(ctx, JS_NULL, errno);
     return node_ok(ctx, node_addr_obj(ctx, &ss, len));
@@ -1382,6 +1438,11 @@ static JSValue js_node_getpeername(JSContext *ctx, JSValueConst this_val,
         return JS_EXCEPTION;
     struct sockaddr_storage ss;
     socklen_t len = sizeof(ss);
+    if (node_netstack_is_vfd(fd)) {
+        if (node_netstack_getpeername(fd, (struct sockaddr *)&ss, &len))
+            return node_err(ctx, JS_NULL, errno);
+        return node_ok(ctx, node_addr_obj(ctx, &ss, len));
+    }
     if (getpeername(fd, (struct sockaddr *)&ss, &len))
         return node_err(ctx, JS_NULL, errno);
     return node_ok(ctx, node_addr_obj(ctx, &ss, len));
@@ -1395,7 +1456,49 @@ static JSValue js_node_shutdown(JSContext *ctx, JSValueConst this_val,
         return JS_EXCEPTION;
     if (argc > 1 && !JS_IsUndefined(argv[1]))
         if (JS_ToInt32(ctx, &how, argv[1])) return JS_EXCEPTION;
+    if (node_netstack_is_vfd(fd))
+        return JS_NewInt32(ctx, node_netstack_shutdown(fd, how) ? errno : 0);
     return JS_NewInt32(ctx, shutdown(fd, how) ? errno : 0);
+}
+
+static JSValue js_node_netstack_info(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv)
+{
+    char addr[64];
+    const char *link = NULL;
+    int ok = node_netstack_info(addr, sizeof(addr), &link);
+    JSValue arr = JS_NewArray(ctx);
+    JS_SetPropertyUint32(ctx, arr, 0, JS_NewInt32(ctx, ok == 0 ? 1 : 0));
+    JS_SetPropertyUint32(ctx, arr, 1, JS_NewString(ctx, addr));
+    JS_SetPropertyUint32(ctx, arr, 2, JS_NewString(ctx, link ? link : ""));
+    JS_SetPropertyUint32(ctx, arr, 3,
+                         JS_NewInt32(ctx, node_netstack_link_fd()));
+    (void)this_val; (void)argc; (void)argv;
+    return arr;
+}
+
+static JSValue js_node_netstack_pump(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv)
+{
+    (void)this_val; (void)argc; (void)argv;
+    return JS_NewInt32(ctx, node_netstack_pump());
+}
+
+static JSValue js_node_netstack_tick(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv)
+{
+    (void)this_val; (void)argc; (void)argv;
+    return JS_NewInt32(ctx, node_netstack_tick());
+}
+
+static JSValue js_node_is_virtual_fd(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv)
+{
+    int32_t fd;
+    if (JS_ToInt32(ctx, &fd, argv[0]))
+        return JS_EXCEPTION;
+    (void)this_val; (void)argc;
+    return JS_NewBool(ctx, node_netstack_is_vfd(fd));
 }
 
 static JSValue js_node_dns(JSContext *ctx, JSValueConst this_val,
@@ -2182,6 +2285,15 @@ static int node_tls_bio_send(void *ctx, const unsigned char *buf, size_t len)
 {
     int fd = (int)(intptr_t)ctx;
     ssize_t n;
+    if (node_netstack_is_vfd(fd)) {
+        n = node_netstack_write(fd, buf, len);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                return MBEDTLS_ERR_SSL_WANT_WRITE;
+            return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+        }
+        return (int)n;
+    }
     do {
         n = send(fd, buf, len, MSG_NOSIGNAL);
     } while (n < 0 && errno == EINTR);
@@ -2197,6 +2309,15 @@ static int node_tls_bio_recv(void *ctx, unsigned char *buf, size_t len)
 {
     int fd = (int)(intptr_t)ctx;
     ssize_t n;
+    if (node_netstack_is_vfd(fd)) {
+        n = node_netstack_read(fd, buf, len);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                return MBEDTLS_ERR_SSL_WANT_READ;
+            return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+        }
+        return (int)n;
+    }
     do {
         n = recv(fd, buf, len, 0);
     } while (n < 0 && errno == EINTR);
@@ -4509,6 +4630,10 @@ static const JSCFunctionListEntry js_node_funcs[] = {
     JS_CFUNC_DEF("shardAddress", 2, js_node_shard_address),
     JS_CFUNC_DEF("shardIndex", 1, js_node_shard_index),
     JS_CFUNC_DEF("shutdown", 2, js_node_shutdown),
+    JS_CFUNC_DEF("isVirtualFd", 1, js_node_is_virtual_fd),
+    JS_CFUNC_DEF("netstackInfo", 0, js_node_netstack_info),
+    JS_CFUNC_DEF("netstackPump", 0, js_node_netstack_pump),
+    JS_CFUNC_DEF("netstackTick", 0, js_node_netstack_tick),
     JS_CFUNC_DEF("dns", 1, js_node_dns),
 
     JS_CFUNC_DEF("spawn", 6, js_node_spawn),

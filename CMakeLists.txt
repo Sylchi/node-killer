@@ -399,7 +399,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         _GNU_SOURCE=1)
     target_link_libraries(qnode_sodium PUBLIC Threads::Threads)
 
-    add_library(qnode_core STATIC node.c)
+    add_library(qnode_core STATIC node.c netstack.c netstack_link.c
+        node_netstack.c)
     target_compile_definitions(qnode_core PRIVATE ${qjs_defines})
     target_include_directories(qnode_core PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
     target_link_libraries(qnode_core PRIVATE qjs qjs-libc

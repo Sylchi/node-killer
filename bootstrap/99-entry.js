@@ -208,6 +208,7 @@ globalScope.AbortSignal = AbortSignal;
 globalScope.Event = Event;
 globalScope.EventTarget = EventTarget;
 globalScope.MessageEvent = MessageEvent;
+globalScope.WebSocket = WebSocket;
 globalScope.MessageChannel = MessageChannel;
 globalScope.MessagePort = MessagePort;
 globalScope.BroadcastChannel = BroadcastChannel;
@@ -239,6 +240,29 @@ globalScope.navigator = {
   language: "en-US",
 };
 globalScope.self = globalScope;
+
+/* ------------------------------------------------------------------ */
+/* owned TCP stack                                                    */
+/* ------------------------------------------------------------------ */
+
+/* The owned stack needs a heartbeat for retransmission timers and TUN input.
+   It is unref'd, so it only runs while sockets or other work keep the loop
+   alive; a bare `qnode -e` still exits. */
+if (typeof native !== "undefined" && typeof native.netstackInfo === "function") {
+  try {
+    const info = native.netstackInfo();
+    if (info[0]) {
+      const tun = info[3];
+      if (tun >= 0 && typeof qjsos !== "undefined") {
+        qjsos.setReadHandler(tun, () => native.netstackPump());
+        qjsos.setHandlerRef(tun, false);
+      }
+      setInterval(() => native.netstackTick(), 20).unref();
+    }
+  } catch (e) {
+    /* The kernel socket path remains available. */
+  }
+}
 
 /* ------------------------------------------------------------------ */
 /* C-facing module loader API                                         */

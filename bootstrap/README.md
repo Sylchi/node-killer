@@ -22,10 +22,11 @@ The parts are **not** ES modules. They share one top-level scope, so:
 | `20-fs-process.js` | `fs`, `process`/`os`, timers, `console` |
 | `30-web.js` | `AbortController`/`EventTarget`, `URL`, `querystring` |
 | `40-modules.js` | `node_modules` resolution, CommonJS loader |
-| `50-net-http.js` | `net`, `http`, `child_process` |
+| `50-net-http.js` | `net` (including owned-stack selection), `http`, `child_process` |
 | `60-crypto.js` | hashes, HMACs, key objects, signatures, KDFs |
 | `70-misc.js` | `assert`, `string_decoder`, small core modules, `readline` |
 | `80-tls.js` | `tls` |
+| `85-websocket.js` | `WebSocket` client and `WebSocketServer` (`node:websocket`) |
 | `90-web-streams.js` | WHATWG streams, `MessageChannel`, builtin registry |
 | `95-fetch.js` | `fetch`, `Request`/`Response`, web body types |
 | `97-npm.js` | npm installer |

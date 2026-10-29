@@ -61,6 +61,33 @@ typedef void (*NsLinkSendFn)(NsStack *stack, const uint8_t *pkt, size_t len,
 NsStack *ns_stack_new(const uint8_t prefix[NS_PREFIX_LEN], int nshards,
                       NsLinkSendFn send, void *opaque);
 void ns_stack_free(NsStack *s);
+void ns_stack_set_send(NsStack *s, NsLinkSendFn send, void *opaque);
+
+/* Plain (non-sharded) mode.
+ *
+ * The shard model allocates a fresh IPv6 address for every accepted
+ * connection and chooses a shard from byte 8 of the destination address.
+ * That is great for a single process that owns a whole /64, but it cannot
+ * interoperate with an ordinary peer: a peer that connects to the address
+ * it was told about expects the SYN-ACK, and later the data, to come back
+ * from that same address.
+ *
+ * Plain mode keeps one stable local address for the whole stack and
+ * dispatches every packet to shard 0. Listeners are bound to an explicit
+ * address and port. This is the mode used by the node:net integration and
+ * by the TUN link. */
+int ns_stack_set_plain(NsStack *s, const NsAddr *local);
+int ns_stack_is_plain(const NsStack *s);
+const NsAddr *ns_stack_local(const NsStack *s);
+
+/* Bind a listener to an explicit address. ns_listen() keeps its original
+   service-address behaviour for the sharded model. Passing a NULL address
+   is equivalent to ns_listen(). */
+int ns_listen_addr(NsStack *s, const NsAddr *local, uint16_t port);
+int ns_listen_port(NsStack *s, uint16_t port, uint16_t *out_port);
+int ns_listen_port_ex(NsStack *s, const NsAddr *local, uint16_t port,
+                      uint16_t *out_port);
+int ns_unlisten(NsStack *s, uint16_t port);
 
 void ns_addr_service(const NsStack *s, int shard, NsAddr *out);
 int ns_addr_shard(const NsAddr *a);
@@ -73,6 +100,11 @@ int ns_listener_addr(const NsStack *s, uint16_t port, int shard, NsAddr *out);
 uint64_t ns_connect(NsStack *s, int local_shard, const NsAddr *service,
                     uint16_t port, uint16_t local_port);
 
+/* Connect from an explicit local address/port. Required in plain mode.
+   Pass local_port 0 to pick an ephemeral port. */
+uint64_t ns_connect_from(NsStack *s, const NsAddr *local, uint16_t local_port,
+                         const NsAddr *remote, uint16_t remote_port);
+
 void ns_input(NsStack *s, const uint8_t *pkt, size_t len);
 int ns_run(NsStack *s, int budget);
 void ns_tick(NsStack *s, uint64_t now_ms);
@@ -81,6 +113,16 @@ int ns_send(NsStack *s, uint64_t id, const void *buf, size_t len);
 int ns_recv(NsStack *s, uint64_t id, void *buf, size_t len);
 int ns_close(NsStack *s, uint64_t id);
 int ns_accept(NsStack *s, uint64_t *id_out);
+
+/* Accept the next connection queued on a specific listener port. */
+int ns_accept_port(NsStack *s, uint16_t port, uint64_t *id_out);
+
+/* Readiness helpers for the event-loop integration. */
+int ns_accept_ready(NsStack *s);
+int ns_accept_ready_port(NsStack *s, uint16_t port);
+int ns_conn_readable(NsStack *s, uint64_t id);
+int ns_conn_writable(NsStack *s, uint64_t id);
+int ns_conn_established(NsStack *s, uint64_t id);
 
 int ns_conn_state(NsStack *s, uint64_t id);
 int ns_conn_peer_closed(NsStack *s, uint64_t id);
