@@ -1279,6 +1279,31 @@ static int node_sockaddr_type(JSContext *ctx, const char *host, int port,
     hints.ai_socktype = socktype;
     hints.ai_flags = passive ? AI_PASSIVE : 0;
     snprintf(portbuf, sizeof(portbuf), "%d", port);
+#ifdef QNODE_FREESTANDING
+    /* try literal parsing first for IPv4/IPv6 */
+    if (host && host[0]) {
+        struct in_addr a4;
+        if (inet_pton(AF_INET, host, &a4) == 1) {
+            struct sockaddr_in *s4 = (struct sockaddr_in *)ss;
+            memset(s4, 0, sizeof(*s4));
+            s4->sin_family = AF_INET;
+            s4->sin_port = htons((uint16_t)port);
+            s4->sin_addr = a4;
+            *plen = sizeof(*s4);
+            return 0;
+        }
+        struct in6_addr a6;
+        if (inet_pton(AF_INET6, host, &a6) == 1) {
+            struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)ss;
+            memset(s6, 0, sizeof(*s6));
+            s6->sin6_family = AF_INET6;
+            s6->sin6_port = htons((uint16_t)port);
+            s6->sin6_addr = a6;
+            *plen = sizeof(*s6);
+            return 0;
+        }
+    }
+#endif
     int r = getaddrinfo((host && host[0]) ? host : NULL, portbuf, &hints, &res);
     if (r != 0)
         return EADDRNOTAVAIL;
