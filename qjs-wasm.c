@@ -316,6 +316,26 @@ static void js_wasm_table_finalizer(JSRuntime *rt, JSValueConst val);
 static void js_wasm_table_mark(JSRuntime *rt, JSValueConst val,
                                JS_MarkFunc *mark_func);
 
+/* Drop the class registration belonging to a runtime that is being
+   destroyed. Without this the entry would point into freed runtime memory
+   and confuse the next runtime that happens to reuse the same address. */
+static void js_wasm_classes_finalize(JSRuntime *rt, void *opaque)
+{
+    QJSWasmClasses *c = opaque;
+    QJSWasmClasses **p;
+
+    while (atomic_flag_test_and_set(&qjs_wasm_classes_lock))
+        ;
+    for (p = &qjs_wasm_classes; *p; p = &(*p)->next) {
+        if (*p == c) {
+            *p = c->next;
+            break;
+        }
+    }
+    atomic_flag_clear(&qjs_wasm_classes_lock);
+    js_free_rt(rt, c);
+}
+
 static QJSWasmClasses *js_wasm_classes(JSRuntime *rt)
 {
     QJSWasmClasses *c;
@@ -324,10 +344,11 @@ static QJSWasmClasses *js_wasm_classes(JSRuntime *rt)
         ;
     for (c = qjs_wasm_classes; c; c = c->next) {
         if (c->rt == rt) {
-            /* A runtime can be freed and a new one allocated at the same
-               address.  Re-register the ids when that happened. */
+            /* The entry is removed from the list when its runtime is freed,
+               so it must still describe a live runtime here. */
             if (JS_IsRegisteredClass(rt, c->module))
                 break;
+            /* Defensive: re-register if the ids were cleared. */
             c->module = 0;
             c->instance = 0;
             c->memory = 0;
@@ -346,6 +367,14 @@ static QJSWasmClasses *js_wasm_classes(JSRuntime *rt)
         c->rt = rt;
         c->next = qjs_wasm_classes;
         qjs_wasm_classes = c;
+        /* Register while holding the lock so no other thread observes the
+           entry before its class ids are initialized. */
+        if (JS_AddRuntimeFinalizer(rt, js_wasm_classes_finalize, c) < 0) {
+            qjs_wasm_classes = c->next;
+            atomic_flag_clear(&qjs_wasm_classes_lock);
+            js_free_rt(rt, c);
+            return NULL;
+        }
     }
 register_classes:
     {
