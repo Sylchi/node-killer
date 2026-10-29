@@ -1733,6 +1733,183 @@ static JSValue js_node_zlib_decompress(JSContext *ctx, JSValueConst this_val,
     return val;
 }
 
+/* Streaming inflate. Fetch needs to decompress gzip/deflate responses while
+   the body is still arriving, so keep a small pool of live z_streams indexed
+   by an integer handle rather than allocating one per JS object. */
+
+#define NODE_MAX_INFLATE_STREAMS 128
+
+/* Worker threads share the process address space but each runtime has its
+   own JSContext-backed z_streams, so keep one pool per OS thread. */
+#if defined(__GNUC__) || defined(__clang__)
+#define NODE_INFLATE_TLS __thread
+#else
+#define NODE_INFLATE_TLS _Thread_local
+#endif
+
+typedef struct {
+    z_stream zs;
+    int used;
+    int done;
+} NodeInflateStream;
+
+static NODE_INFLATE_TLS NodeInflateStream node_inflate_streams[NODE_MAX_INFLATE_STREAMS];
+
+static JSValue node_empty_bytes(JSContext *ctx)
+{
+    return JS_NewUint8ArrayCopy(ctx, (const uint8_t *)"", 0);
+}
+
+static NodeInflateStream *node_inflate_get(JSContext *ctx, int32_t id)
+{
+    if (id < 0 || id >= NODE_MAX_INFLATE_STREAMS ||
+        !node_inflate_streams[id].used) {
+        JS_ThrowRangeError(ctx, "zlib: invalid inflate stream");
+        return NULL;
+    }
+    return &node_inflate_streams[id];
+}
+
+/* Run inflate over `in`, appending all output into a single Uint8Array. */
+static JSValue node_inflate_run(JSContext *ctx, NodeInflateStream *s,
+                                const uint8_t *in, size_t in_len, int flush)
+{
+    uint8_t scratch[16384];
+    uint8_t *out = NULL;
+    size_t cap = 0, len = 0;
+    int r;
+
+    s->zs.next_in = (Bytef *)in;
+    s->zs.avail_in = (uInt)in_len;
+    for (;;) {
+        uInt before = s->zs.avail_in;
+        size_t produced;
+
+        s->zs.next_out = scratch;
+        s->zs.avail_out = sizeof(scratch);
+        r = inflate(&s->zs, flush);
+        produced = sizeof(scratch) - s->zs.avail_out;
+        if (produced) {
+            if (len + produced > cap) {
+                size_t ncap = cap ? cap : sizeof(scratch);
+                uint8_t *nb;
+                while (ncap < len + produced)
+                    ncap *= 2;
+                nb = js_realloc(ctx, out, ncap);
+                if (!nb) {
+                    js_free(ctx, out);
+                    return JS_EXCEPTION;
+                }
+                out = nb;
+                cap = ncap;
+            }
+            memcpy(out + len, scratch, produced);
+            len += produced;
+        }
+        if (r == Z_STREAM_END) {
+            s->done = 1;
+            break;
+        }
+        if (r != Z_OK && r != Z_BUF_ERROR) {
+            js_free(ctx, out);
+            return JS_ThrowPlainError(ctx, "zlib: inflate failed (%d)", r);
+        }
+        if (produced == 0 && s->zs.avail_in == before)
+            break;
+        if (flush == Z_FINISH && produced == 0)
+            break;
+    }
+
+    JSValue val = JS_NewUint8ArrayCopy(ctx, out ? out : (uint8_t *)"", len);
+    js_free(ctx, out);
+    return val;
+}
+
+/* zlibInflateStart(windowBits) -> id */
+static JSValue js_node_zlib_inflate_start(JSContext *ctx, JSValueConst this_val,
+                                          int argc, JSValueConst *argv)
+{
+    int32_t windowBits = 15;
+    int i, r;
+
+    if (argc > 0 && !JS_IsUndefined(argv[0]) &&
+        JS_ToInt32(ctx, &windowBits, argv[0]))
+        return JS_EXCEPTION;
+
+    for (i = 0; i < NODE_MAX_INFLATE_STREAMS; i++) {
+        if (!node_inflate_streams[i].used)
+            break;
+    }
+    if (i == NODE_MAX_INFLATE_STREAMS)
+        return JS_ThrowPlainError(ctx, "zlib: too many inflate streams");
+
+    memset(&node_inflate_streams[i], 0, sizeof(node_inflate_streams[i]));
+    node_inflate_streams[i].used = 1;
+    r = inflateInit2(&node_inflate_streams[i].zs, windowBits);
+    if (r != Z_OK) {
+        node_inflate_streams[i].used = 0;
+        return JS_ThrowPlainError(ctx, "zlib: inflateInit2 failed (%d)", r);
+    }
+    return JS_NewInt32(ctx, i);
+}
+
+/* zlibInflateWrite(id, data) -> Uint8Array */
+static JSValue js_node_zlib_inflate_write(JSContext *ctx, JSValueConst this_val,
+                                          int argc, JSValueConst *argv)
+{
+    NodeBytes in;
+    NodeInflateStream *s;
+    int32_t id;
+    JSValue ret;
+
+    if (JS_ToInt32(ctx, &id, argv[0]))
+        return JS_EXCEPTION;
+    if (node_get_bytes(ctx, argv[1], &in))
+        return JS_EXCEPTION;
+    s = node_inflate_get(ctx, id);
+    if (!s) {
+        node_free_bytes(ctx, &in);
+        return JS_EXCEPTION;
+    }
+    if (s->done) {
+        node_free_bytes(ctx, &in);
+        return node_empty_bytes(ctx);
+    }
+    ret = node_inflate_run(ctx, s, in.data, in.len, Z_NO_FLUSH);
+    node_free_bytes(ctx, &in);
+    return ret;
+}
+
+/* zlibInflateEnd(id) -> trailing Uint8Array */
+static JSValue js_node_zlib_inflate_end(JSContext *ctx, JSValueConst this_val,
+                                        int argc, JSValueConst *argv)
+{
+    NodeInflateStream *s;
+    int32_t id;
+    int was_done, ok;
+    JSValue ret;
+
+    if (JS_ToInt32(ctx, &id, argv[0]))
+        return JS_EXCEPTION;
+    s = node_inflate_get(ctx, id);
+    if (!s)
+        return JS_EXCEPTION;
+
+    was_done = s->done;
+    ret = was_done ? node_empty_bytes(ctx)
+                   : node_inflate_run(ctx, s, NULL, 0, Z_FINISH);
+    ok = s->done;
+    inflateEnd(&s->zs);
+    s->used = 0;
+    s->done = 0;
+
+    if (!JS_IsException(ret) && !ok && !was_done) {
+        JS_FreeValue(ctx, ret);
+        return JS_ThrowPlainError(ctx, "zlib: unexpected end of file");
+    }
+    return ret;
+}
+
 static JSValue js_node_crc32(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv)
 {
@@ -2762,6 +2939,9 @@ static const JSCFunctionListEntry js_node_funcs[] = {
     JS_CFUNC_DEF("requireEsm", 1, js_node_require_esm),
     JS_CFUNC_DEF("zlibCompress", 5, js_node_zlib_compress),
     JS_CFUNC_DEF("zlibDecompress", 2, js_node_zlib_decompress),
+    JS_CFUNC_DEF("zlibInflateStart", 1, js_node_zlib_inflate_start),
+    JS_CFUNC_DEF("zlibInflateWrite", 2, js_node_zlib_inflate_write),
+    JS_CFUNC_DEF("zlibInflateEnd", 1, js_node_zlib_inflate_end),
     JS_CFUNC_DEF("crc32", 2, js_node_crc32),
     JS_CFUNC_DEF("tlsClientInit", 5, js_node_tls_client_init),
     JS_CFUNC_DEF("tlsServerContext", 3, js_node_tls_server_context),

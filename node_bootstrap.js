@@ -3199,15 +3199,15 @@ class AbortSignal extends EventTarget {
     const s = new AbortSignal();
     s.aborted = true;
     s.reason = reason === undefined
-      ? new Error("This operation was aborted") : reason;
+      ? new DOMException("This operation was aborted", "AbortError") : reason;
     return s;
   }
   static timeout(ms) {
     const s = new AbortSignal();
     const t = setTimeout(() => {
       s.aborted = true;
-      s.reason = new Error("The operation was aborted due to timeout");
-      s.reason.name = "TimeoutError";
+      s.reason = new DOMException(
+        "The operation was aborted due to timeout", "TimeoutError");
       s.dispatchEvent(new Event("abort"));
     }, ms);
     if (t.unref) t.unref();
@@ -3238,8 +3238,9 @@ class AbortController {
       return;
     this.signal.aborted = true;
     this.signal.reason = reason === undefined
-      ? new Error("The operation was aborted") : reason;
-    this.signal.reason.name = this.signal.reason.name || "AbortError";
+      ? new DOMException("This operation was aborted", "AbortError") : reason;
+    if (this.signal.reason.name === undefined)
+      this.signal.reason.name = "AbortError";
     this.signal.dispatchEvent(new Event("abort"));
   }
 }
@@ -5197,8 +5198,12 @@ class HttpServer extends EventEmitter {
         if (current && chunked) {
           /* decode chunked transfer-encoding */
           const decoded = decodeChunked(buf);
-          if (decoded === null)
+          if (!decoded.done) {
+            if (decoded.body.length)
+              bodyChunks.push(decoded.body);
+            buf = decoded.rest;
             return;
+          }
           buf = decoded.rest;
           bodyChunks.push(decoded.body);
           chunked = false;
@@ -5242,26 +5247,30 @@ class HttpServer extends EventEmitter {
 function decodeChunked(buf) {
   const chunks = [];
   let pos = 0;
+  let done = false;
   for (;;) {
     const lineEnd = bufferIndexOf(buf, Buffer.from("\r\n"), pos);
     if (lineEnd < 0)
-      return null;
+      break;
     const sizeLine = utf8Decode(buf, pos, lineEnd).split(";")[0].trim();
     const size = parseInt(sizeLine, 16);
     if (isNaN(size))
-      return null;
-    pos = lineEnd + 2;
+      break;
     if (size === 0) {
-      const end = bufferIndexOf(buf, Buffer.from("\r\n"), pos);
+      const end = bufferIndexOf(buf, Buffer.from("\r\n"), pos + 2);
       if (end < 0)
-        return null;
-      return { body: Buffer.concat(chunks), rest: buf.subarray(end + 2) };
+        break;
+      pos = end + 2;
+      done = true;
+      break;
     }
-    if (buf.length < pos + size + 2)
-      return null;
-    chunks.push(Buffer.from(buf.subarray(pos, pos + size)));
-    pos += size + 2;
+    const bodyStart = lineEnd + 2;
+    if (buf.length < bodyStart + size + 2)
+      break;
+    chunks.push(Buffer.from(buf.subarray(bodyStart, bodyStart + size)));
+    pos = bodyStart + size + 2;
   }
+  return { body: Buffer.concat(chunks), rest: buf.subarray(pos), done };
 }
 
 function tlsOptionId(value) {
@@ -5639,8 +5648,24 @@ class ClientRequest extends Writable {
       this.socket.write(this._pendingBody.shift());
   }
 
+  _isChunked() {
+    const te = this._headers["transfer-encoding"];
+    const text = Array.isArray(te) ? te.join(",") : String(te || "");
+    return text.toLowerCase().indexOf("chunked") >= 0;
+  }
+
+  _frameChunk(b) {
+    if (!this._isChunked() || !b.length)
+      return b;
+    return Buffer.concat([
+      Buffer.from(b.length.toString(16) + "\r\n"),
+      b,
+      Buffer.from("\r\n"),
+    ]);
+  }
+
   _write(chunk, encoding, cb) {
-    const b = toChunk(chunk, encoding);
+    const b = this._frameChunk(toChunk(chunk, encoding));
     if (!this._sent) {
       this._chunks.push(b);
       this._sendHead();
@@ -5660,13 +5685,15 @@ class ClientRequest extends Writable {
     if (typeof chunk === "function") { cb = chunk; chunk = undefined; }
     if (typeof encoding === "function") { cb = encoding; encoding = undefined; }
     if (chunk !== undefined && chunk !== null)
-      this._chunks.push(toChunk(chunk, encoding));
+      this._chunks.push(this._frameChunk(toChunk(chunk, encoding)));
     this._sendHead();
     if (this._chunks.length) {
       for (const part of this._chunks)
         this._pendingBody.push(part);
       this._chunks = [];
     }
+    if (this._isChunked())
+      this._pendingBody.push(Buffer.from("0\r\n\r\n"));
     this._flushBody();
     this.emit("finish");
     if (cb) queueMicrotask(cb);
@@ -5733,12 +5760,11 @@ class ClientRequest extends Writable {
       return;
     if (this._chunked) {
       const d = decodeChunked(this._respBuf);
-      if (d === null)
-        return;
       this._respBuf = d.rest;
       if (d.body.length)
         res.push(d.body);
-      this._finishResponse(this._respBuf.length === 0);
+      if (d.done)
+        this._finishResponse(this._respBuf.length === 0);
       return;
     }
     if (this._remaining >= 0) {
@@ -6679,10 +6705,20 @@ assert.throws = function(fn, error, message) {
     throw new AssertionError({ message: message || "Missing expected exception",
                                actual: String(thrown), expected: String(error),
                                operator: "throws" });
-  if (typeof error === "function" && !(thrown instanceof error))
-    throw new AssertionError({ message: message || "Missing expected exception",
-                               actual: thrown, expected: error,
-                               operator: "throws" });
+  if (typeof error === "function") {
+    let ok = false;
+    const isErrorClass = error === Error ||
+      (error.prototype !== undefined && error.prototype instanceof Error);
+    if (isErrorClass) {
+      ok = thrown instanceof error;
+    } else {
+      try { ok = !!error(thrown); } catch (e) { ok = false; }
+    }
+    if (!ok)
+      throw new AssertionError({ message: message || "Missing expected exception",
+                                 actual: thrown, expected: error,
+                                 operator: "throws" });
+  }
   return thrown;
 };
 assert.doesNotThrow = function(fn, error, message) {
@@ -6708,10 +6744,20 @@ assert.rejects = async function(fn, error, message) {
       throw new AssertionError({ message: "Rejection did not match",
                                  actual: String(e), expected: String(error),
                                  operator: "rejects" });
-    if (typeof error === "function" && !(e instanceof error))
-      throw new AssertionError({ message: "Rejection did not match",
-                                 actual: e, expected: error,
-                                 operator: "rejects" });
+    if (typeof error === "function") {
+      let ok = false;
+      const isErrorClass = error === Error ||
+        (error.prototype !== undefined && error.prototype instanceof Error);
+      if (isErrorClass) {
+        ok = e instanceof error;
+      } else {
+        try { ok = !!error(e); } catch (e2) { ok = false; }
+      }
+      if (!ok)
+        throw new AssertionError({ message: "Rejection did not match",
+                                   actual: e, expected: error,
+                                   operator: "rejects" });
+    }
     return e;
   }
   throw new AssertionError({ message: message || "Missing expected rejection",
@@ -8254,6 +8300,7 @@ class ReadableStream {
     this._reader = null;
     this._pulling = false;
     this._started = false;
+    this._disturbed = false;
     this._hwm = qnodeHighWaterMark(strategy, source.type === "bytes" ? 0 : 1);
     this._sizeFn = typeof strategy.size === "function" ? strategy.size : null;
     this._controller = new ReadableStreamDefaultController(this);
@@ -8347,6 +8394,7 @@ class ReadableStream {
     }
   }
   _read() {
+    this._disturbed = true;
     if (this._state === "errored")
       return Promise.reject(this._errorValue);
     if (this._queue.length) {
@@ -8396,6 +8444,7 @@ class ReadableStream {
     return this._cancel(reason);
   }
   _cancel(reason) {
+    this._disturbed = true;
     if (this._state === "closed" || this._state === "errored")
       return Promise.resolve();
     this._state = "closed";
@@ -9115,6 +9164,13 @@ function registerBuiltins() {
     TextEncoderStream,
     TextDecoderStream,
   };
+  /* streamConsumers is declared after this function runs, so expose it via a
+     getter; requiring it happens long after bootstrap initialization. */
+  Object.defineProperty(builtins, "stream/consumers", {
+    enumerable: true,
+    configurable: true,
+    get() { return streamConsumers; },
+  });
   builtins.string_decoder = { StringDecoder };
   builtins.sys = util;
   builtins.timers = { setTimeout, clearTimeout, setInterval, clearInterval,
@@ -9224,8 +9280,440 @@ function structuredClone(value) {
 }
 
 /* ------------------------------------------------------------------ */
-/* fetch (http only, buffered)                                        */
+/* fetch, Request/Response and web body types                         */
 /* ------------------------------------------------------------------ */
+
+const DOM_EXCEPTION_CODES = {
+  IndexSizeError: 1, HierarchyRequestError: 3, WrongDocumentError: 4,
+  InvalidCharacterError: 5, NoModificationAllowedError: 7,
+  NotFoundError: 8, NotSupportedError: 9, InUseAttributeError: 10,
+  InvalidStateError: 11, SyntaxError: 12, InvalidModificationError: 13,
+  NamespaceError: 14, InvalidAccessError: 15, TypeMismatchError: 17,
+  SecurityError: 18, NetworkError: 19, AbortError: 20, URLMismatchError: 21,
+  QuotaExceededError: 22, TimeoutError: 23, InvalidNodeTypeError: 24,
+  DataCloneError: 25,
+};
+
+class DOMException extends Error {
+  constructor(message, name) {
+    super(message === undefined ? "" : String(message));
+    this.name = name === undefined ? "Error" : String(name);
+  }
+  get code() { return DOM_EXCEPTION_CODES[this.name] || 0; }
+}
+for (const name of Object.keys(DOM_EXCEPTION_CODES)) {
+  const constName = name.replace(/Error$/, "")
+    .replace(/([a-z])([A-Z])/g, "$1_$2").toUpperCase() + "_ERR";
+  DOMException[constName] = DOM_EXCEPTION_CODES[name];
+}
+DOMException.prototype[Symbol.toStringTag] = "DOMException";
+
+function normalizeBlobType(type) {
+  if (type === undefined || type === null)
+    return "";
+  const s = String(type);
+  if (!s || !/^[\x20-\x7e]*$/.test(s))
+    return "";
+  return s.toLowerCase();
+}
+
+function blobPartBytes(part, endings) {
+  if (part instanceof Blob)
+    return part._parts;
+  if (typeof part === "string") {
+    let s = String(part);
+    if (endings === "native")
+      s = s.replace(/\r\n|\r|\n/g, "\r\n");
+    return [Buffer.from(s, "utf8")];
+  }
+  if (part instanceof ArrayBuffer)
+    return [Buffer.from(new Uint8Array(part))];
+  if (ArrayBuffer.isView(part))
+    return [Buffer.from(part.buffer, part.byteOffset, part.byteLength)];
+  return [Buffer.from(String(part), "utf8")];
+}
+
+function clampBlobIndex(value, size, fallback) {
+  if (value === undefined)
+    return fallback;
+  let n = Number(value);
+  if (Number.isNaN(n))
+    n = 0;
+  n = Math.trunc(n);
+  if (n < 0)
+    n = Math.max(size + n, 0);
+  return Math.min(n, size);
+}
+
+class Blob {
+  constructor(parts, options) {
+    parts = parts === undefined ? [] : parts;
+    options = options || {};
+    if (typeof parts === "string" || !parts || typeof parts[Symbol.iterator] !== "function")
+      throw new TypeError("Blob parts must be an iterable");
+    this._parts = [];
+    for (const part of parts)
+      for (const bytes of blobPartBytes(part, options.endings))
+        this._parts.push(bytes);
+    this.type = normalizeBlobType(options.type);
+    this._size = 0;
+    for (const p of this._parts)
+      this._size += p.length;
+    this._buffer = null;
+  }
+  get size() { return this._size; }
+  _bytes() {
+    if (!this._buffer)
+      this._buffer = Buffer.concat(this._parts, this._size);
+    return this._buffer;
+  }
+  slice(start, end, type) {
+    const s = clampBlobIndex(start, this._size, 0);
+    const e = clampBlobIndex(end, this._size, this._size);
+    const part = this._bytes().subarray(Math.min(s, e), Math.max(s, e));
+    return new Blob([part], { type: type === undefined ? "" : type });
+  }
+  text() { return Promise.resolve(this._bytes().toString("utf8")); }
+  arrayBuffer() {
+    const b = this._bytes();
+    const ab = new ArrayBuffer(b.length);
+    new Uint8Array(ab).set(b);
+    return Promise.resolve(ab);
+  }
+  bytes() { return Promise.resolve(new Uint8Array(this._bytes())); }
+  stream() { return bufferToStream(this._bytes()); }
+}
+Blob.prototype[Symbol.toStringTag] = "Blob";
+
+class File extends Blob {
+  constructor(parts, name, options) {
+    super(parts, options);
+    options = options || {};
+    this.name = String(name);
+    this.lastModified = options.lastModified === undefined
+      ? Date.now() : Number(options.lastModified);
+    this.webkitRelativePath = "";
+  }
+}
+File.prototype[Symbol.toStringTag] = "File";
+/* `buffer` exposes the same Blob/File classes as the globals. Assigned here
+   because bufferModule is created before these classes are initialized. */
+bufferModule.Blob = Blob;
+bufferModule.File = File;
+
+function normalizeFormValue(value, filename) {
+  if (value instanceof Blob) {
+    if (filename !== undefined)
+      return new File([value], filename, { type: value.type });
+    return value;
+  }
+  return String(value);
+}
+
+class FormData {
+  constructor() { this._entries = []; }
+  append(name, value, filename) {
+    this._entries.push([String(name), normalizeFormValue(value, filename)]);
+  }
+  set(name, value, filename) {
+    name = String(name);
+    const entry = [name, normalizeFormValue(value, filename)];
+    this._entries = this._entries.filter((e) => e[0] !== name);
+    this._entries.push(entry);
+  }
+  get(name) {
+    name = String(name);
+    const entry = this._entries.find((e) => e[0] === name);
+    return entry ? entry[1] : null;
+  }
+  getAll(name) {
+    name = String(name);
+    return this._entries.filter((e) => e[0] === name).map((e) => e[1]);
+  }
+  has(name) {
+    name = String(name);
+    return this._entries.some((e) => e[0] === name);
+  }
+  delete(name) {
+    name = String(name);
+    this._entries = this._entries.filter((e) => e[0] !== name);
+  }
+  forEach(fn, thisArg) {
+    for (const [name, value] of this._entries)
+      fn.call(thisArg, value, name, this);
+  }
+  *entries() { for (const entry of this._entries) yield [entry[0], entry[1]]; }
+  *keys() { for (const entry of this._entries) yield entry[0]; }
+  *values() { for (const entry of this._entries) yield entry[1]; }
+  [Symbol.iterator]() { return this.entries(); }
+}
+FormData.prototype[Symbol.toStringTag] = "FormData";
+
+function escapeMultipartName(s) {
+  return String(s).replace(/[\r\n"]/g, (c) =>
+    c === '"' ? "%22" : c === "\r" ? "%0D" : "%0A");
+}
+
+function unescapeMultipartName(s) {
+  return String(s).replace(/%0D/gi, "\r").replace(/%0A/gi, "\n")
+    .replace(/%22/gi, '"').replace(/\\(.)/g, "$1");
+}
+
+function formDataToBuffer(fd) {
+  const boundary = "----qnodeFormBoundary" +
+    Buffer.from(native.randomBytes(16)).toString("hex");
+  const parts = [];
+  for (const [name, value] of fd._entries) {
+    const isBlob = value instanceof Blob;
+    let head = "--" + boundary + "\r\n" +
+      'Content-Disposition: form-data; name="' + escapeMultipartName(name) + '"';
+    if (isBlob) {
+      head += '; filename="' +
+        escapeMultipartName(value.name === undefined ? "blob" : value.name) + '"';
+      head += "\r\nContent-Type: " +
+        (value.type || "application/octet-stream");
+    }
+    head += "\r\n\r\n";
+    parts.push(Buffer.from(head, "utf8"));
+    parts.push(isBlob ? value._bytes() : Buffer.from(String(value), "utf8"));
+    parts.push(Buffer.from("\r\n"));
+  }
+  parts.push(Buffer.from("--" + boundary + "--\r\n"));
+  return { buffer: Buffer.concat(parts), boundary };
+}
+
+function parseMultipartFormData(buf, boundary) {
+  const fd = new FormData();
+  const delim = Buffer.from("--" + boundary);
+  let pos = bufferIndexOf(buf, delim);
+  if (pos < 0)
+    return fd;
+  for (;;) {
+    let start = pos + delim.length;
+    if (buf[start] === 0x2d && buf[start + 1] === 0x2d)
+      break;
+    if (buf[start] === 0x0d && buf[start + 1] === 0x0a)
+      start += 2;
+    const headEnd = bufferIndexOf(buf, Buffer.from("\r\n\r\n"), start);
+    if (headEnd < 0)
+      break;
+    const nextPos = bufferIndexOf(buf, delim, headEnd + 4);
+    if (nextPos < 0)
+      break;
+    let bodyEnd = nextPos;
+    if (bodyEnd >= 2 && buf[bodyEnd - 2] === 0x0d && buf[bodyEnd - 1] === 0x0a)
+      bodyEnd -= 2;
+    const head = utf8Decode(buf, start, headEnd);
+    const body = buf.subarray(headEnd + 4, bodyEnd);
+    let name = "", filename = null, ctype = "";
+    for (const line of head.split("\r\n")) {
+      const colon = line.indexOf(":");
+      if (colon < 0)
+        continue;
+      const key = line.slice(0, colon).trim().toLowerCase();
+      const value = line.slice(colon + 1).trim();
+      if (key === "content-disposition") {
+        const n = /name="((?:[^"\\]|\\.)*)"/i.exec(value);
+        if (n)
+          name = unescapeMultipartName(n[1]);
+        const f = /filename="((?:[^"\\]|\\.)*)"/i.exec(value);
+        if (f)
+          filename = unescapeMultipartName(f[1]);
+      } else if (key === "content-type") {
+        ctype = value;
+      }
+    }
+    if (name) {
+      if (filename === null)
+        fd.append(name, utf8Decode(body, 0, body.length));
+      else
+        fd.append(name, new File([body], filename, { type: ctype }));
+    }
+    pos = nextPos;
+  }
+  return fd;
+}
+
+function parseBodyFormData(buf, contentType) {
+  const raw = String(contentType || "");
+  const ct = raw.toLowerCase();
+  if (ct.startsWith("multipart/form-data")) {
+    const m = /boundary=(?:"([^"]+)"|([^;]+))/i.exec(raw);
+    const boundary = m ? (m[1] || m[2]).trim() : "";
+    if (!boundary)
+      throw new TypeError("Could not parse content as FormData.");
+    return parseMultipartFormData(buf, boundary);
+  }
+  if (ct.startsWith("application/x-www-form-urlencoded")) {
+    const fd = new FormData();
+    for (const [k, v] of new URLSearchParams(buf.toString("utf8")))
+      fd.append(k, v);
+    return fd;
+  }
+  throw new TypeError("Could not parse content as FormData.");
+}
+
+function copyBodyBytes(value) {
+  if (value instanceof ArrayBuffer)
+    return Buffer.from(new Uint8Array(value));
+  if (ArrayBuffer.isView(value))
+    return Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+  return null;
+}
+
+function bufferToStream(buf) {
+  return new ReadableStream({
+    start(controller) {
+      if (buf.length)
+        controller.enqueue(new Uint8Array(buf));
+      controller.close();
+    },
+  });
+}
+
+function normalizeRequestBody(body, headers, duplex) {
+  if (body === undefined || body === null)
+    return { kind: "none" };
+  if (typeof body === "string")
+    return { kind: "buffer", buffer: Buffer.from(body, "utf8"),
+             contentType: "text/plain;charset=UTF-8" };
+  if (body instanceof URLSearchParams)
+    return { kind: "buffer", buffer: Buffer.from(body.toString(), "utf8"),
+             contentType: "application/x-www-form-urlencoded;charset=UTF-8" };
+  if (body instanceof Blob)
+    return { kind: "buffer", buffer: body._bytes(),
+             contentType: body.type || null };
+  if (body instanceof FormData) {
+    const m = formDataToBuffer(body);
+    return { kind: "buffer", buffer: m.buffer,
+             contentType: "multipart/form-data; boundary=" + m.boundary };
+  }
+  const bytes = copyBodyBytes(body);
+  if (bytes)
+    return { kind: "buffer", buffer: bytes };
+  if (body instanceof ReadableStream) {
+    if (duplex !== "half")
+      throw new TypeError(
+        "RequestInit: duplex option is required when sending a body.");
+    return { kind: "stream", stream: body };
+  }
+  const isAsync = typeof body[Symbol.asyncIterator] === "function";
+  const isSync = typeof body[Symbol.iterator] === "function";
+  if (isAsync || isSync) {
+    if (duplex !== "half")
+      throw new TypeError(
+        "RequestInit: duplex option is required when sending a body.");
+    return { kind: "stream", stream: ReadableStream.from(body) };
+  }
+  throw new TypeError("Request body: unsupported body type");
+}
+
+async function readStreamFully(stream) {
+  if (stream.locked)
+    throw new TypeError("Body is unusable: Body has already been read");
+  const reader = stream.getReader();
+  const chunks = [];
+  try {
+    for (;;) {
+      const r = await reader.read();
+      if (r.done)
+        break;
+      chunks.push(Buffer.from(r.value));
+    }
+  } finally {
+    try { reader.releaseLock(); } catch (e) {}
+  }
+  return Buffer.concat(chunks);
+}
+
+/* Shared worker for `stream/consumers`: accept the same inputs Node does
+   (Blob, Response, ReadableStream, async iterable or stream.Readable) and
+   return a Buffer. */
+function readConsumerSource(source) {
+  if (source instanceof Blob)
+    return Promise.resolve(source._bytes());
+  if (source instanceof Response)
+    return source._consume();
+  if (source instanceof ReadableStream)
+    return readStreamFully(source);
+  if (source && typeof source[Symbol.asyncIterator] === "function") {
+    return (async () => {
+      const chunks = [];
+      for await (const chunk of source)
+        chunks.push(Buffer.from(chunk));
+      return Buffer.concat(chunks);
+    })();
+  }
+  if (source && typeof source[Symbol.iterator] === "function" &&
+      typeof source !== "string") {
+    const chunks = [];
+    for (const chunk of source)
+      chunks.push(Buffer.from(chunk));
+    return Promise.resolve(Buffer.concat(chunks));
+  }
+  if (source && typeof source.on === "function") {
+    return new Promise((resolve, reject) => {
+      const chunks = [];
+      source.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+      source.on("end", () => resolve(Buffer.concat(chunks)));
+      source.on("error", reject);
+    });
+  }
+  return Promise.reject(
+    new TypeError("Expected a Blob, ReadableStream, or stream.Readable"));
+}
+
+const streamConsumers = {
+  buffer: (source) => readConsumerSource(source),
+  text: async (source) => (await readConsumerSource(source)).toString("utf8"),
+  json: async (source) =>
+    JSON.parse((await readConsumerSource(source)).toString("utf8")),
+  arrayBuffer: async (source) => {
+    const buf = await readConsumerSource(source);
+    const out = new ArrayBuffer(buf.length);
+    new Uint8Array(out).set(buf);
+    return out;
+  },
+  blob: async (source) => {
+    const buf = await readConsumerSource(source);
+    let type = "";
+    if (source instanceof Response)
+      type = source.headers.get("content-type") || "";
+    else if (source instanceof Blob)
+      type = source.type;
+    return new Blob([buf], { type });
+  },
+};
+
+function bodyConsume(target) {
+  if (target._bodyUsed ||
+      (target._bodyStream && target._bodyStream._disturbed))
+    return Promise.reject(
+      new TypeError("Body is unusable: Body has already been read"));
+  target._bodyUsed = true;
+  if (target._bodyStream) {
+    if (target._bodyStream.locked)
+      return Promise.reject(
+        new TypeError("Body is unusable: Body has already been read"));
+    return readStreamFully(target._bodyStream);
+  }
+  return Promise.resolve(target._bodyBuffer || Buffer.alloc(0));
+}
+
+function bodyCloneInto(source, target) {
+  if (source._bodyUsed)
+    throw new TypeError("Body is unusable: Body has already been read");
+  if (!source._bodyStream && source._bodyBuffer === null)
+    return;
+  const stream = source.body;
+  if (!stream)
+    return;
+  const [a, b] = stream.tee();
+  source._bodyStream = a;
+  source._bodyBuffer = null;
+  target._bodyStream = b;
+  target._bodyBuffer = null;
+}
 
 class Headers {
   constructor(init) {
@@ -9274,87 +9762,344 @@ class Headers {
 class Response {
   constructor(body, init) {
     init = init || {};
-    this.status = init.status === undefined ? 200 : init.status;
-    this.statusText = init.statusText === undefined ? "" : init.statusText;
+    this.status = init.status === undefined ? 200 : Number(init.status);
+    this.statusText = init.statusText === undefined ? "" : String(init.statusText);
     this.ok = this.status >= 200 && this.status < 300;
     this.headers = new Headers(init.headers);
-    this.url = init.url || "";
-    this.redirected = false;
-    this.type = "basic";
-    this.bodyUsed = false;
-    this._body = body ? Buffer.from(body) : Buffer.alloc(0);
+    this.url = init.url === undefined ? "" : String(init.url);
+    this.redirected = !!init.redirected;
+    this.type = init.type || "default";
+    this._bodyUsed = false;
+    this._bodyBuffer = null;
     this._bodyStream = null;
+    if (body === null || body === undefined) {
+      /* null body: HEAD, 204 and 304 responses have no readable stream */
+    } else if (body instanceof ReadableStream) {
+      this._bodyStream = body;
+    } else if (body instanceof Blob) {
+      this._bodyBuffer = body._bytes();
+      if (body.type && !this.headers.has("content-type"))
+        this.headers.set("content-type", body.type);
+    } else if (body instanceof FormData) {
+      const m = formDataToBuffer(body);
+      this._bodyBuffer = m.buffer;
+      this.headers.set("content-type",
+                       "multipart/form-data; boundary=" + m.boundary);
+    } else {
+      const bytes = copyBodyBytes(body);
+      this._bodyBuffer = bytes || Buffer.from(String(body), "utf8");
+    }
   }
   get body() {
-    if (!this._bodyStream) {
-      const body = this._body;
-      this._bodyStream = new ReadableStream({
-        start(controller) {
-          if (body.length)
-            controller.enqueue(new Uint8Array(body));
-          controller.close();
-        },
-      });
-    }
+    if (!this._bodyStream && this._bodyBuffer !== null)
+      this._bodyStream = bufferToStream(this._bodyBuffer);
     return this._bodyStream;
   }
-  _consume() {
-    if (this.bodyUsed)
-      throw new TypeError("Body is unusable: Body has already been read");
-    this.bodyUsed = true;
-    return this._body;
+  get bodyUsed() {
+    return this._bodyUsed || !!(this._bodyStream && this._bodyStream._disturbed);
   }
-  async text() { return this._consume().toString("utf8"); }
-  async json() { return JSON.parse(this._consume().toString("utf8")); }
+  _consume() { return bodyConsume(this); }
+  async text() { return (await this._consume()).toString("utf8"); }
+  async json() { return JSON.parse(await this.text()); }
   async arrayBuffer() {
-    const b = this._consume();
+    const b = await this._consume();
     const out = new ArrayBuffer(b.length);
     new Uint8Array(out).set(b);
     return out;
   }
-  async blob() { return { size: this._body.length, type: this.headers.get("content-type") || "" }; }
+  async bytes() { return new Uint8Array(await this._consume()); }
+  async blob() {
+    const b = await this._consume();
+    return new Blob([b], { type: this.headers.get("content-type") || "" });
+  }
+  async formData() {
+    const b = await this._consume();
+    return parseBodyFormData(b, this.headers.get("content-type"));
+  }
   clone() {
-    const r = new Response(this._body, { status: this.status,
-      statusText: this.statusText, headers: this.headers, url: this.url });
+    const r = new Response(null, {
+      status: this.status,
+      statusText: this.statusText,
+      headers: new Headers(this.headers),
+      url: this.url,
+      redirected: this.redirected,
+      type: this.type,
+    });
+    bodyCloneInto(this, r);
     return r;
   }
+  static error() {
+    const r = new Response(null, { status: 0, statusText: "" });
+    r.type = "error";
+    return r;
+  }
+  static redirect(url, status) {
+    status = status === undefined ? 302 : Number(status);
+    if (status !== 301 && status !== 302 && status !== 303 &&
+        status !== 307 && status !== 308)
+      throw new RangeError("Invalid status code");
+    return new Response(null, {
+      status, headers: { location: String(url) },
+    });
+  }
+  static json(data, init) {
+    init = Object.assign({}, init);
+    const headers = new Headers(init.headers);
+    if (!headers.has("content-type"))
+      headers.set("content-type", "application/json");
+    return new Response(JSON.stringify(data), Object.assign({}, init, { headers }));
+  }
 }
+Response.prototype[Symbol.toStringTag] = "Response";
 
 class Request {
   constructor(input, init) {
     init = init || {};
-    if (input instanceof Request) {
-      this.url = input.url;
-      this.method = init.method || input.method;
-      this.headers = new Headers(init.headers || input.headers);
-      this.body = init.body === undefined ? input.body : init.body;
+    const isRequest = input instanceof Request;
+    this.url = isRequest ? input.url
+      : (input instanceof URL ? input.href : String(input));
+    this.method = (init.method || (isRequest ? input.method : "GET"))
+      .toUpperCase();
+    this.headers = new Headers(init.headers !== undefined
+      ? init.headers : (isRequest ? input.headers : undefined));
+    this.redirect = init.redirect || (isRequest ? input.redirect : "follow");
+    this.signal = init.signal || (isRequest ? input.signal : null) || null;
+    if (isRequest && input._bodyUsed)
+      throw new TypeError(
+        "Cannot construct a Request with a Request object that has already been used.");
+    this._bodyUsed = isRequest ? input._bodyUsed : false;
+
+    let source;
+    if (init.body !== undefined) {
+      source = normalizeRequestBody(init.body, this.headers, init.duplex);
+    } else if (isRequest) {
+      const src = input._bodySource;
+      if (src.kind === "buffer") {
+        source = { kind: "buffer", buffer: src.buffer,
+                   contentType: src.contentType };
+      } else if (src.kind === "stream") {
+        const [a, b] = input.body.tee();
+        input._bodyStream = a;
+        input._bodyBuffer = null;
+        source = { kind: "stream", stream: b };
+      } else {
+        source = { kind: "none" };
+      }
     } else {
-      this.url = input instanceof URL ? input.href : String(input);
-      this.method = (init.method || "GET").toUpperCase();
-      this.headers = new Headers(init.headers);
-      this.body = init.body;
+      source = { kind: "none" };
     }
-    this.signal = init.signal || null;
+    this._bodySource = source;
+    this._bodyBuffer = source.kind === "buffer" ? source.buffer : null;
+    this._bodyStream = source.kind === "stream" ? source.stream : null;
+    if (source.contentType && !this.headers.has("content-type"))
+      this.headers.set("content-type", source.contentType);
+    if ((this.method === "GET" || this.method === "HEAD") &&
+        source.kind !== "none")
+      throw new TypeError(
+        "Request with GET/HEAD method cannot have body.");
   }
-  clone() { return new Request(this); }
+  get body() {
+    if (!this._bodyStream && this._bodyBuffer !== null)
+      this._bodyStream = bufferToStream(this._bodyBuffer);
+    return this._bodyStream;
+  }
+  get bodyUsed() {
+    return this._bodyUsed || !!(this._bodyStream && this._bodyStream._disturbed);
+  }
+  _consume() { return bodyConsume(this); }
+  async text() { return (await this._consume()).toString("utf8"); }
+  async json() { return JSON.parse(await this.text()); }
+  async arrayBuffer() {
+    const b = await this._consume();
+    const out = new ArrayBuffer(b.length);
+    new Uint8Array(out).set(b);
+    return out;
+  }
+  async bytes() { return new Uint8Array(await this._consume()); }
+  async blob() {
+    const b = await this._consume();
+    return new Blob([b], { type: this.headers.get("content-type") || "" });
+  }
+  async formData() {
+    const b = await this._consume();
+    return parseBodyFormData(b, this.headers.get("content-type"));
+  }
+  clone() {
+    const r = new Request(this);
+    return r;
+  }
 }
+Request.prototype[Symbol.toStringTag] = "Request";
 
 const FETCH_REDIRECT_CODES = new Set([301, 302, 303, 307, 308]);
 
-function fetchDecodeBody(buf, encoding) {
-  const enc = String(encoding || "").toLowerCase().trim();
+/* Stream an HTTP response body into a ReadableStream. Data is pulled from
+   the socket on demand (highWaterMark 0) so an unread body does not buffer
+   the whole response in memory. gzip/deflate is inflated incrementally. */
+function responseBodyStream(res, method, statusCode, headers) {
+  if (method === "HEAD" || statusCode === 204 || statusCode === 304) {
+    res.resume();
+    return null;
+  }
+
+  let windowBits = 0;
+  const enc = String(headers["content-encoding"] || "").toLowerCase().trim();
   if (enc === "gzip" || enc === "x-gzip")
-    return zlib.gunzipSync(buf);
-  if (enc === "deflate")
-    return zlib.inflateSync(buf);
-  if (enc === "br" && typeof zlib.brotliDecompressSync === "function")
-    return zlib.brotliDecompressSync(buf);
-  return buf;
+    windowBits = 31;
+  else if (enc === "deflate")
+    windowBits = 15;
+
+  const socket = res.socket;
+  let inflateId = windowBits ? native.zlibInflateStart(windowBits) : -1;
+  let closed = false;
+  let paused = true;
+  let pullResolve = null;
+
+  const finishInflate = () => {
+    if (inflateId < 0)
+      return null;
+    const tail = native.zlibInflateEnd(inflateId);
+    inflateId = -1;
+    return tail;
+  };
+  const wakePull = () => {
+    const resolve = pullResolve;
+    pullResolve = null;
+    if (resolve)
+      resolve();
+  };
+  const fail = (controller, err) => {
+    if (closed)
+      return;
+    closed = true;
+    try { controller.error(err); } catch (e) {}
+    wakePull();
+    if (socket && !socket.destroyed) {
+      try { socket.destroy(); } catch (e) {}
+    }
+  };
+
+  return new ReadableStream({
+    start(controller) {
+      /* Pause before attaching the data listener: Readable.on("data")
+         resumes a stream unless it has explicitly been paused. */
+      res.pause();
+      if (socket && typeof socket.unref === "function")
+        socket.unref();
+      res.on("data", (chunk) => {
+        if (closed)
+          return;
+        let data = chunk;
+        if (inflateId >= 0) {
+          try {
+            data = native.zlibInflateWrite(inflateId, chunk);
+          } catch (e) {
+            fail(controller, e);
+            return;
+          }
+        }
+        if (data && data.length) {
+          try {
+            controller.enqueue(data);
+          } catch (e) {
+            closed = true;
+            return;
+          }
+          wakePull();
+        }
+        if (!closed && controller.desiredSize !== null &&
+            controller.desiredSize <= 0) {
+          paused = true;
+          res.pause();
+        }
+      });
+      res.on("end", () => {
+        if (closed)
+          return;
+        try {
+          const tail = finishInflate();
+          if (tail && tail.length)
+            controller.enqueue(tail);
+        } catch (e) {
+          fail(controller, e);
+          return;
+        }
+        closed = true;
+        try { controller.close(); } catch (e) {}
+        wakePull();
+      });
+      res.on("error", (err) => fail(controller, err));
+    },
+    pull(controller) {
+      if (closed)
+        return;
+      if (res.readableEnded &&
+          (!res._readableState || res._readableState.buffer.length === 0)) {
+        closed = true;
+        try { controller.close(); } catch (e) {}
+        return;
+      }
+      if (socket && typeof socket.ref === "function")
+        socket.ref();
+      if (paused) {
+        paused = false;
+        res.resume();
+      }
+      /* Resolve once a chunk has been enqueued (or the stream ended) so the
+         ReadableStream does not spin calling pull synchronously. */
+      return new Promise((resolve) => { pullResolve = resolve; });
+    },
+    cancel(reason) {
+      if (closed)
+        return;
+      closed = true;
+      try { finishInflate(); } catch (e) {}
+      wakePull();
+      try { res.destroy(reason); } catch (e) {}
+      if (socket && !socket.destroyed) {
+        try { socket.destroy(); } catch (e) {}
+      }
+    },
+  }, { highWaterMark: 0 });
+}
+
+async function pumpRequestBody(req, body, state) {
+  if (!body || body.kind === "none") {
+    req.end();
+    return;
+  }
+  if (body.kind === "buffer") {
+    req.end(body.buffer);
+    return;
+  }
+
+  const reader = body.stream.getReader();
+  try {
+    for (;;) {
+      if (state.cancelled) {
+        try { await reader.cancel(); } catch (e) {}
+        return;
+      }
+      const r = await reader.read();
+      if (r.done)
+        break;
+      if (state.cancelled) {
+        try { await reader.cancel(); } catch (e) {}
+        return;
+      }
+      if (req.destroyed || req.aborted)
+        return;
+      req.write(r.value);
+    }
+    if (!state.cancelled && !req.destroyed && !req.aborted)
+      req.end();
+  } finally {
+    try { reader.releaseLock(); } catch (e) {}
+  }
 }
 
 function fetchOnce(url, init, redirects) {
   return new Promise((resolve, reject) => {
-    const req0 = init.request instanceof Request ? init.request : null;
     let u;
     try { u = new URL(url); }
     catch (e) { reject(new TypeError("Failed to parse URL from " + url)); return; }
@@ -9363,15 +10108,24 @@ function fetchOnce(url, init, redirects) {
       return;
     }
     if (init.signal && init.signal.aborted) {
-      reject(init.signal.reason);
+      reject(init.signal.reason ||
+        new DOMException("The operation was aborted.", "AbortError"));
       return;
     }
+
     const secure = u.protocol === "https:";
     const headers = {};
     init.headers.forEach((v, k) => { headers[k] = v; });
-    if (headers["accept-encoding"] === undefined &&
-        init.acceptEncoding !== false)
+    if (headers["accept-encoding"] === undefined && init.acceptEncoding !== false)
       headers["accept-encoding"] = "gzip, deflate";
+    const body = init.body || { kind: "none" };
+    if (body.kind === "buffer" && headers["content-length"] === undefined)
+      headers["content-length"] = body.buffer.length;
+    if (body.kind === "stream" &&
+        headers["content-length"] === undefined &&
+        headers["transfer-encoding"] === undefined)
+      headers["transfer-encoding"] = "chunked";
+
     const opts = {
       hostname: u.hostname,
       port: u.port || (secure ? 443 : 80),
@@ -9384,95 +10138,125 @@ function fetchOnce(url, init, redirects) {
         opts.rejectUnauthorized = init.rejectUnauthorized;
       if (init.ca !== undefined)
         opts.ca = init.ca;
-    }
-    else if (init.rejectUnauthorized !== undefined)
+    } else if (init.rejectUnauthorized !== undefined) {
       opts.rejectUnauthorized = init.rejectUnauthorized;
-    const mod = secure ? https : http;
-    const r = mod.request(opts, (res) => {
-      const location = res.headers.location;
-      if (FETCH_REDIRECT_CODES.has(res.statusCode) && location &&
-          init.redirect !== "manual" && redirects > 0) {
-        res.resume();
-        let next;
-        try { next = new URL(location, url).href; }
-        catch (e) { reject(new TypeError("fetch: invalid redirect URL")); return; }
-        let method = init.method;
-        let body = init.bodyText;
-        if (res.statusCode === 303 ||
-            ((res.statusCode === 301 || res.statusCode === 302) &&
-             method === "POST")) {
-          method = "GET";
-          body = undefined;
-        }
-        const nextInit = Object.assign({}, init, {
-          request: null, method, bodyText: body,
-        });
-        if (nextInit.headers && nextInit.headers.delete) {
-          if (method === "GET")
-            nextInit.headers.delete("content-length");
-          nextInit.headers.delete("host");
-        }
-        resolve(fetchOnce(next, nextInit, redirects - 1));
+    }
+
+    const state = { settled: false, cancelled: false };
+    const settle = (fn, value) => {
+      if (state.settled)
         return;
-      }
-      const chunks = [];
-      res.on("data", (c) => chunks.push(c));
-      res.on("end", () => {
+      state.settled = true;
+      fn(value);
+    };
+
+    let req;
+    try {
+      req = (secure ? https : http).request(opts, (res) => {
+        const location = res.headers.location;
+        if (FETCH_REDIRECT_CODES.has(res.statusCode) && location &&
+            init.redirect !== "manual" && redirects > 0) {
+          state.cancelled = true;
+          res.resume();
+          let next;
+          try { next = new URL(location, url).href; }
+          catch (e) {
+            settle(reject, new TypeError("fetch: invalid redirect URL"));
+            return;
+          }
+          let method = init.method;
+          let nextBody = body;
+          if (res.statusCode === 303 ||
+              ((res.statusCode === 301 || res.statusCode === 302) &&
+               method === "POST")) {
+            method = "GET";
+            nextBody = { kind: "none" };
+          } else if (body.kind === "stream") {
+            settle(reject, new TypeError(
+              "fetch: cannot follow redirect with a streaming body"));
+            try { req.destroy(); } catch (e) {}
+            return;
+          }
+          const nextHeaders = new Headers(init.headers);
+          nextHeaders.delete("host");
+          if (method === "GET") {
+            nextHeaders.delete("content-length");
+            nextHeaders.delete("transfer-encoding");
+          } else if (nextBody.kind === "buffer" &&
+                     !nextHeaders.has("content-length")) {
+            nextHeaders.set("content-length", nextBody.buffer.length);
+          }
+          settle(resolve, fetchOnce(next, Object.assign({}, init, {
+            method, headers: nextHeaders, body: nextBody,
+          }), redirects - 1));
+          return;
+        }
+
+        state.res = res;
         const outHeaders = {};
         for (const k of Object.keys(res.headers))
           outHeaders[k] = res.headers[k];
-        let body = Buffer.concat(chunks);
-        try {
-          body = fetchDecodeBody(body, res.headers["content-encoding"]);
-        } catch (e) {
-          reject(e);
-          return;
-        }
-        const out = new Response(
-          init.method === "HEAD" ? null : body, {
-            status: res.statusCode,
-            statusText: res.statusMessage,
-            headers: outHeaders,
-            url,
-          });
-        out.redirected = redirects !== init.maxRedirects;
-        resolve(out);
+        const stream = responseBodyStream(res, init.method,
+                                          res.statusCode, outHeaders);
+        const out = new Response(null, {
+          status: res.statusCode,
+          statusText: res.statusMessage,
+          headers: outHeaders,
+          url,
+          type: "basic",
+        });
+        out._bodyStream = stream;
+        out._bodyBuffer = null;
+        out.redirected = init.maxRedirects !== redirects;
+        settle(resolve, out);
       });
-      res.on("error", reject);
+    } catch (e) {
+      settle(reject, e);
+      return;
+    }
+
+    req.on("error", (err) => {
+      if (!state.settled)
+        settle(reject, err);
     });
-    r.on("error", reject);
-    if (init.signal && init.signal.addEventListener) {
+
+    if (init.signal && typeof init.signal.addEventListener === "function") {
       init.signal.addEventListener("abort", () => {
-        r.destroy();
-        reject(init.signal.reason);
+        state.cancelled = true;
+        const reason = init.signal.reason ||
+          new DOMException("The operation was aborted.", "AbortError");
+        if (state.res) {
+          try { state.res.destroy(reason); } catch (e) {}
+        }
+        try { req.destroy(); } catch (e) {}
+        settle(reject, reason);
       }, { once: true });
     }
-    if (init.bodyText !== undefined && init.bodyText !== null &&
-        init.method !== "GET" && init.method !== "HEAD")
-      r.end(init.bodyText);
-    else
-      r.end();
+
+    pumpRequestBody(req, body, state).catch((err) => {
+      if (!state.settled) {
+        settle(reject, err);
+        try { req.destroy(err); } catch (e) {}
+      }
+    });
   });
 }
 
-function fetch(input, init) {
-  return new Promise((resolve, reject) => {
-    let req;
-    try { req = input instanceof Request ? input : new Request(input, init); }
-    catch (e) { reject(e); return; }
-    const headers = new Headers();
-    req.headers.forEach((v, k) => headers.set(k, v));
-    fetchOnce(req.url, {
-      request: req,
-      method: req.method,
-      headers,
-      signal: req.signal,
-      redirect: req.redirect,
-      maxRedirects: 20,
-      bodyText: req.body === undefined || req.body === null
-        ? undefined : req.body,
-    }, 20).then(resolve, reject);
-  });
+async function fetch(input, init) {
+  const req = new Request(input, init);
+  if (input instanceof Request && input._bodySource.kind !== "none")
+    input._bodyUsed = true;
+  if (req._bodyUsed)
+    throw new TypeError("Body is unusable: Body has already been read");
+  req._bodyUsed = true;
+  return fetchOnce(req.url, {
+    method: req.method,
+    headers: req.headers,
+    body: req._bodySource,
+    signal: req.signal,
+    redirect: req.redirect,
+    maxRedirects: 20,
+  }, 20);
 }
 
 /* ------------------------------------------------------------------ */
@@ -10416,6 +11200,10 @@ globalScope.fetch = fetch;
 globalScope.Headers = Headers;
 globalScope.Request = Request;
 globalScope.Response = Response;
+globalScope.Blob = Blob;
+globalScope.File = File;
+globalScope.FormData = FormData;
+globalScope.DOMException = DOMException;
 globalScope.crypto = crypto.webcrypto;
 globalScope.atob = (s) => Buffer.from(s, "base64").toString("latin1");
 globalScope.btoa = (s) => Buffer.from(s, "latin1").toString("base64");
@@ -10526,7 +11314,10 @@ globalThis.__qnode_on_unhandled = function(reason) {
 };
 
 /* The C tracker fires the moment a promise is rejected.  Defer reporting to
-   a microtask so a handler attached in the same turn still counts. */
+   the end of the current turn so a handler attached later in the same turn
+   still counts.  A single microtask is not enough: an async function that
+   returns a rejected promise only adopts it from a queued job, so reporting
+   there would race with the adoption. */
 const __qnode_pending_rejections = new Map();
 let __qnode_rejection_scheduled = false;
 globalThis.__qnode_track_rejection = function(promise, reason, handled) {
@@ -10537,12 +11328,12 @@ globalThis.__qnode_track_rejection = function(promise, reason, handled) {
   __qnode_pending_rejections.set(promise, reason);
   if (__qnode_rejection_scheduled) return;
   __qnode_rejection_scheduled = true;
-  queueMicrotask(() => {
+  setTimeout(() => {
     __qnode_rejection_scheduled = false;
     const pending = Array.from(__qnode_pending_rejections.values());
     __qnode_pending_rejections.clear();
     for (const reason of pending) globalThis.__qnode_on_unhandled(reason);
-  });
+  }, 0);
 };
 
 /* ------------------------------------------------------------------ */
