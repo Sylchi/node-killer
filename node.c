@@ -1121,6 +1121,16 @@ static JSValue js_node_environ(JSContext *ctx, JSValueConst this_val,
 static JSValue js_node_uname(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv)
 {
+#ifdef QNODE_FREESTANDING
+    (void)this_val; (void)argc; (void)argv;
+    JSValue o = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, o, "sysname", JS_NewString(ctx, "qnode"));
+    JS_SetPropertyStr(ctx, o, "nodename", JS_NewString(ctx, "qnode"));
+    JS_SetPropertyStr(ctx, o, "release", JS_NewString(ctx, "0.1.0"));
+    JS_SetPropertyStr(ctx, o, "version", JS_NewString(ctx, "freestanding"));
+    JS_SetPropertyStr(ctx, o, "machine", JS_NewString(ctx, "unknown"));
+    return node_ok(ctx, o);
+#else
     struct utsname u;
     JSValue o = JS_NewObject(ctx);
     if (uname(&u))
@@ -1131,13 +1141,19 @@ static JSValue js_node_uname(JSContext *ctx, JSValueConst this_val,
     JS_SetPropertyStr(ctx, o, "version", JS_NewString(ctx, u.version));
     JS_SetPropertyStr(ctx, o, "machine", JS_NewString(ctx, u.machine));
     return node_ok(ctx, o);
+#endif
 }
 
 static JSValue js_node_cpu_count(JSContext *ctx, JSValueConst this_val,
                                  int argc, JSValueConst *argv)
 {
+#ifdef QNODE_FREESTANDING
+    (void)ctx; (void)this_val; (void)argc; (void)argv;
+    return JS_NewInt32(ctx, 1);
+#else
     long n = sysconf(_SC_NPROCESSORS_ONLN);
     return JS_NewInt32(ctx, n > 0 ? n : 1);
+#endif
 }
 
 /* Real footprint of this process plus the engine's own accounting. */
