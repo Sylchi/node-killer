@@ -2,8 +2,9 @@
 
 Status: integrated. `node:net` hands managed IPv4 and IPv6 TCP streams and
 `node:dgram` UDP sockets to the in-process stack in `netstack.c` instead of the
-kernel. Unmanaged addresses still use kernel sockets, and `netstack: false`
-restores the kernel path per socket.
+kernel. The stack also answers IPv4 and IPv6 ICMP echo requests and reports
+unreachable UDP ports. Unmanaged addresses still use kernel sockets, and
+`netstack: false` restores the kernel path per socket.
 
 The kernel-backed sharded transport is still available and is documented in
 `docs/sharded-net.md`. The two features share the same `/64` address layout
@@ -19,7 +20,7 @@ sharded listeners use kernel TCP, the managed prefix uses the owned stack.
              |
    node_netstack.c  (virtual fd bridge)
       |            |
-   eventfd      netstack.c  (IPv4/IPv6 + TCP state machine + UDP sockets)
+   eventfd      netstack.c  (IPv4/IPv6 + TCP + UDP + ICMP)
                    |
               netstack_link.c
               /             \
@@ -28,8 +29,8 @@ sharded listeners use kernel TCP, the managed prefix uses the owned stack.
 
 - `netstack.c` is transport-agnostic. It consumes and emits complete IPv4 or
   IPv6 packets; it never opens a kernel socket. IPv4 and IPv6 share the TCP
-  state machine and the UDP socket table and differ only in header
-  encode/decode, checksum pseudo-headers and dispatch.
+  state machine, the UDP socket table and the ICMP echo logic, and differ only
+  in header encode/decode, checksum pseudo-headers and dispatch.
 - `netstack_link.c` is the link: an in-process loopback or a Linux TUN device.
 - `node_netstack.c` exposes the stack as descriptors. Each virtual fd is an
   `eventfd`; `node.c` routes socket natives to the bridge when the descriptor
@@ -173,8 +174,8 @@ Implemented:
 
 Current limits:
 
-- No ICMP, IPv4/IPv6 fragmentation or reassembly. UDP datagrams larger than
-  the link MTU are rejected instead of being fragmented.
+- No IPv4/IPv6 fragmentation or reassembly. UDP datagrams larger than the
+  link MTU are rejected instead of being fragmented.
 - No out-of-order reassembly, SACK, window scaling, congestion control or
   delayed ACK. The receive window is a fixed 64 KiB ring; peers that exceed it
   are retransmitted into after the application reads.
@@ -207,8 +208,9 @@ the 49152–65535 range). The engine supports:
 Limits and errors:
 
 - At most 256 UDP sockets per stack, 64 queued datagrams and 256 KiB of
-  queued payload per socket. Datagrams that arrive for a full queue or for no
-  matching socket are counted as drops.
+  queued payload per socket. Datagrams that arrive for a full queue are
+  counted as drops; datagrams for no matching socket also generate an ICMP
+  port-unreachable error.
 - `NS_EMSGSIZE`/`EMSGSIZE` when the payload does not fit in one link frame:
   1472 bytes for IPv4 and 1452 bytes for IPv6, i.e. `1500 - IP header - 8`.
 - `EADDRINUSE` on a conflicting bind; `EDESTADDRREQ` when an unconnected
@@ -224,6 +226,39 @@ and `disconnect` primitives as the TCP path. Broadcast and multicast
 membership setters are accepted as no-ops for API compatibility; the engine
 does not implement multicast or broadcast delivery.
 
+## ICMP behaviour
+
+The engine implements the subset needed for reachability tests and UDP error
+reporting:
+
+- IPv4 echo requests (type 8) are answered with type 0; ICMPv6 echo requests
+  (type 128) are answered with type 129. The reply is sourced from the address
+  the request was sent to, sent back to the request's source, and preserves the
+  identifier, sequence number and payload.
+- Checksums use the ICMP message for IPv4 and the ICMPv6 pseudo-header for
+  IPv6. Invalid checksums and truncated messages are dropped.
+- A UDP datagram with no matching socket produces ICMPv4 destination
+  unreachable / port unreachable (type 3, code 3) or ICMPv6 destination
+  unreachable / port unreachable (type 1, code 4). The IPv4 error quotes the
+  original IP header plus eight bytes; IPv6 quotes up to the 1280-byte
+  minimum MTU.
+- Errors are suppressed for packets whose source or destination is
+  unspecified, multicast or broadcast.
+
+`ns_icmp_echo()` sends an echo request from a local to a remote address and is
+used by the C tests. There is no JavaScript ping API; a host `ping` reaches
+the stack through the TUN link. `NsStats.icmp_rx` and `NsStats.icmp_tx` count
+received messages (echo requests and errors) and emitted replies and errors.
+
+Limits:
+
+- Only echo request/reply and UDP port-unreachable generation are implemented.
+  Redirect, time-exceeded, parameter-problem, fragment-needed and other ICMP
+  messages are neither generated nor acted on.
+- Incoming ICMP error messages are counted but not fed back to TCP or UDP
+  sockets, so there is no path-MTU discovery or error-driven socket failure.
+- No broadcast or multicast echo replies are sent.
+
 ## Sharded transport relationship
 
 The kernel sharded server (`subnet` + `shards`) is still the supported path
@@ -235,14 +270,16 @@ connection-address allocation.
 ## Testing
 
 ```sh
-make netstack-test       # C engine: TCP, UDP, dispatch, retransmit, limits
+make netstack-test       # C engine: TCP, UDP, ICMP, dispatch, retransmit, limits
 make netstack-tun-test   # optional TUN path in a private user+network namespace
 make qnode-test          # includes netstack_socket.js and netstack_dgram.js
 ```
 
 `tests/netstack_test.c` covers IPv4 and IPv6 datagram round-trips, ephemeral
 ports, wildcard and exact binds, reuse rules, connected sockets, disconnect,
-queue ordering, truncation, checksum handling and the oversize error.
+queue ordering, truncation, checksum handling and the oversize error. It also
+checks IPv4/IPv6 echo request/reply fields and checksums, and the IPv4/IPv6
+UDP port-unreachable errors and their quoted packets.
 
 `tests/qnode/netstack_socket.js` runs the TCP integration end to end over
 loopback: explicit and automatic netstack selection for both families,
@@ -259,8 +296,10 @@ managed addresses for manual testing.
 
 `tests/qnode/netstack_tun.sh` starts a TUN-backed stack in `unshare -rn`, adds
 IPv6 and IPv4 host-side addresses, and exchanges TCP streams and UDP
-datagrams with kernel clients over both families. It skips (and succeeds) when
-user namespaces, `ip(8)` or `/dev/net/tun` are unavailable.
+datagrams with kernel clients over both families. It also runs `ping -4` and
+`ping -6` against the owned stack to exercise real ICMP echo traffic. It skips
+(and succeeds) when user namespaces, `ip(8)` or `/dev/net/tun` are unavailable;
+the ICMP checks are skipped when `ping` is not installed.
 
 The C test is `tests/netstack_test.c`; it links the stack directly and needs no
 runtime or privileges.

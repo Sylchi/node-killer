@@ -7,6 +7,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define V4_HDR 20
+#define V6_HDR 40
+#define UDP_HDR 8
+
 static int failures;
 
 #define CHECK(cond) do { \
@@ -21,6 +25,9 @@ typedef struct Link {
     NsStack *b;
     int drop_next;
     int drop_synack;
+    int capture_on;
+    size_t capture_len;
+    uint8_t capture[NS_MAX_PACKET];
     uint64_t now;
 } Link;
 
@@ -39,8 +46,53 @@ static void link_send(NsStack *stack, const uint8_t *pkt, size_t len,
         l->drop_synack = 0;
         return;
     }
+    if (l->capture_on) {
+        if (len > sizeof(l->capture))
+            len = sizeof(l->capture);
+        memcpy(l->capture, pkt, len);
+        l->capture_len = len;
+    }
     peer = (stack == l->a) ? l->b : l->a;
     ns_input(peer, pkt, len);
+}
+
+/* One's-complement sum, folded to 16 bits. A valid IPv4 packet or ICMP
+   message sums to 0xffff. */
+static uint32_t csum_sum(const uint8_t *p, size_t len)
+{
+    uint32_t sum = 0;
+    size_t i;
+
+    for (i = 0; i + 1 < len; i += 2)
+        sum += ((uint32_t)p[i] << 8) | p[i + 1];
+    if (i < len)
+        sum += (uint32_t)p[i] << 8;
+    while (sum >> 16)
+        sum = (sum & 0xffff) + (sum >> 16);
+    return sum;
+}
+
+/* ICMPv6 checksum validation includes the IPv6 pseudo-header. */
+static uint32_t csum_sum6(const uint8_t *src, const uint8_t *dst,
+                          uint8_t proto, const uint8_t *l4, size_t len)
+{
+    uint32_t sum = 0;
+    size_t i;
+
+    for (i = 0; i < 16; i += 2)
+        sum += ((uint32_t)src[i] << 8) | src[i + 1];
+    for (i = 0; i < 16; i += 2)
+        sum += ((uint32_t)dst[i] << 8) | dst[i + 1];
+    sum += (uint32_t)(len >> 16);
+    sum += (uint32_t)(len & 0xffff);
+    sum += proto;
+    for (i = 0; i + 1 < len; i += 2)
+        sum += ((uint32_t)l4[i] << 8) | l4[i + 1];
+    if (i < len)
+        sum += (uint32_t)l4[i] << 8;
+    while (sum >> 16)
+        sum = (sum & 0xffff) + (sum >> 16);
+    return sum;
 }
 
 /* Run both ends until they are idle, ticking timers while idle. */
@@ -832,6 +884,242 @@ static void test_udp_ipv6(void)
     free_pair(&l);
 }
 
+static void test_icmp_echo_ipv4(void)
+{
+    Link l;
+    NsAddr local_a, local_b;
+    const uint8_t payload[4] = { 'p', 'i', 'n', 'g' };
+    const uint8_t *ip, *icmp;
+    size_t icmp_len;
+
+    make_plain_pair(&l, &local_a, &local_b);
+    l.capture_on = 1;
+
+    CHECK(ns_icmp_echo(l.a, &local_a, &local_b, 0x1234, 7, payload, 4) == 0);
+    CHECK(ns_stats(l.a)->icmp_tx == 1);
+    CHECK(ns_stats(l.a)->icmp_rx == 0);
+    CHECK(l.capture_len == V4_HDR + 8 + 4);
+
+    ip = l.capture;
+    icmp = ip + V4_HDR;
+    icmp_len = l.capture_len - V4_HDR;
+    CHECK(ip[0] == 0x45);
+    CHECK(ip[9] == 1);
+    CHECK(csum_sum(ip, V4_HDR) == 0xffff);
+    CHECK(memcmp(ip + 12, local_a.b, 4) == 0);
+    CHECK(memcmp(ip + 16, local_b.b, 4) == 0);
+    CHECK(icmp[0] == 8 && icmp[1] == 0);
+    CHECK(((icmp[4] << 8) | icmp[5]) == 0x1234);
+    CHECK(((icmp[6] << 8) | icmp[7]) == 7);
+    CHECK(memcmp(icmp + 8, payload, 4) == 0);
+    CHECK(csum_sum(icmp, icmp_len) == 0xffff);
+
+    pump(&l, 10);
+    CHECK(ns_stats(l.b)->icmp_rx == 1);
+    CHECK(ns_stats(l.b)->icmp_tx == 1);
+    CHECK(ns_stats(l.a)->icmp_rx == 1);
+
+    /* The reply comes from the request's destination and keeps the
+       identifier, sequence number and payload. */
+    CHECK(l.capture_len == V4_HDR + 8 + 4);
+    ip = l.capture;
+    icmp = ip + V4_HDR;
+    icmp_len = l.capture_len - V4_HDR;
+    CHECK(ip[9] == 1);
+    CHECK(csum_sum(ip, V4_HDR) == 0xffff);
+    CHECK(memcmp(ip + 12, local_b.b, 4) == 0);
+    CHECK(memcmp(ip + 16, local_a.b, 4) == 0);
+    CHECK(icmp[0] == 0 && icmp[1] == 0);
+    CHECK(((icmp[4] << 8) | icmp[5]) == 0x1234);
+    CHECK(((icmp[6] << 8) | icmp[7]) == 7);
+    CHECK(memcmp(icmp + 8, payload, 4) == 0);
+    CHECK(csum_sum(icmp, icmp_len) == 0xffff);
+
+    /* The largest echo that fits in one IPv4 link frame is 1472 bytes. */
+    {
+        uint8_t big[NS_MAX_PACKET];
+        int max_v4 = 1500 - V4_HDR - 8;
+
+        memset(big, 'x', sizeof(big));
+        CHECK(ns_icmp_echo(l.a, &local_a, &local_b, 1, 1, big, max_v4) == 0);
+        CHECK(ns_icmp_echo(l.a, &local_a, &local_b, 1, 1, big, max_v4 + 1) ==
+              -NS_EMSGSIZE);
+        pump(&l, 10);
+    }
+
+    free_pair(&l);
+}
+
+static void test_icmp_echo_ipv6(void)
+{
+    Link l;
+    NsAddr addr_a, addr_b;
+    const uint8_t payload[5] = { 'h', 'e', 'l', 'l', 'o' };
+    const uint8_t *ip, *icmp;
+    size_t icmp_len;
+
+    make_pair(&l, 2);
+    set_addr6(&addr_a, 1);
+    set_addr6(&addr_b, 2);
+    l.capture_on = 1;
+
+    CHECK(ns_icmp_echo(l.a, &addr_a, &addr_b, 0xabcd, 9, payload, 5) == 0);
+    CHECK(ns_stats(l.a)->icmp_tx == 1);
+    CHECK(l.capture_len == V6_HDR + 8 + 5);
+
+    ip = l.capture;
+    icmp = ip + V6_HDR;
+    icmp_len = l.capture_len - V6_HDR;
+    CHECK((ip[0] >> 4) == 6);
+    CHECK(ip[6] == 58);
+    CHECK(ip[7] == 64);
+    CHECK(((ip[4] << 8) | ip[5]) == 8 + 5);
+    CHECK(memcmp(ip + 8, addr_a.b, NS_ADDR_LEN) == 0);
+    CHECK(memcmp(ip + 24, addr_b.b, NS_ADDR_LEN) == 0);
+    CHECK(icmp[0] == 128 && icmp[1] == 0);
+    CHECK(((icmp[4] << 8) | icmp[5]) == 0xabcd);
+    CHECK(((icmp[6] << 8) | icmp[7]) == 9);
+    CHECK(memcmp(icmp + 8, payload, 5) == 0);
+    CHECK(csum_sum6(ip + 8, ip + 24, 58, icmp, icmp_len) == 0xffff);
+
+    pump(&l, 10);
+    CHECK(ns_stats(l.b)->icmp_rx == 1);
+    CHECK(ns_stats(l.b)->icmp_tx == 1);
+    CHECK(ns_stats(l.a)->icmp_rx == 1);
+
+    CHECK(l.capture_len == V6_HDR + 8 + 5);
+    ip = l.capture;
+    icmp = ip + V6_HDR;
+    icmp_len = l.capture_len - V6_HDR;
+    CHECK(memcmp(ip + 8, addr_b.b, NS_ADDR_LEN) == 0);
+    CHECK(memcmp(ip + 24, addr_a.b, NS_ADDR_LEN) == 0);
+    CHECK(icmp[0] == 129 && icmp[1] == 0);
+    CHECK(((icmp[4] << 8) | icmp[5]) == 0xabcd);
+    CHECK(((icmp[6] << 8) | icmp[7]) == 9);
+    CHECK(memcmp(icmp + 8, payload, 5) == 0);
+    CHECK(csum_sum6(ip + 8, ip + 24, 58, icmp, icmp_len) == 0xffff);
+
+    free_pair(&l);
+}
+
+static void test_icmp_port_unreachable_ipv4(void)
+{
+    Link l;
+    NsAddr local_a, local_b;
+    const uint8_t *ip, *icmp, *quote;
+    size_t icmp_len, quote_len;
+    uint16_t aport = 0;
+    uint64_t u;
+
+    make_plain_pair(&l, &local_a, &local_b);
+    l.capture_on = 1;
+
+    u = ns_udp_open(l.a, &local_a, 0, 0);
+    CHECK(u != 0);
+    CHECK(ns_udp_bound_addr(l.a, u, NULL, &aport) == 0);
+    CHECK(ns_udp_sendto(l.a, u, &local_b, 9999, "hello", 5) == 5);
+    pump(&l, 10);
+
+    CHECK(ns_stats(l.b)->icmp_tx == 1);
+    CHECK(ns_stats(l.a)->icmp_rx == 1);
+    CHECK(l.capture_len == V4_HDR + 8 + V4_HDR + UDP_HDR);
+
+    ip = l.capture;
+    icmp = ip + V4_HDR;
+    icmp_len = l.capture_len - V4_HDR;
+    CHECK(icmp[0] == 3 && icmp[1] == 3);
+    CHECK(csum_sum(ip, V4_HDR) == 0xffff);
+    CHECK(csum_sum(icmp, icmp_len) == 0xffff);
+    CHECK(memcmp(ip + 12, local_b.b, 4) == 0);
+    CHECK(memcmp(ip + 16, local_a.b, 4) == 0);
+
+    /* RFC 792 quotes the original header and eight data bytes. */
+    quote = icmp + 8;
+    quote_len = icmp_len - 8;
+    CHECK(quote_len == V4_HDR + UDP_HDR);
+    CHECK(quote[0] == 0x45);
+    CHECK(quote[9] == 17);
+    CHECK(memcmp(quote + 12, local_a.b, 4) == 0);
+    CHECK(memcmp(quote + 16, local_b.b, 4) == 0);
+    CHECK(((quote[20] << 8) | quote[21]) == aport);
+    CHECK(((quote[22] << 8) | quote[23]) == 9999);
+
+    CHECK(ns_udp_close(l.a, u) == 0);
+    free_pair(&l);
+}
+
+static void test_icmp_port_unreachable_ipv6(void)
+{
+    Link l;
+    NsAddr addr_a, addr_b;
+    const uint8_t *ip, *icmp, *quote;
+    size_t icmp_len, quote_len;
+    uint16_t aport = 0;
+    uint64_t u;
+
+    make_pair(&l, 2);
+    set_addr6(&addr_a, 1);
+    set_addr6(&addr_b, 2);
+    l.capture_on = 1;
+
+    u = ns_udp_open(l.a, &addr_a, 0, 0);
+    CHECK(u != 0);
+    CHECK(ns_udp_bound_addr(l.a, u, NULL, &aport) == 0);
+    CHECK(ns_udp_sendto(l.a, u, &addr_b, 9999, "hello6", 6) == 6);
+    pump(&l, 10);
+
+    CHECK(ns_stats(l.b)->icmp_tx == 1);
+    CHECK(ns_stats(l.a)->icmp_rx == 1);
+    CHECK(l.capture_len == V6_HDR + 8 + V6_HDR + UDP_HDR + 6);
+
+    ip = l.capture;
+    icmp = ip + V6_HDR;
+    icmp_len = l.capture_len - V6_HDR;
+    CHECK(icmp[0] == 1 && icmp[1] == 4);
+    CHECK(csum_sum6(ip + 8, ip + 24, 58, icmp, icmp_len) == 0xffff);
+    CHECK(memcmp(ip + 8, addr_b.b, NS_ADDR_LEN) == 0);
+    CHECK(memcmp(ip + 24, addr_a.b, NS_ADDR_LEN) == 0);
+
+    /* The original packet fits well below the 1280-byte minimum MTU. */
+    quote = icmp + 8;
+    quote_len = icmp_len - 8;
+    CHECK(quote_len == V6_HDR + UDP_HDR + 6);
+    CHECK((quote[0] >> 4) == 6);
+    CHECK(quote[6] == 17);
+    CHECK(memcmp(quote + 8, addr_a.b, NS_ADDR_LEN) == 0);
+    CHECK(memcmp(quote + 24, addr_b.b, NS_ADDR_LEN) == 0);
+    CHECK(((quote[40] << 8) | quote[41]) == aport);
+    CHECK(((quote[42] << 8) | quote[43]) == 9999);
+
+    CHECK(ns_udp_close(l.a, u) == 0);
+    free_pair(&l);
+}
+
+static void test_icmp_suppression(void)
+{
+    Link l;
+    NsAddr local_a, local_b, mcast, bcast;
+    const uint8_t payload[1] = { 'x' };
+
+    make_plain_pair(&l, &local_a, &local_b);
+    set_addr4(&mcast, 224, 0, 0, 1);
+    set_addr4(&bcast, 255, 255, 255, 255);
+
+    /* A request from a multicast source must not be answered. */
+    CHECK(ns_icmp_echo(l.a, &mcast, &local_b, 1, 1, payload, 1) == 0);
+    pump(&l, 10);
+    CHECK(ns_stats(l.b)->icmp_rx == 1);
+    CHECK(ns_stats(l.b)->icmp_tx == 0);
+
+    /* Nor must a request sent to a broadcast destination. */
+    CHECK(ns_icmp_echo(l.a, &local_a, &bcast, 2, 2, payload, 1) == 0);
+    pump(&l, 10);
+    CHECK(ns_stats(l.b)->icmp_rx == 2);
+    CHECK(ns_stats(l.b)->icmp_tx == 0);
+
+    free_pair(&l);
+}
+
 int main(void)
 {
     test_addressing();
@@ -848,6 +1136,11 @@ int main(void)
     test_udp_connected_ipv4();
     test_udp_bind_rules();
     test_udp_ipv6();
+    test_icmp_echo_ipv4();
+    test_icmp_echo_ipv6();
+    test_icmp_port_unreachable_ipv4();
+    test_icmp_port_unreachable_ipv6();
+    test_icmp_suppression();
 
     if (failures) {
         fprintf(stderr, "netstack: %d check(s) failed\n", failures);

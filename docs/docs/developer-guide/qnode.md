@@ -10,10 +10,10 @@ changes.
 |---|---|
 | `qnode.c` | CLI entry point: runtime/context setup, argument parsing, event loop drain |
 | `node.c` | Native layer: filesystem, sockets, DNS, child processes, zlib, TLS, crypto, module loading |
-| `node_netstack.c` | Virtual-fd bridge between `node.c` sockets and the owned TCP/UDP stack |
+| `node_netstack.c` | Virtual-fd bridge between `node.c` sockets and the owned TCP/UDP/ICMP stack |
 | `node.h` | Entry points used by `qnode.c` and the worker hook |
 | `bootstrap/` | Node compatibility layer, split into ordered parts |
-| `netstack.c` | Owned IPv4/IPv6 TCP and UDP engine (no kernel sockets) |
+| `netstack.c` | Owned IPv4/IPv6 TCP, UDP and ICMP engine (no kernel sockets) |
 | `netstack_link.c` | Loopback and Linux TUN links for the owned stack |
 | `vendor/` | zlib, mbedTLS, libsodium, libev, wasm3 |
 | `tests/` | Test262-compatible tests plus qnode-only tests |
@@ -67,12 +67,14 @@ that may be strings, `Buffer`s, typed arrays or `ArrayBuffer`s.
 - **Kernel sockets** for `netstack: false`, unmanaged addresses, and the
   sharded TCP transport (`subnet`/`shards`). This is the existing path and
   remains fully interoperable with the host.
-- **Owned TCP and UDP** for IPv4 and IPv6 sockets inside the managed prefixes
-  (default `10.254.0.0/16` and `fd00:dead:beef:99::/64`). `native.socket()`
-  returns an `eventfd`-backed virtual fd; `node_netstack.c` implements the
-  socket operations on top of `netstack.c`, and the real eventfd is what libev
-  polls. UDP adds `sendto`/`recvfrom`/`disconnect` natives and shares the
-  virtual-fd bridge with streams.
+- **Owned TCP, UDP and ICMP** for IPv4 and IPv6 sockets inside the managed
+  prefixes (default `10.254.0.0/16` and `fd00:dead:beef:99::/64`).
+  `native.socket()` returns an `eventfd`-backed virtual fd; `node_netstack.c`
+  implements the socket operations on top of `netstack.c`, and the real
+  eventfd is what libev polls. UDP adds `sendto`/`recvfrom`/`disconnect`
+  natives and shares the virtual-fd bridge with streams. ICMP answers echo
+  requests and generates port-unreachable errors for unmatched UDP datagrams;
+  it has no JavaScript API and is driven by packets arriving on the link.
 
 When a virtual socket binds, connects or sends to an address outside the
 managed prefix, the bridge creates a kernel socket, `dup2`s it onto the same
@@ -135,7 +137,7 @@ Concurrent TLS use from multiple workers is not safe yet. Crypto RNG state
 ```bash
 make test              # upstream quickjs-ng suite (qjs)
 make qnode-test        # qnode-only tests (crypto, workers, fetch, modules, net, dgram, WebSocket)
-make netstack-test     # owned TCP/UDP engine in isolation
+make netstack-test     # owned TCP/UDP/ICMP engine in isolation
 make netstack-tun-test # optional TUN path (skips without user namespaces)
 ```
 

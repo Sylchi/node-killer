@@ -16,6 +16,7 @@
 #define NS_IPV6_HDR 40
 #define NS_TCP_HDR 20
 #define NS_UDP_HDR 8
+#define NS_ICMP_HDR 8
 #define NS_MTU 1500
 #define NS_MSS 1400
 #define NS_RTO_MS 200
@@ -316,6 +317,20 @@ static int addr_unspecified(const NsAddr *a)
         if (a->b[i])
             return 0;
     return 1;
+}
+
+static int addr_multicast(const NsAddr *a)
+{
+    if (ns_addr_family(a) == NS_AF_INET)
+        return (a->b[0] & 0xf0) == 0xe0;
+    return a->b[0] == 0xff;
+}
+
+static int addr_broadcast(const NsAddr *a)
+{
+    return ns_addr_family(a) == NS_AF_INET &&
+           a->b[0] == 255 && a->b[1] == 255 && a->b[2] == 255 &&
+           a->b[3] == 255;
 }
 
 static int is_service_addr(const NsAddr *a)
@@ -931,6 +946,194 @@ static NsConn *server_accept_syn(NsShard *sh, const NsAddr *src,
     return c;
 }
 
+/* ---------------- ICMP ---------------- */
+
+/* Never answer a packet whose source is not a unicast address, and never
+   send an error about a multicast, broadcast or unspecified destination. */
+static int icmp_can_reply(const NsAddr *src, const NsAddr *dst)
+{
+    return !addr_unspecified(src) && !addr_multicast(src) &&
+           !addr_broadcast(src) && !addr_unspecified(dst) &&
+           !addr_multicast(dst) && !addr_broadcast(dst);
+}
+
+static int icmp_emit(NsStack *s, const NsAddr *src, const NsAddr *dst,
+                     uint8_t *msg, size_t len)
+{
+    uint8_t pkt[NS_MAX_PACKET];
+    int family = ns_addr_family(dst);
+    size_t ip_hdr = family == NS_AF_INET ? NS_IPV4_HDR : NS_IPV6_HDR;
+    size_t total = ip_hdr + len;
+
+    if (!s->send || family != ns_addr_family(src) || len < NS_ICMP_HDR ||
+        total > NS_MTU || total > sizeof(pkt))
+        return -NS_EMSGSIZE;
+
+    wr16(msg + 2, 0);
+    if (family == NS_AF_INET) {
+        memset(pkt, 0, NS_IPV4_HDR);
+        pkt[0] = 0x45;
+        wr16(pkt + 2, (uint16_t)total);
+        wr16(pkt + 4, ++s->ip_id);
+        pkt[8] = 64; /* TTL */
+        pkt[9] = 1;  /* ICMP */
+        memcpy(pkt + 12, src->b, 4);
+        memcpy(pkt + 16, dst->b, 4);
+        wr16(pkt + 10, ipv4_checksum(pkt, NS_IPV4_HDR));
+        wr16(msg + 2, ipv4_checksum(msg, len));
+    } else {
+        memset(pkt, 0, NS_IPV6_HDR);
+        pkt[0] = 0x60;
+        wr16(pkt + 4, (uint16_t)len);
+        pkt[6] = 58; /* ICMPv6 */
+        pkt[7] = 64; /* hop limit */
+        memcpy(pkt + 8, src->b, 16);
+        memcpy(pkt + 24, dst->b, 16);
+        wr16(msg + 2, l4_checksum(src->b, dst->b, family, 58, msg, len));
+    }
+    memcpy(pkt + ip_hdr, msg, len);
+
+    s->stats.tx_packets++;
+    s->stats.icmp_tx++;
+    s->send(s, pkt, total, s->opaque);
+    return 0;
+}
+
+/* Answer an echo request from the address the request was sent to. */
+static void icmp_input(NsShard *sh, const uint8_t *pkt, size_t len)
+{
+    NsStack *s = sh->stack;
+    int family = (pkt[0] >> 4) == 4 ? NS_AF_INET : NS_AF_INET6;
+    size_t ip_hdr = family == NS_AF_INET
+                        ? (size_t)(pkt[0] & 0x0f) * 4 : NS_IPV6_HDR;
+    size_t addr_len = family == NS_AF_INET ? 4 : 16;
+    const uint8_t *icmp;
+    size_t icmp_len;
+    NsAddr sa, da;
+
+    if (len < ip_hdr + NS_ICMP_HDR) {
+        s->stats.dropped++;
+        return;
+    }
+    icmp = pkt + ip_hdr;
+    icmp_len = len - ip_hdr;
+    if (family == NS_AF_INET) {
+        if (ipv4_checksum(icmp, icmp_len) != 0) {
+            s->stats.dropped++;
+            return;
+        }
+    } else if (l4_checksum(pkt + 8, pkt + 24, family, 58, icmp,
+                           icmp_len) != 0) {
+        s->stats.dropped++;
+        return;
+    }
+    s->stats.icmp_rx++;
+
+    memset(&sa, 0, sizeof(sa));
+    memset(&da, 0, sizeof(da));
+    sa.family = da.family = (uint8_t)family;
+    memcpy(sa.b, family == NS_AF_INET ? pkt + 12 : pkt + 8, addr_len);
+    memcpy(da.b, family == NS_AF_INET ? pkt + 16 : pkt + 24, addr_len);
+
+    if ((family == NS_AF_INET && icmp[0] == 8 && icmp[1] == 0) ||
+        (family == NS_AF_INET6 && icmp[0] == 128 && icmp[1] == 0)) {
+        uint8_t *reply;
+        int r;
+
+        if (!icmp_can_reply(&sa, &da))
+            return;
+        reply = malloc(icmp_len);
+        if (!reply) {
+            s->stats.dropped++;
+            return;
+        }
+        memcpy(reply, icmp, icmp_len);
+        reply[0] = family == NS_AF_INET ? 0 : 129;
+        reply[1] = 0;
+        r = icmp_emit(s, &da, &sa, reply, icmp_len);
+        free(reply);
+        if (r < 0)
+            s->stats.dropped++;
+    }
+}
+
+/* Build an ICMP/ICMPv6 error quoting the packet that triggered it. */
+static void icmp_send_error(NsShard *sh, const uint8_t *pkt, size_t len,
+                            uint8_t type, uint8_t code)
+{
+    NsStack *s = sh->stack;
+    uint8_t msg[NS_MAX_PACKET];
+    int family = (pkt[0] >> 4) == 4 ? NS_AF_INET : NS_AF_INET6;
+    size_t ip_hdr = family == NS_AF_INET
+                        ? (size_t)(pkt[0] & 0x0f) * 4 : NS_IPV6_HDR;
+    size_t addr_len = family == NS_AF_INET ? 4 : 16;
+    size_t quote_len = len;
+    size_t msg_len;
+    NsAddr src, dst;
+
+    if (len <= ip_hdr)
+        return;
+    memset(&src, 0, sizeof(src));
+    memset(&dst, 0, sizeof(dst));
+    src.family = dst.family = (uint8_t)family;
+    memcpy(src.b, family == NS_AF_INET ? pkt + 12 : pkt + 8, addr_len);
+    memcpy(dst.b, family == NS_AF_INET ? pkt + 16 : pkt + 24, addr_len);
+    if (!icmp_can_reply(&src, &dst))
+        return;
+
+    if (family == NS_AF_INET) {
+        /* RFC 792: internet header plus 64 bits of the original data. */
+        if (quote_len > ip_hdr + NS_UDP_HDR)
+            quote_len = ip_hdr + NS_UDP_HDR;
+    } else {
+        /* RFC 4443: keep the error within the minimum IPv6 MTU. */
+        size_t max_quote = 1280 - NS_IPV6_HDR - NS_ICMP_HDR;
+        if (quote_len > max_quote)
+            quote_len = max_quote;
+    }
+    if (quote_len < ip_hdr || quote_len > NS_MAX_PACKET - NS_ICMP_HDR)
+        return;
+    msg_len = NS_ICMP_HDR + quote_len;
+    memset(msg, 0, NS_ICMP_HDR);
+    msg[0] = type;
+    msg[1] = code;
+    memcpy(msg + NS_ICMP_HDR, pkt, quote_len);
+    icmp_emit(s, &dst, &src, msg, msg_len);
+}
+
+static void icmp_port_unreachable(NsShard *sh, const uint8_t *pkt, size_t len)
+{
+    if ((pkt[0] >> 4) == 4)
+        icmp_send_error(sh, pkt, len, 3, 3);
+    else
+        icmp_send_error(sh, pkt, len, 1, 4);
+}
+
+int ns_icmp_echo(NsStack *s, const NsAddr *local, const NsAddr *remote,
+                 uint16_t id, uint16_t seq, const void *payload, size_t len)
+{
+    uint8_t msg[NS_MAX_PACKET];
+    int family;
+    size_t total;
+
+    if (!s || !local || !remote)
+        return -NS_EINVAL;
+    family = ns_addr_family(remote);
+    if (family != ns_addr_family(local))
+        return -NS_EINVAL;
+    total = NS_ICMP_HDR + len;
+    if (total > sizeof(msg))
+        return -NS_EMSGSIZE;
+    memset(msg, 0, NS_ICMP_HDR);
+    msg[0] = family == NS_AF_INET ? 8 : 128;
+    msg[1] = 0;
+    wr16(msg + 4, id);
+    wr16(msg + 6, seq);
+    if (len)
+        memcpy(msg + NS_ICMP_HDR, payload, len);
+    return icmp_emit(s, local, remote, msg, total);
+}
+
 /* ---------------- UDP ---------------- */
 
 static void udp_free(NsUdp *u)
@@ -1325,6 +1528,8 @@ static void udp_input(NsShard *sh, const uint8_t *pkt, size_t len)
 
     u = udp_find(s, &da, dport, &sa, sport);
     if (!u) {
+        /* No listener: tell the sender with an ICMP error. */
+        icmp_port_unreachable(sh, pkt, len);
         s->stats.dropped++;
         return;
     }
@@ -1380,6 +1585,10 @@ static void shard_process(NsShard *sh, NsPacket *p)
        after this check, since a short datagram may end before tcp[12]. */
     if (proto == 17) {
         udp_input(sh, pkt, p->len);
+        return;
+    }
+    if (proto == 1 || proto == 58) {
+        icmp_input(sh, pkt, p->len);
         return;
     }
 
@@ -1493,7 +1702,7 @@ void ns_input(NsStack *s, const uint8_t *pkt, size_t len)
             return;
         }
         proto = pkt[9];
-        if (proto != 6 && proto != 17) {
+        if (proto != 1 && proto != 6 && proto != 17) {
             s->stats.dropped++;
             return;
         }
@@ -1535,11 +1744,12 @@ void ns_input(NsStack *s, const uint8_t *pkt, size_t len)
             return;
         }
         proto = pkt[6];
-        if (proto != 6 && proto != 17) {
+        if (proto != 6 && proto != 17 && proto != 58) {
             s->stats.dropped++;
             return;
         }
-        min_hdr = proto == 6 ? NS_TCP_HDR : NS_UDP_HDR;
+        min_hdr = proto == 6 ? NS_TCP_HDR
+                            : proto == 17 ? NS_UDP_HDR : NS_ICMP_HDR;
         if (len < NS_IPV6_HDR + min_hdr) {
             s->stats.dropped++;
             return;
@@ -1585,6 +1795,13 @@ void ns_input(NsStack *s, const uint8_t *pkt, size_t len)
                 return;
             }
         } else if (l4_checksum(src, dst, family, 17, l4, l4_len) != 0) {
+            s->stats.dropped++;
+            return;
+        }
+    } else if (proto == 1 || proto == 58) {
+        /* ICMP checksums are verified in icmp_input(), which has the
+           addresses needed for the ICMPv6 pseudo-header. */
+        if (l4_len < NS_ICMP_HDR) {
             s->stats.dropped++;
             return;
         }

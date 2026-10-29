@@ -137,12 +137,27 @@ unshare -rn sh -c '
   rcu6=$?
   "$QNODE" "$1/client4udp.js"
   rcu4=$?
+
+  if command -v ping >/dev/null 2>&1; then
+    ping -c 2 -w 5 -4 10.254.0.1 >"$1/ping4.out" 2>&1
+    rcp4=$?
+    ping -c 2 -w 5 -6 fd00:dead:beef:99::1 >"$1/ping6.out" 2>&1
+    rcp6=$?
+  else
+    rcp4=0
+    rcp6=0
+    echo "netstack_tun: ping not found, skipping ICMP echo checks"
+  fi
+
   kill $spid 2>/dev/null
   wait $spid 2>/dev/null
   [ "$rc6" -ne 0 ] && exit $rc6
   [ "$rc4" -ne 0 ] && exit $rc4
   [ "$rcu6" -ne 0 ] && exit $rcu6
-  exit $rcu4
+  [ "$rcu4" -ne 0 ] && exit $rcu4
+  [ "$rcp4" -ne 0 ] && { cat "$1/ping4.out"; exit $rcp4; }
+  [ "$rcp6" -ne 0 ] && { cat "$1/ping6.out"; exit $rcp6; }
+  exit 0
 ' sh "$tmp"
 rc=$?
 set -e
