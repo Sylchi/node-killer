@@ -81,6 +81,7 @@ static int ns_prefix4_len = 16;
 static int ns_prefix6_len = 64;
 
 static Vfd vfds[VFD_MAX];
+static void qn_unused_vfds(void){ (void)vfds; }
 
 static uint64_t now_ms(void)
 {
@@ -319,7 +320,48 @@ static int ns_init(void)
     ns_tried = 1;
 
 #if defined(QNODE_FREESTANDING)
-    /* keep loopback only, no TUN/TAP */
+    if (parse_prefix(ns_prefix_text, prefix, &ns_prefix6_len) < 0)
+        return -1;
+    if (parse_prefix4(ns_prefix4_text, ns_prefix4, &ns_prefix4_len) < 0)
+        return -1;
+    memset(&gw4, 0, sizeof(gw4));
+    memset(&gw6, 0, sizeof(gw6));
+
+    memset(&local6, 0, sizeof(local6));
+    local6.family = NS_AF_INET6;
+    memcpy(local6.b, prefix, NS_PREFIX_LEN);
+    local6.b[15] = 1;
+
+    memset(&local4, 0, sizeof(local4));
+    local4.family = NS_AF_INET;
+    {
+        int i;
+        for (i = 0; i < 4; i++) {
+            int bits = ns_prefix4_len - i * 8;
+            uint8_t mask = bits >= 8 ? 0xff
+                           : bits <= 0 ? 0
+                           : (uint8_t)(0xff << (8 - bits));
+            local4.b[i] = (uint8_t)(ns_prefix4[i] & mask);
+        }
+        if (ns_prefix4_len < 32)
+            local4.b[3] |= 1;
+    }
+
+    ns_stack = ns_stack_new(prefix, 1, NULL, NULL);
+    if (!ns_stack)
+        return -1;
+    ns_stack_set_plain(ns_stack, &local6);
+    ns_stack_set_plain(ns_stack, &local4);
+
+    ns_link = ns_link_new(ns_stack, NS_LINK_LOOPBACK, NULL, mac);
+    if (!ns_link) {
+        ns_stack_free(ns_stack);
+        ns_stack = NULL;
+        return -1;
+    }
+    ns_link_attach(ns_link);
+    ns_ready = 1;
+    return 0;
 #else
 #ifndef __linux__
     return -1;
@@ -358,13 +400,12 @@ static int ns_init(void)
     memset(&local6, 0, sizeof(local6));
     local6.family = NS_AF_INET6;
     memcpy(local6.b, prefix, NS_PREFIX_LEN);
-    local6.b[15] = 1; /* the stack's stable IPv6 local address */
+    local6.b[15] = 1;
 
     memset(&local4, 0, sizeof(local4));
     local4.family = NS_AF_INET;
     {
         int i;
-        /* Use the first host address in the managed network. */
         for (i = 0; i < 4; i++) {
             int bits = ns_prefix4_len - i * 8;
             uint8_t mask = bits >= 8 ? 0xff
@@ -437,6 +478,7 @@ static int ns_init(void)
 #endif
 #endif
 }
+
 
 int node_netstack_info(char *addr, size_t addrlen, char *addr4, size_t addr4len,
                        const char **link)
