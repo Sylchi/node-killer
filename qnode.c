@@ -225,6 +225,9 @@ int main(int argc, char **argv)
 
     memset(&q, 0, sizeof(q));
 
+    /* Worker threads re-enter the qnode bootstrap through this hook. */
+    js_node_install_worker_hooks();
+
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         if (!strcmp(a, "--version") || !strcmp(a, "-v")) {

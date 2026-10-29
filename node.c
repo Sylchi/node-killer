@@ -2676,6 +2676,18 @@ static JSValue js_node_digest(JSContext *ctx, JSValueConst this_val,
 
 /* ---------------- native object ---------------- */
 
+/* Request that the current worker stop its event loop. Unlike qjsstd.exit()
+   this never terminates the whole process. */
+static JSValue js_node_worker_exit(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv)
+{
+    int32_t code = 0;
+    if (argc > 0 && !JS_IsUndefined(argv[0]))
+        JS_ToInt32(ctx, &code, argv[0]);
+    js_std_worker_request_exit(ctx, code);
+    return JS_UNDEFINED;
+}
+
 static const JSCFunctionListEntry js_node_funcs[] = {
     JS_CFUNC_DEF("getpid", 0, js_node_getpid),
     JS_CFUNC_DEF("getppid", 0, js_node_getppid),
@@ -2763,6 +2775,7 @@ static const JSCFunctionListEntry js_node_funcs[] = {
     JS_CFUNC_DEF("tlsPeerCert", 1, js_node_tls_peer_cert),
     JS_CFUNC_DEF("tlsInfo", 1, js_node_tls_info),
     JS_CFUNC_DEF("digest", 2, js_node_digest),
+    JS_CFUNC_DEF("workerExit", 1, js_node_worker_exit),
 };
 
 /* ---------------- module loading ---------------- */
@@ -3154,6 +3167,68 @@ int js_node_start(JSContext *ctx)
     }
     JS_FreeValue(ctx, ret);
     return 0;
+}
+
+static void node_worker_rejection_tracker(JSContext *ctx,
+                                          JSValueConst promise,
+                                          JSValueConst reason,
+                                          bool is_handled, void *opaque)
+{
+    JSValue global, fn, args[3], r;
+    (void)opaque;
+    global = JS_GetGlobalObject(ctx);
+    fn = JS_GetPropertyStr(ctx, global, "__qnode_track_rejection");
+    if (JS_IsFunction(ctx, fn)) {
+        args[0] = JS_DupValue(ctx, promise);
+        args[1] = JS_DupValue(ctx, reason);
+        args[2] = JS_NewBool(ctx, is_handled);
+        r = JS_Call(ctx, fn, JS_UNDEFINED, 3, args);
+        if (JS_IsException(r))
+            JS_FreeValue(ctx, JS_GetException(ctx));
+        JS_FreeValue(ctx, r);
+        JS_FreeValue(ctx, args[0]);
+        JS_FreeValue(ctx, args[1]);
+        JS_FreeValue(ctx, args[2]);
+    }
+    JS_FreeValue(ctx, fn);
+    JS_FreeValue(ctx, global);
+}
+
+/* Worker start hook: install the qnode runtime pieces, publish the startup
+   value and evaluate the regular bootstrap. The bootstrap detects worker
+   mode and imports the user script itself. */
+static void node_worker_start_func(JSContext *ctx, const char *basename,
+                                   const char *filename, void *opaque)
+{
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    JSValue startup, global;
+    (void)basename;
+    (void)opaque;
+
+    JS_SetMaxStackSize(rt, 2 << 20);
+    JS_SetHostPromiseRejectionTracker(rt, node_worker_rejection_tracker, NULL);
+
+    if (js_node_init(ctx, rt) < 0)
+        return;
+
+    startup = js_std_worker_startup(ctx);
+    if (JS_IsException(startup)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        startup = JS_UNDEFINED;
+    }
+    global = JS_GetGlobalObject(ctx);
+    JS_SetPropertyStr(ctx, global, "__qnode_worker_startup", startup);
+    JS_SetPropertyStr(ctx, global, "__qnode_worker_filename",
+                      JS_NewString(ctx, filename ? filename : ""));
+    JS_SetPropertyStr(ctx, global, "__qnode_worker_mode", JS_TRUE);
+    JS_FreeValue(ctx, global);
+
+    js_node_start(ctx);
+}
+
+void js_node_install_worker_hooks(void)
+{
+    js_std_set_worker_start_func(node_worker_start_func, NULL);
 }
 
 JSValue js_node_run_main(JSContext *ctx, const char *path)

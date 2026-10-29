@@ -2906,7 +2906,13 @@ process.dlopen = function() {
   throw new Error("Native addons are not supported");
 };
 process._linkedBinding = process.binding;
-process.reallyExit = function(code) { qjsstd.exit(code || 0); };
+process.reallyExit = function(code) {
+  if (__qnode_worker_mode) {
+    native.workerExit(code || 0);
+    return;
+  }
+  qjsstd.exit(code || 0);
+};
 process.abort = function() { native.abort(); };
 process.exit = function(code) {
   if (code !== undefined)
@@ -2914,6 +2920,10 @@ process.exit = function(code) {
   const c = process.exitCode === undefined ? 0 : process.exitCode;
   for (const fn of process.listeners("exit")) {
     try { fn(c); } catch (e) { /* ignore */ }
+  }
+  if (__qnode_worker_mode) {
+    native.workerExit(typeof c === "number" ? c : 0);
+    return;
   }
   qjsstd.exit(typeof c === "number" ? c : 0);
 };
@@ -7099,17 +7109,234 @@ function runInSandbox(code, sandbox, filename) {
   return fn(...values);
 }
 
-const worker_threads = {
-  isMainThread: true,
-  parentPort: null,
-  workerData: null,
-  threadId: 0,
-  Worker: class Worker extends EventEmitter {
-    constructor() {
-      super();
-      throw new Error("worker_threads are not supported yet");
-    }
+/* Worker threads run the qnode bootstrap in a fresh qjs runtime. The C side
+ * passes a startup value through os.Worker; the bootstrap then imports the
+ * user script once the worker globals are in place. */
+const __qnode_worker_mode = !!globalThis.__qnode_worker_mode;
+const __qnode_worker_startup = __qnode_worker_mode
+  ? (globalThis.__qnode_worker_startup || null) : null;
+const __qnode_is_main_thread = !__qnode_worker_mode;
+const __qnode_raw_parent = (!__qnode_is_main_thread && qjsos.Worker)
+  ? qjsos.Worker.parent : null;
+let __qnode_next_thread_id = 1;
+const __qnode_environment_data = new Map();
+
+function getEnvironmentData(key) {
+  return __qnode_environment_data.get(key);
+}
+function setEnvironmentData(key, value) {
+  if (value === undefined)
+    __qnode_environment_data.delete(key);
+  else
+    __qnode_environment_data.set(key, value);
+}
+
+function __qnode_worker_send_control(type, fields) {
+  if (__qnode_is_main_thread || !__qnode_raw_parent)
+    return;
+  const msg = Object.assign({ __qnodeWorkerControl: type }, fields || {});
+  try { __qnode_raw_parent.postMessage(msg); } catch (e) { /* ignore */ }
+}
+
+function __qnode_worker_error_fields(err) {
+  if (err && typeof err === "object") {
+    return {
+      name: err.name || "Error",
+      message: err.message === undefined ? String(err) : String(err.message),
+      stack: err.stack ? String(err.stack) : undefined,
+    };
+  }
+  return { name: "Error", message: String(err) };
+}
+
+class WorkerParentPort extends EventEmitter {
+  constructor(raw) {
+    super();
+    this._raw = raw;
+    this._closed = false;
+    this._bound = (event) => {
+      const data = event.data;
+      if (data && typeof data === "object" &&
+          data.__qnodeWorkerControl === "terminate") {
+        process.exit(0);
+        return;
+      }
+      this.emit("message", data);
+    };
+  }
+  /* Only listen while somebody is interested in messages. A worker that
+     never touches parentPort must be able to drain and exit. Messages sent
+     before the first listener stay queued in the parent pipe. */
+  _update() {
+    if (this._closed)
+      this._raw.onmessage = null;
+    else
+      this._raw.onmessage =
+        this.listenerCount("message") > 0 ? this._bound : null;
+  }
+  on(type, fn) {
+    super.on(type, fn);
+    if (type === "message")
+      this._update();
+    return this;
+  }
+  removeListener(type, fn) {
+    super.removeListener(type, fn);
+    if (type === "message")
+      this._update();
+    return this;
+  }
+  removeAllListeners(type) {
+    super.removeAllListeners(type);
+    if (type === undefined || type === "message")
+      this._update();
+    return this;
+  }
+  postMessage(value, transferList) {
+    if (!this._closed)
+      this._raw.postMessage(value);
+  }
+  start() { this._update(); }
+  close() {
+    if (this._closed)
+      return;
+    this._closed = true;
+    this._raw.onmessage = null;
+    this.emit("close");
+  }
+  ref() { return this; }
+  unref() { return this; }
+  hasRef() { return true; }
+}
+Object.defineProperty(WorkerParentPort.prototype, "onmessage", {
+  configurable: true,
+  enumerable: true,
+  get() { return this._onmessage || null; },
+  set(fn) {
+    if (this._onmessage)
+      this.removeListener("message", this._onmessage);
+    this._onmessage = typeof fn === "function" ? fn : null;
+    if (this._onmessage)
+      this.on("message", this._onmessage);
   },
+});
+WorkerParentPort.prototype[Symbol.toStringTag] = "MessagePort";
+
+function __qnode_worker_filename(filename) {
+  if (filename && typeof filename === "object" && filename.href)
+    filename = filename.href;
+  const value = String(filename);
+  if (value.startsWith("file://")) {
+    try {
+      return decodeURIComponent(new URL(value).pathname);
+    } catch (e) { /* fall through */ }
+  }
+  return pathResolve(value);
+}
+
+class Worker extends EventEmitter {
+  constructor(filename, options) {
+    super();
+    if (!__qnode_is_main_thread)
+      throw new Error("Worker cannot be created inside a worker thread");
+    options = options || {};
+    const id = __qnode_next_thread_id++;
+    this.threadId = id;
+    this.resourceLimits = {};
+    this.stdin = options.stdin || null;
+    this.stdout = options.stdout || null;
+    this.stderr = options.stderr || null;
+    this._exited = false;
+    this._exitCode = undefined;
+    this._terminateResolve = null;
+
+    const evalMode = !!options.eval;
+    const sourceName = evalMode
+      ? "<worker-eval>" : __qnode_worker_filename(filename);
+    const startData = {
+      threadId: id,
+      filename: sourceName,
+      eval: evalMode,
+      evalSource: evalMode ? String(filename) : null,
+      workerData: options.workerData,
+      argv: Array.isArray(options.argv) ? options.argv.slice() : [],
+      environmentData: Array.from(__qnode_environment_data.entries()),
+    };
+
+    const raw = new qjsos.Worker(startData.filename, startData);
+    this._raw = raw;
+    raw.onmessage = (event) => {
+      const data = event.data;
+      if (data && typeof data === "object" &&
+          Object.prototype.hasOwnProperty.call(data, "__qnodeWorkerControl")) {
+        const type = data.__qnodeWorkerControl;
+        if (type === "exit") {
+          this._finish(data.code === undefined ? 0 : data.code | 0);
+        } else if (type === "error") {
+          const err = new Error(data.message || "Worker error");
+          err.name = data.name || "Error";
+          if (data.stack)
+            err.stack = data.stack;
+          if (!this._exited)
+            this.emit("error", err);
+        }
+        return;
+      }
+      this.emit("message", data);
+    };
+
+    process.nextTick(() => {
+      if (!this._exited)
+        this.emit("online");
+    });
+  }
+  postMessage(value, transferList) {
+    if (!this._exited)
+      this._raw.postMessage(value);
+  }
+  terminate() {
+    if (this._exited)
+      return Promise.resolve(this._exitCode);
+    this._raw.postMessage({ __qnodeWorkerControl: "terminate" });
+    return new Promise((resolve) => {
+      this._terminateResolve = resolve;
+      if (this._exited)
+        resolve(this._exitCode);
+    });
+  }
+  _finish(code) {
+    if (this._exited)
+      return;
+    this._exited = true;
+    this._exitCode = code;
+    this._raw.onmessage = null;
+    this.emit("exit", code);
+    if (this._terminateResolve) {
+      const resolve = this._terminateResolve;
+      this._terminateResolve = null;
+      resolve(code);
+    }
+  }
+  ref() { return this; }
+  unref() { return this; }
+  hasRef() { return true; }
+}
+Worker.prototype[Symbol.toStringTag] = "Worker";
+
+const worker_threads = {
+  isMainThread: __qnode_is_main_thread,
+  parentPort: (!__qnode_is_main_thread && __qnode_raw_parent)
+    ? new WorkerParentPort(__qnode_raw_parent) : null,
+  workerData: __qnode_worker_startup
+    ? __qnode_worker_startup.workerData : undefined,
+  threadId: __qnode_worker_startup ? __qnode_worker_startup.threadId : 0,
+  Worker,
+  SHARE_ENV: Symbol("worker_threads.SHARE_ENV"),
+  getEnvironmentData,
+  setEnvironmentData,
+  markAsUntransferable() {},
+  isMarkedAsUntransferable() { return false; },
+  moveMessagePortToContext(port) { return port; },
   MessageChannel: class MessageChannel {
     constructor() {
       this.port1 = { postMessage() {}, on() {}, close() {} };
@@ -10114,6 +10341,13 @@ function formatError(err) {
 }
 
 function reportError(err) {
+  if (__qnode_worker_mode) {
+    if (process.listenerCount("uncaughtException"))
+      process.emit("uncaughtException", err);
+    __qnode_worker_send_control("error", __qnode_worker_error_fields(err));
+    process.exit(1);
+    return;
+  }
   if (process.listenerCount("uncaughtException")) {
     process.emit("uncaughtException", err);
     return;
@@ -10311,4 +10545,41 @@ globalThis.__qnode_track_rejection = function(promise, reason, handled) {
   });
 };
 
+/* ------------------------------------------------------------------ */
+/* worker entry                                                       */
+/* ------------------------------------------------------------------ */
 
+async function __qnode_worker_run() {
+  const startup = __qnode_worker_startup || {};
+  const filename = String(globalThis.__qnode_worker_filename ||
+                          startup.filename || "<worker>");
+  for (const entry of startup.environmentData || [])
+    __qnode_environment_data.set(entry[0], entry[1]);
+  process.argv = [process.execPath, filename].concat(startup.argv || []);
+  process.argv0 = process.execPath;
+
+  try {
+    if (startup.eval) {
+      const dirname = process.cwd();
+      const req = makeRequire(pathJoin(dirname, "index.js"));
+      const mod = { exports: {}, id: filename, filename, loaded: false };
+      const fn = new Function("exports", "require", "module",
+                              "__filename", "__dirname",
+                              String(startup.evalSource || "") +
+                              "\n//# sourceURL=" + filename);
+      fn.call(mod.exports, mod.exports, req, mod, filename, dirname);
+      mod.loaded = true;
+    } else {
+      const kind = moduleKind(filename);
+      if (kind === "cjs" || kind === "json")
+        runMainCJS(filename);
+      else
+        await import(filename);
+    }
+  } catch (e) {
+    reportError(e);
+  }
+}
+
+if (__qnode_worker_mode)
+  __qnode_worker_run();

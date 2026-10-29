@@ -152,10 +152,14 @@ netstack-test: $(BUILD_DIR)
 	cmake --build $(BUILD_DIR) --target netstack_test
 	$(BUILD_DIR)/netstack-test
 
+worker-test: $(BUILD_DIR)
+	cmake --build $(BUILD_DIR) --target qnode_exe -j $(JOBS)
+	$(abspath $(BUILD_DIR))/qnode $(CURDIR)/tests/worker_threads.js
+
 unicode_gen: $(BUILD_DIR)
 	cmake --build $(BUILD_DIR) --target unicode_gen
 
 libunicode-table.h: unicode_gen
 	$(BUILD_DIR)/unicode_gen unicode $@
 
-.PHONY: all amalgam ctest cxxtest debug fuzz jscheck install clean codegen distclean stats test test262 test262-update test262-check microbench net-test net-bench netstack-test unicode_gen $(QJS) $(QJSC)
+.PHONY: all amalgam ctest cxxtest debug fuzz jscheck install clean codegen distclean stats test test262 test262-update test262-check microbench net-test net-bench netstack-test worker-test unicode_gen $(QJS) $(QJSC)

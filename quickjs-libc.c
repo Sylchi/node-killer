@@ -224,6 +224,18 @@ typedef struct JSThreadState {
     /* not used in the main thread */
 #ifdef USE_WORKER
     JSWorkerMessagePipe *recv_pipe, *send_pipe;
+    /* Startup value supplied by the parent, consumed by the worker start
+       hook. Kept here so the hook can decode it lazily in the worker
+       context. */
+    uint8_t *startup_data;
+    size_t startup_len;
+    uint8_t **startup_sab_tab;
+    size_t startup_sab_tab_len;
+    /* Set once the qnode-style worker protocol is in use. It makes the
+       worker send a final exit control message to the parent. */
+    bool worker_protocol;
+    bool worker_exit_requested;
+    int worker_exit_code;
 #else
     void *recv_pipe;
 #endif // USE_WORKER
@@ -4432,6 +4444,11 @@ typedef struct {
     char *filename; /* module filename */
     char *basename; /* module base name */
     JSWorkerMessagePipe *recv_pipe, *send_pipe;
+    /* Serialized startup value passed by the parent. */
+    uint8_t *startup_data;
+    size_t startup_len;
+    uint8_t **startup_sab_tab;
+    size_t startup_sab_tab_len;
 } WorkerFuncArgs;
 
 typedef struct {
@@ -4441,6 +4458,13 @@ typedef struct {
 
 static JSRuntime *(*js_worker_new_runtime_func)(void);
 static JSContext *(*js_worker_new_context_func)(JSRuntime *rt);
+typedef void (*JSWorkerStartFunc)(JSContext *ctx, const char *basename,
+                                  const char *filename, void *opaque);
+typedef void (*JSWorkerExitFunc)(JSContext *ctx, int exit_code, void *opaque);
+static JSWorkerStartFunc js_worker_start_func;
+static void *js_worker_start_opaque;
+static JSWorkerExitFunc js_worker_exit_func;
+static void *js_worker_exit_opaque;
 
 static int atomic_add_int(int *ptr, int v)
 {
@@ -4512,6 +4536,21 @@ static void js_free_message(JSWorkerMessage *msg)
     free(msg);
 }
 
+static void js_free_startup_data(JSThreadState *ts)
+{
+    size_t i;
+    if (!ts)
+        return;
+    for (i = 0; i < ts->startup_sab_tab_len; i++)
+        js_sab_free(NULL, ts->startup_sab_tab[i]);
+    free(ts->startup_sab_tab);
+    free(ts->startup_data);
+    ts->startup_sab_tab = NULL;
+    ts->startup_sab_tab_len = 0;
+    ts->startup_data = NULL;
+    ts->startup_len = 0;
+}
+
 static void js_free_message_pipe(JSWorkerMessagePipe *ps)
 {
     struct list_head *el, *el1;
@@ -4561,6 +4600,43 @@ static JSClassDef js_worker_class = {
     .finalizer = js_worker_finalizer,
 };
 
+static void js_std_dump_error1(JSContext *ctx, JSValueConst exception_val);
+static void js_worker_send_control(JSContext *ctx, const char *type,
+                                   int code, const char *name,
+                                   const char *message, const char *stack);
+
+static void js_worker_report_exception(JSContext *ctx)
+{
+    JSValue exc, namev, msgv, stackv;
+    const char *name = NULL, *message = NULL, *stack = NULL;
+
+    exc = JS_GetException(ctx);
+    namev = JS_GetPropertyStr(ctx, exc, "name");
+    msgv = JS_GetPropertyStr(ctx, exc, "message");
+    stackv = JS_GetPropertyStr(ctx, exc, "stack");
+    if (JS_IsString(namev))
+        name = JS_ToCString(ctx, namev);
+    if (JS_IsString(msgv))
+        message = JS_ToCString(ctx, msgv);
+    if (JS_IsString(stackv))
+        stack = JS_ToCString(ctx, stackv);
+    if (!message)
+        message = JS_ToCString(ctx, exc);
+    js_worker_send_control(ctx, "error", -1, name ? name : "Error",
+                           message ? message : "worker error", stack);
+    js_std_dump_error1(ctx, exc);
+    if (name)
+        JS_FreeCString(ctx, name);
+    if (message)
+        JS_FreeCString(ctx, message);
+    if (stack)
+        JS_FreeCString(ctx, stack);
+    JS_FreeValue(ctx, namev);
+    JS_FreeValue(ctx, msgv);
+    JS_FreeValue(ctx, stackv);
+    JS_FreeValue(ctx, exc);
+}
+
 static void worker_func(void *opaque)
 {
     JSRuntime *(*new_runtime_func)(void);
@@ -4570,6 +4646,13 @@ static void worker_func(void *opaque)
     JSThreadState *ts;
     JSContext *ctx;
     JSValue val;
+    char *filename, *basename;
+    int exit_code;
+
+    filename = args->filename;
+    basename = args->basename;
+    args->filename = NULL;
+    args->basename = NULL;
 
     new_runtime_func = js_worker_new_runtime_func;
     if (!new_runtime_func)
@@ -4587,6 +4670,14 @@ static void worker_func(void *opaque)
     ts = js_get_thread_state(rt);
     ts->recv_pipe = args->recv_pipe;
     ts->send_pipe = args->send_pipe;
+    ts->startup_data = args->startup_data;
+    ts->startup_len = args->startup_len;
+    ts->startup_sab_tab = args->startup_sab_tab;
+    ts->startup_sab_tab_len = args->startup_sab_tab_len;
+    args->startup_data = NULL;
+    args->startup_sab_tab = NULL;
+    args->startup_len = 0;
+    args->startup_sab_tab_len = 0;
 
     /* function pointer to avoid linking the whole JS_NewContext() if
        not needed */
@@ -4603,16 +4694,40 @@ static void worker_func(void *opaque)
 
     js_std_add_helpers(ctx, -1, NULL);
 
-    val = JS_LoadModule(ctx, args->basename, args->filename);
-    free(args->filename);
-    free(args->basename);
     free(args);
-    val = js_std_await(ctx, val);
-    if (JS_IsException(val))
-        js_std_dump_error(ctx);
-    JS_FreeValue(ctx, val);
+    args = NULL;
 
-    js_std_loop(ctx);
+    if (js_worker_start_func && ts->startup_data) {
+        /* The start hook takes over module loading: it installs the host
+           bootstrap, which then imports the user script. */
+        js_worker_start_func(ctx, basename ? basename : "",
+                             filename ? filename : "", js_worker_start_opaque);
+    } else {
+        val = JS_LoadModule(ctx, basename, filename);
+        val = js_std_await(ctx, val);
+        if (JS_IsException(val))
+            js_std_dump_error(ctx);
+        JS_FreeValue(ctx, val);
+    }
+    free(filename);
+    free(basename);
+
+    exit_code = js_std_loop(ctx) < 0 ? 1 : 0;
+    if (JS_HasException(ctx)) {
+        if (ts->worker_protocol)
+            js_worker_report_exception(ctx);
+        else
+            js_std_dump_error(ctx);
+        if (!ts->worker_exit_requested)
+            exit_code = 1;
+    }
+    if (ts->worker_exit_requested)
+        exit_code = ts->worker_exit_code;
+
+    if (js_worker_exit_func)
+        js_worker_exit_func(ctx, exit_code, js_worker_exit_opaque);
+    if (ts->worker_protocol)
+        js_worker_send_control(ctx, "exit", exit_code, NULL, NULL, NULL);
 
     js_std_free_handlers(rt);
     JS_FreeContext(ctx);
@@ -4663,6 +4778,10 @@ static JSValue js_worker_ctor(JSContext *ctx, JSValueConst new_target,
     int ret;
     const char *filename = NULL, *basename;
     JSAtom basename_atom;
+    uint8_t *startup_data = NULL;
+    size_t startup_len = 0;
+    JSSABTab startup_sab_tab;
+    size_t i;
 
     /* XXX: in order to avoid problems with resource liberation, we
        don't support creating workers inside workers */
@@ -4700,6 +4819,43 @@ static JSValue js_worker_ctor(JSContext *ctx, JSValueConst new_target,
     if (!args->send_pipe)
         goto oom_fail;
 
+    /* Optional startup value for the worker runtime. qnode uses it to pass
+       workerData and the filename before the worker bootstrap runs. */
+    if (argc >= 2 && !JS_IsUndefined(argv[1])) {
+        memset(&startup_sab_tab, 0, sizeof(startup_sab_tab));
+        startup_data = JS_WriteObject2(ctx, &startup_len, argv[1],
+                                       JS_WRITE_OBJ_SAB |
+                                           JS_WRITE_OBJ_REFERENCE,
+                                       &startup_sab_tab);
+        if (!startup_data)
+            goto fail;
+        args->startup_data = malloc(startup_len);
+        if (!args->startup_data) {
+            js_free(ctx, startup_data);
+            js_free(ctx, startup_sab_tab.tab);
+            goto oom_fail;
+        }
+        memcpy(args->startup_data, startup_data, startup_len);
+        args->startup_len = startup_len;
+        js_free(ctx, startup_data);
+        startup_data = NULL;
+        if (startup_sab_tab.len > 0) {
+            args->startup_sab_tab = malloc(sizeof(args->startup_sab_tab[0]) *
+                                           startup_sab_tab.len);
+            if (!args->startup_sab_tab) {
+                js_free(ctx, startup_sab_tab.tab);
+                goto oom_fail;
+            }
+            memcpy(args->startup_sab_tab, startup_sab_tab.tab,
+                   sizeof(args->startup_sab_tab[0]) * startup_sab_tab.len);
+            args->startup_sab_tab_len = startup_sab_tab.len;
+        }
+        js_free(ctx, startup_sab_tab.tab);
+        /* The worker receives its own reference to each SAB. */
+        for (i = 0; i < args->startup_sab_tab_len; i++)
+            js_sab_dup(NULL, args->startup_sab_tab[i]);
+    }
+
     obj = js_worker_ctor_internal(ctx, new_target,
                                   args->send_pipe, args->recv_pipe);
     if (JS_IsException(obj))
@@ -4721,6 +4877,10 @@ static JSValue js_worker_ctor(JSContext *ctx, JSValueConst new_target,
     if (args) {
         free(args->filename);
         free(args->basename);
+        for (i = 0; i < args->startup_sab_tab_len; i++)
+            js_sab_free(NULL, args->startup_sab_tab[i]);
+        free(args->startup_sab_tab);
+        free(args->startup_data);
         js_free_message_pipe(args->recv_pipe);
         js_free_message_pipe(args->send_pipe);
         free(args);
@@ -4729,26 +4889,19 @@ static JSValue js_worker_ctor(JSContext *ctx, JSValueConst new_target,
     return JS_EXCEPTION;
 }
 
-static JSValue js_worker_postMessage(JSContext *ctx, JSValueConst this_val,
-                                     int argc, JSValueConst *argv)
+static int js_worker_pipe_post(JSContext *ctx, JSWorkerMessagePipe *ps,
+                               JSValueConst value)
 {
-    JSRuntime *rt = JS_GetRuntime(ctx);
-    JSThreadState *ts = js_get_thread_state(rt);
-    JSWorkerData *worker = JS_GetOpaque2(ctx, this_val, ts->worker_class_id);
-    JSWorkerMessagePipe *ps;
     size_t data_len, i;
     uint8_t *data;
-    JSWorkerMessage *msg;
+    JSWorkerMessage *msg = NULL;
     JSSABTab sab_tab;
 
-    if (!worker)
-        return JS_EXCEPTION;
-
-    data = JS_WriteObject2(ctx, &data_len, argv[0],
+    data = JS_WriteObject2(ctx, &data_len, value,
                            JS_WRITE_OBJ_SAB | JS_WRITE_OBJ_REFERENCE,
                            &sab_tab);
     if (!data)
-        return JS_EXCEPTION;
+        return -1;
 
     msg = malloc(sizeof(*msg));
     if (!msg)
@@ -4779,14 +4932,13 @@ static JSValue js_worker_postMessage(JSContext *ctx, JSValueConst this_val,
         js_sab_dup(NULL, msg->sab_tab[i]);
     }
 
-    ps = worker->send_pipe;
     js_mutex_lock(&ps->mutex);
     /* indicate that data is present */
     if (list_empty(&ps->msg_queue))
         js_waker_signal(&ps->waker);
     list_add_tail(&msg->link, &ps->msg_queue);
     js_mutex_unlock(&ps->mutex);
-    return JS_UNDEFINED;
+    return 0;
  fail:
     if (msg) {
         free(msg->data);
@@ -4795,8 +4947,49 @@ static JSValue js_worker_postMessage(JSContext *ctx, JSValueConst this_val,
     }
     js_free(ctx, data);
     js_free(ctx, sab_tab.tab);
-    return JS_EXCEPTION;
+    return -1;
+}
 
+static void js_worker_send_control(JSContext *ctx, const char *type,
+                                   int code, const char *name,
+                                   const char *message, const char *stack)
+{
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    JSThreadState *ts = js_get_thread_state(rt);
+    JSValue obj;
+
+    if (!ts->send_pipe)
+        return;
+    obj = JS_NewObject(ctx);
+    if (JS_IsException(obj))
+        return;
+    JS_SetPropertyStr(ctx, obj, "__qnodeWorkerControl",
+                      JS_NewString(ctx, type));
+    if (code >= 0)
+        JS_SetPropertyStr(ctx, obj, "code", JS_NewInt32(ctx, code));
+    if (name)
+        JS_SetPropertyStr(ctx, obj, "name", JS_NewString(ctx, name));
+    if (message)
+        JS_SetPropertyStr(ctx, obj, "message", JS_NewString(ctx, message));
+    if (stack)
+        JS_SetPropertyStr(ctx, obj, "stack", JS_NewString(ctx, stack));
+    if (js_worker_pipe_post(ctx, ts->send_pipe, obj) < 0)
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    JS_FreeValue(ctx, obj);
+}
+
+static JSValue js_worker_postMessage(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv)
+{
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    JSThreadState *ts = js_get_thread_state(rt);
+    JSWorkerData *worker = JS_GetOpaque2(ctx, this_val, ts->worker_class_id);
+
+    if (!worker)
+        return JS_EXCEPTION;
+    if (js_worker_pipe_post(ctx, worker->send_pipe, argv[0]) < 0)
+        return JS_EXCEPTION;
+    return JS_UNDEFINED;
 }
 
 static JSValue js_worker_set_onmessage(JSContext *ctx, JSValueConst this_val,
@@ -4868,6 +5061,70 @@ void js_std_set_worker_new_context_func(JSContext *(*func)(JSRuntime *rt))
 {
 #ifdef USE_WORKER
     js_worker_new_context_func = func;
+#endif
+}
+
+void js_std_set_worker_start_func(void (*func)(JSContext *ctx,
+                                               const char *basename,
+                                               const char *filename,
+                                               void *opaque),
+                                  void *opaque)
+{
+#ifdef USE_WORKER
+    js_worker_start_func = func;
+    js_worker_start_opaque = opaque;
+#endif
+}
+
+void js_std_set_worker_exit_func(void (*func)(JSContext *ctx, int exit_code,
+                                              void *opaque),
+                                 void *opaque)
+{
+#ifdef USE_WORKER
+    js_worker_exit_func = func;
+    js_worker_exit_opaque = opaque;
+#endif
+}
+
+/* Decode the startup value supplied to the worker constructor. The caller
+   owns the returned value. Returns JS_UNDEFINED when no startup value was
+   given. */
+JSValue js_std_worker_startup(JSContext *ctx)
+{
+#ifdef USE_WORKER
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    JSThreadState *ts = js_get_thread_state(rt);
+    JSValue val;
+
+    if (!ts->startup_data)
+        return JS_UNDEFINED;
+    val = JS_ReadObject(ctx, ts->startup_data, ts->startup_len,
+                        JS_READ_OBJ_SAB | JS_READ_OBJ_REFERENCE);
+    js_free_startup_data(ts);
+    ts->worker_protocol = true;
+    return val;
+#else
+    return JS_UNDEFINED;
+#endif
+}
+
+void js_std_worker_request_exit(JSContext *ctx, int code)
+{
+#ifdef USE_WORKER
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    JSThreadState *ts = js_get_thread_state(rt);
+    ts->worker_exit_requested = true;
+    ts->worker_exit_code = code;
+#endif
+}
+
+void js_std_worker_post_message(JSContext *ctx, JSValueConst value)
+{
+#ifdef USE_WORKER
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    JSThreadState *ts = js_get_thread_state(rt);
+    if (ts->send_pipe && js_worker_pipe_post(ctx, ts->send_pipe, value) < 0)
+        JS_FreeValue(ctx, JS_GetException(ctx));
 #endif
 }
 
@@ -5212,6 +5469,7 @@ void js_std_free_handlers(JSRuntime *rt)
 
 #ifdef USE_WORKER
     /* XXX: free port_list ? */
+    js_free_startup_data(ts);
     js_free_message_pipe(ts->recv_pipe);
     js_free_message_pipe(ts->send_pipe);
 #endif
@@ -5354,6 +5612,10 @@ int js_std_loop(JSContext *ctx)
     int err;
 
     for(;;) {
+#ifdef USE_WORKER
+        if (ts->worker_exit_requested)
+            break;
+#endif
         /* execute the pending jobs */
         for(;;) {
             err = JS_ExecutePendingJob(JS_GetRuntime(ctx), &ctx1);
@@ -5382,6 +5644,10 @@ int js_std_has_pending(JSContext *ctx)
     JSOSRWHandler *rh;
     struct list_head *el;
 
+#ifdef USE_WORKER
+    if (ts->worker_exit_requested)
+        return 0;
+#endif
     if (JS_IsJobPending(rt))
         return 1;
     if (!list_empty(&ts->os_timers))
@@ -5446,6 +5712,12 @@ JSValue js_std_await(JSContext *ctx, JSValue obj)
     int state;
 
     for(;;) {
+#ifdef USE_WORKER
+        if (ts->worker_exit_requested) {
+            JS_FreeValue(ctx, obj);
+            return JS_UNDEFINED;
+        }
+#endif
         state = JS_PromiseState(ctx, obj);
         if (state == JS_PROMISE_FULFILLED) {
             ret = JS_PromiseResult(ctx, obj);

@@ -80,6 +80,28 @@ JS_LIBC_EXTERN void js_std_set_worker_new_runtime_func(JSRuntime *(*func)(void))
 // Defaults to JS_NewContext, no-op if compiled without worker support.
 // Call before creating the first worker thread.
 JS_LIBC_EXTERN void js_std_set_worker_new_context_func(JSContext *(*func)(JSRuntime *rt));
+// Optional worker start hook. When set, the hook replaces the default
+// JS_LoadModule() call and is responsible for running the worker entry code.
+// Call before creating the first worker thread.
+JS_LIBC_EXTERN void js_std_set_worker_start_func(void (*func)(JSContext *ctx,
+                                                              const char *basename,
+                                                              const char *filename,
+                                                              void *opaque),
+                                                 void *opaque);
+// Optional worker exit hook, invoked after the worker event loop drains.
+JS_LIBC_EXTERN void js_std_set_worker_exit_func(void (*func)(JSContext *ctx,
+                                                             int exit_code,
+                                                             void *opaque),
+                                                void *opaque);
+// Decode the startup value passed to the worker constructor. Consumes and
+// frees the serialized copy. Returns JS_UNDEFINED when none was supplied.
+JS_LIBC_EXTERN JSValue js_std_worker_startup(JSContext *ctx);
+// Request that a worker event loop stop after the current callback. The code
+// is reported to the parent when the worker exits.
+JS_LIBC_EXTERN void js_std_worker_request_exit(JSContext *ctx, int code);
+// Post a structured-clone message to the parent worker endpoint.
+JS_LIBC_EXTERN void js_std_worker_post_message(JSContext *ctx,
+                                               JSValueConst value);
 
 #ifdef __cplusplus
 } /* extern "C" { */
