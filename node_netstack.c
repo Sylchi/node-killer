@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "node_netstack.h"
 
 #include <arpa/inet.h>
@@ -17,6 +19,7 @@
 
 #include "netstack.h"
 #include "netstack_link.h"
+#include "netstack_util.h"
 
 #define VFD_MAX 512
 #define VFD_OPTS_MAX 16
@@ -719,25 +722,10 @@ static void ns_to_sa(const NsAddr *addr, uint16_t port, struct sockaddr *sa,
     }
 }
 
-static int prefix4_match(const uint8_t addr[4], const uint8_t prefix[4],
-                         int bits)
-{
-    int full = bits / 8;
-    int rem = bits % 8;
-    if (full && memcmp(addr, prefix, (size_t)full) != 0)
-        return 0;
-    if (rem) {
-        uint8_t mask = (uint8_t)(0xff << (8 - rem));
-        if ((addr[full] & mask) != (prefix[full] & mask))
-            return 0;
-    }
-    return 1;
-}
-
 static int addr_managed(const NsAddr *addr)
 {
     if (ns_addr_family(addr) == NS_AF_INET)
-        return prefix4_match(addr->b, ns_prefix4, ns_prefix4_len);
+        return ns_prefix_match(addr->b, ns_prefix4, ns_prefix4_len);
     {
         const NsAddr *local = ns_stack_local_family(ns_stack, NS_AF_INET6);
         return local && memcmp(addr->b, local->b, NS_PREFIX_LEN) == 0;
@@ -747,15 +735,6 @@ static int addr_managed(const NsAddr *addr)
 static int ns_family(const NsAddr *addr)
 {
     return ns_addr_family(addr) == NS_AF_INET ? AF_INET : AF_INET6;
-}
-
-static int ns_addr_any(const NsAddr *addr)
-{
-    int i;
-    for (i = 0; i < NS_ADDR_LEN; i++)
-        if (addr->b[i])
-            return 0;
-    return 1;
 }
 
 /* Open the owned UDP socket backing a virtual descriptor. local may be the
@@ -778,7 +757,7 @@ static int vfd_udp_open(Vfd *v, const NsAddr *local, uint16_t port)
     v->kind = VFD_DGRAM;
     v->udp = id;
     v->bound = 1;
-    v->bind_wildcard = ns_addr_any(&bound);
+    v->bind_wildcard = ns_addr_unspecified(&bound);
     v->bind_addr = bound;
     v->bind_port = lport;
     v->local = bound;

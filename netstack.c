@@ -6,6 +6,7 @@
  * pseudo-header checksum are selected from the NsAddr family.
  */
 #include "netstack.h"
+#include "netstack_util.h"
 
 #include <arpa/inet.h>
 #include <stdio.h>
@@ -198,83 +199,12 @@ static void ip_dispatch(NsStack *s, const uint8_t *pkt, size_t len, int family,
 static int ip_emit(NsStack *s, const NsAddr *src, const NsAddr *dst,
                    uint8_t proto, const uint8_t *l4, size_t l4_len);
 
-/* ---------------- byte order and checksums ---------------- */
-
-static uint16_t rd16(const uint8_t *p)
-{
-    return (uint16_t)((p[0] << 8) | p[1]);
-}
-
-static uint32_t rd32(const uint8_t *p)
-{
-    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-           ((uint32_t)p[2] << 8) | p[3];
-}
-
-static void wr16(uint8_t *p, uint16_t v)
-{
-    p[0] = (uint8_t)(v >> 8);
-    p[1] = (uint8_t)v;
-}
-
-static void wr32(uint8_t *p, uint32_t v)
-{
-    p[0] = (uint8_t)(v >> 24);
-    p[1] = (uint8_t)(v >> 16);
-    p[2] = (uint8_t)(v >> 8);
-    p[3] = (uint8_t)v;
-}
-
-static uint32_t csum_add(uint32_t sum, const uint8_t *p, size_t len)
-{
-    while (len > 1) {
-        sum += (uint16_t)((p[0] << 8) | p[1]);
-        p += 2;
-        len -= 2;
-    }
-    if (len)
-        sum += (uint16_t)(p[0] << 8);
-    return sum;
-}
-
-static uint16_t csum_fold(uint32_t sum)
-{
-    while (sum >> 16)
-        sum = (sum & 0xffff) + (sum >> 16);
-    return (uint16_t)~sum;
-}
-
-static uint16_t l4_checksum(const uint8_t *src, const uint8_t *dst,
-                            int family, uint8_t proto, const uint8_t *seg,
-                            size_t seg_len)
-{
-    uint32_t sum = 0;
-
-    if (family == NS_AF_INET) {
-        uint8_t pseudo[12];
-        memcpy(pseudo, src, 4);
-        memcpy(pseudo + 4, dst, 4);
-        pseudo[8] = 0;
-        pseudo[9] = proto;
-        wr16(pseudo + 10, (uint16_t)seg_len);
-        sum = csum_add(sum, pseudo, sizeof(pseudo));
-    } else {
-        uint8_t tail[4];
-        uint8_t next[4] = { 0, 0, 0, proto };
-        sum = csum_add(sum, src, 16);
-        sum = csum_add(sum, dst, 16);
-        wr32(tail, (uint32_t)seg_len);
-        sum = csum_add(sum, tail, sizeof(tail));
-        sum = csum_add(sum, next, sizeof(next));
-    }
-    sum = csum_add(sum, seg, seg_len);
-    return csum_fold(sum);
-}
+/* ---------------- checksums ---------------- */
 
 static uint16_t tcp_checksum(const uint8_t *src, const uint8_t *dst,
                              int family, const uint8_t *tcp, size_t tcp_len)
 {
-    return l4_checksum(src, dst, family, 6, tcp, tcp_len);
+    return ns_l4_checksum(src, dst, family, 6, tcp, tcp_len);
 }
 
 /* A computed zero is transmitted as 0xffff: zero means "no checksum" in
@@ -282,13 +212,13 @@ static uint16_t tcp_checksum(const uint8_t *src, const uint8_t *dst,
 static uint16_t udp_checksum(const uint8_t *src, const uint8_t *dst,
                              int family, const uint8_t *udp, size_t udp_len)
 {
-    uint16_t c = l4_checksum(src, dst, family, 17, udp, udp_len);
+    uint16_t c = ns_l4_checksum(src, dst, family, 17, udp, udp_len);
     return c ? c : 0xffff;
 }
 
 static uint16_t ipv4_checksum(const uint8_t *hdr, size_t len)
 {
-    return csum_fold(csum_add(0, hdr, len));
+    return ns_csum_fold(ns_csum_add(0, hdr, len));
 }
 
 static int seq_lt(uint32_t a, uint32_t b)
@@ -355,35 +285,6 @@ void ns_addr_format(const NsAddr *a, char out[64])
         snprintf(out, 64, "<invalid>");
 }
 
-static int addr_eq(const NsAddr *a, const NsAddr *b)
-{
-    return ns_addr_family(a) == ns_addr_family(b) &&
-           memcmp(a->b, b->b, sizeof(a->b)) == 0;
-}
-
-static int addr_unspecified(const NsAddr *a)
-{
-    int i;
-    for (i = 0; i < NS_ADDR_LEN; i++)
-        if (a->b[i])
-            return 0;
-    return 1;
-}
-
-static int addr_multicast(const NsAddr *a)
-{
-    if (ns_addr_family(a) == NS_AF_INET)
-        return (a->b[0] & 0xf0) == 0xe0;
-    return a->b[0] == 0xff;
-}
-
-static int addr_broadcast(const NsAddr *a)
-{
-    return ns_addr_family(a) == NS_AF_INET &&
-           a->b[0] == 255 && a->b[1] == 255 && a->b[2] == 255 &&
-           a->b[3] == 255;
-}
-
 static int is_service_addr(const NsAddr *a)
 {
     int i;
@@ -413,7 +314,7 @@ static NsPmtu *pmtu_find(NsStack *s, const NsAddr *dst)
     int i;
 
     for (i = 0; i < NS_PMTU_ENTRIES; i++)
-        if (s->pmtu[i].valid && addr_eq(&s->pmtu[i].dst, dst))
+        if (s->pmtu[i].valid && ns_addr_eq(&s->pmtu[i].dst, dst))
             return &s->pmtu[i];
     return NULL;
 }
@@ -435,7 +336,7 @@ static void pmtu_note(NsStack *s, const NsAddr *dst, uint32_t mtu,
     uint16_t value;
     int i;
 
-    if (!dst || addr_unspecified(dst))
+    if (!dst || ns_addr_unspecified(dst))
         return;
     value = pmtu_clamp(ns_addr_family(dst), mtu);
     if (slot) {
@@ -610,11 +511,11 @@ static int listener_match(const NsStack *s, const NsListener *l,
     if (l->port != port)
         return 0;
     if (l->has_addr)
-        return addr_eq(&l->addr, dst);
+        return ns_addr_eq(&l->addr, dst);
     if (s->plain) {
         const NsAddr *local =
             ns_stack_local_family(s, ns_addr_family(dst));
-        return local && addr_eq(local, dst);
+        return local && ns_addr_eq(local, dst);
     }
     return is_service_addr(dst);
 }
@@ -780,7 +681,7 @@ static NsConn *conn_find(NsShard *sh, const NsAddr *la, uint16_t lp,
     NsConn *c;
     for (c = sh->conns; c; c = c->next)
         if (c->lport == lp && c->rport == rp &&
-            addr_eq(&c->local, la) && addr_eq(&c->remote, ra))
+            ns_addr_eq(&c->local, la) && ns_addr_eq(&c->remote, ra))
             return c;
     return NULL;
 }
@@ -791,7 +692,7 @@ static NsConn *conn_find_pending(NsShard *sh, const NsAddr *la, uint16_t lp,
     NsConn *c;
     for (c = sh->conns; c; c = c->next)
         if (c->state == NS_SYN_SENT && c->lport == lp && c->rport == rp &&
-            addr_eq(&c->local, la))
+            ns_addr_eq(&c->local, la))
             return c;
     return NULL;
 }
@@ -837,16 +738,16 @@ static void ipv4_send_one(NsStack *s, const NsAddr *src, const NsAddr *dst,
 
     memset(pkt, 0, NS_IPV4_HDR);
     pkt[0] = 0x45;
-    wr16(pkt + 2, (uint16_t)total);
-    wr16(pkt + 4, id);
+    ns_wr16(pkt + 2, (uint16_t)total);
+    ns_wr16(pkt + 4, id);
     frag = (uint16_t)((df ? 0x4000 : 0) | (mf ? 0x2000 : 0) |
                       ((off / 8) & 0x1fff));
-    wr16(pkt + 6, frag);
+    ns_wr16(pkt + 6, frag);
     pkt[8] = 64; /* TTL */
     pkt[9] = proto;
     memcpy(pkt + 12, src->b, 4);
     memcpy(pkt + 16, dst->b, 4);
-    wr16(pkt + 10, ipv4_checksum(pkt, NS_IPV4_HDR));
+    ns_wr16(pkt + 10, ipv4_checksum(pkt, NS_IPV4_HDR));
     if (plen)
         memcpy(pkt + NS_IPV4_HDR, payload, plen);
 
@@ -866,7 +767,7 @@ static void ipv6_send_one(NsStack *s, const NsAddr *src, const NsAddr *dst,
 
     memset(pkt, 0, NS_IPV6_HDR);
     pkt[0] = 0x60;
-    wr16(pkt + 4, (uint16_t)body);
+    ns_wr16(pkt + 4, (uint16_t)body);
     pkt[6] = with_frag ? 44 : proto;
     pkt[7] = 64; /* hop limit */
     memcpy(pkt + 8, src->b, 16);
@@ -874,8 +775,8 @@ static void ipv6_send_one(NsStack *s, const NsAddr *src, const NsAddr *dst,
     if (with_frag) {
         pkt[40] = proto;
         pkt[41] = 0;
-        wr16(pkt + 42, (uint16_t)((off & 0xfff8) | (mf ? 1 : 0)));
-        wr32(pkt + 44, id);
+        ns_wr16(pkt + 42, (uint16_t)((off & 0xfff8) | (mf ? 1 : 0)));
+        ns_wr32(pkt + 44, id);
     }
     if (plen)
         memcpy(pkt + hdr, payload, plen);
@@ -982,18 +883,18 @@ static void ns_emit(NsConn *c, uint8_t flags, uint32_t seq, uint32_t ack,
     if (!s->send || plen > NS_MSS || family != ns_addr_family(&c->remote))
         return;
 
-    wr16(tcp, c->lport);
-    wr16(tcp + 2, c->rport);
-    wr32(tcp + 4, seq);
-    wr32(tcp + 8, ack);
+    ns_wr16(tcp, c->lport);
+    ns_wr16(tcp + 2, c->rport);
+    ns_wr32(tcp + 4, seq);
+    ns_wr32(tcp + 8, ack);
     tcp[12] = (uint8_t)((NS_TCP_HDR / 4) << 4);
     tcp[13] = flags;
-    wr16(tcp + 14, c->rcv_wnd);
-    wr16(tcp + 16, 0);
-    wr16(tcp + 18, 0);
+    ns_wr16(tcp + 14, c->rcv_wnd);
+    ns_wr16(tcp + 16, 0);
+    ns_wr16(tcp + 18, 0);
     if (plen)
         memcpy(tcp + NS_TCP_HDR, payload, plen);
-    wr16(tcp + 16, tcp_checksum(c->local.b, c->remote.b, family, tcp,
+    ns_wr16(tcp + 16, tcp_checksum(c->local.b, c->remote.b, family, tcp,
                                 tcp_len));
 
     ip_emit(s, &c->local, &c->remote, 6, tcp, tcp_len);
@@ -1192,9 +1093,9 @@ static NsConn *server_accept_syn(NsShard *sh, const NsAddr *src,
    send an error about a multicast, broadcast or unspecified destination. */
 static int icmp_can_reply(const NsAddr *src, const NsAddr *dst)
 {
-    return !addr_unspecified(src) && !addr_multicast(src) &&
-           !addr_broadcast(src) && !addr_unspecified(dst) &&
-           !addr_multicast(dst) && !addr_broadcast(dst);
+    return !ns_addr_unspecified(src) && !ns_addr_multicast(src) &&
+           !ns_addr_broadcast(src) && !ns_addr_unspecified(dst) &&
+           !ns_addr_multicast(dst) && !ns_addr_broadcast(dst);
 }
 
 static int icmp_emit(NsStack *s, const NsAddr *src, const NsAddr *dst,
@@ -1207,11 +1108,11 @@ static int icmp_emit(NsStack *s, const NsAddr *src, const NsAddr *dst,
         len > NS_MAX_IP_PACKET)
         return -NS_EMSGSIZE;
 
-    wr16(msg + 2, 0);
+    ns_wr16(msg + 2, 0);
     if (family == NS_AF_INET)
-        wr16(msg + 2, ipv4_checksum(msg, len));
+        ns_wr16(msg + 2, ipv4_checksum(msg, len));
     else
-        wr16(msg + 2, l4_checksum(src->b, dst->b, family, 58, msg, len));
+        ns_wr16(msg + 2, ns_l4_checksum(src->b, dst->b, family, 58, msg, len));
 
     r = ip_emit(s, src, dst, family == NS_AF_INET ? 1 : 58, msg, len);
     if (r == 0)
@@ -1234,7 +1135,7 @@ static void icmp_pmtu_input(NsStack *s, int family, const uint8_t *icmp,
     if (family == NS_AF_INET) {
         if (icmp[0] != 3 || icmp[1] != 4 || icmp_len < NS_ICMP_HDR + NS_IPV4_HDR)
             return;
-        mtu = rd16(icmp + 6);
+        mtu = ns_rd16(icmp + 6);
         if (mtu == 0)
             mtu = NS_PMTU_V4_MIN;
         quote = icmp + NS_ICMP_HDR;
@@ -1251,7 +1152,7 @@ static void icmp_pmtu_input(NsStack *s, int family, const uint8_t *icmp,
     } else {
         if (icmp[0] != 2 || icmp_len < NS_ICMP_HDR + NS_IPV6_HDR)
             return;
-        mtu = rd32(icmp + 4);
+        mtu = ns_rd32(icmp + 4);
         if (mtu == 0)
             return;
         quote = icmp + NS_ICMP_HDR;
@@ -1289,7 +1190,7 @@ static void icmp_input(NsShard *sh, const uint8_t *pkt, size_t len)
             s->stats.dropped++;
             return;
         }
-    } else if (l4_checksum(pkt + 8, pkt + 24, family, 58, icmp,
+    } else if (ns_l4_checksum(pkt + 8, pkt + 24, family, 58, icmp,
                            icmp_len) != 0) {
         s->stats.dropped++;
         return;
@@ -1399,8 +1300,8 @@ int ns_icmp_echo(NsStack *s, const NsAddr *local, const NsAddr *remote,
     memset(msg, 0, NS_ICMP_HDR);
     msg[0] = family == NS_AF_INET ? 8 : 128;
     msg[1] = 0;
-    wr16(msg + 4, id);
-    wr16(msg + 6, seq);
+    ns_wr16(msg + 4, id);
+    ns_wr16(msg + 6, seq);
     if (len)
         memcpy(msg + NS_ICMP_HDR, payload, len);
     r = icmp_emit(s, local, remote, msg, total);
@@ -1445,7 +1346,7 @@ static int udp_port_conflict(const NsStack *s, const NsAddr *local,
     for (u = s->udp; u; u = u->next) {
         if (u->lport != port || u->local.family != family)
             continue;
-        if (has_local && u->has_local && !addr_eq(&u->local, local))
+        if (has_local && u->has_local && !ns_addr_eq(&u->local, local))
             continue;
         if (reuse && u->reuse)
             continue;
@@ -1468,10 +1369,10 @@ static NsUdp *udp_find(NsStack *s, const NsAddr *dst, uint16_t dport,
             u->local.family != (uint8_t)ns_addr_family(dst))
             continue;
         if (u->connected &&
-            (u->rport != sport || !addr_eq(&u->remote, src)))
+            (u->rport != sport || !ns_addr_eq(&u->remote, src)))
             continue;
         if (u->has_local) {
-            if (!addr_eq(&u->local, dst))
+            if (!ns_addr_eq(&u->local, dst))
                 continue;
             exact = 1;
         } else {
@@ -1504,13 +1405,13 @@ static int udp_emit(NsStack *s, const NsAddr *src, const NsAddr *dst,
             return -NS_EMSGSIZE;
     }
 
-    wr16(udp, sport);
-    wr16(udp + 2, dport);
-    wr16(udp + 4, (uint16_t)udp_len);
-    wr16(udp + 6, 0);
+    ns_wr16(udp, sport);
+    ns_wr16(udp + 2, dport);
+    ns_wr16(udp + 4, (uint16_t)udp_len);
+    ns_wr16(udp + 6, 0);
     if (len)
         memcpy(udp + NS_UDP_HDR, buf, len);
-    wr16(udp + 6, udp_checksum(src->b, dst->b, family, udp, udp_len));
+    ns_wr16(udp + 6, udp_checksum(src->b, dst->b, family, udp, udp_len));
 
     r = ip_emit(s, src, dst, 17, udp, udp_len);
     if (udp != small)
@@ -1534,7 +1435,7 @@ uint64_t ns_udp_open(NsStack *s, const NsAddr *local, uint16_t port, int reuse)
         family = ns_addr_family(local);
         la = *local;
         la.family = (uint8_t)family;
-        has_local = !addr_unspecified(&la);
+        has_local = !ns_addr_unspecified(&la);
     } else {
         if (ns_stack_local_family(s, NS_AF_INET6))
             family = NS_AF_INET6;
@@ -1591,7 +1492,7 @@ int ns_udp_connect(NsStack *s, uint64_t id, const NsAddr *remote,
 
     if (!u)
         return -NS_ENOTCONN;
-    if (!remote || rport == 0 || addr_unspecified(remote))
+    if (!remote || rport == 0 || ns_addr_unspecified(remote))
         return -NS_EINVAL;
     family = ns_addr_family(remote);
     if (family != (int)u->local.family)
@@ -1632,7 +1533,7 @@ int ns_udp_sendto(NsStack *s, uint64_t id, const NsAddr *dst, uint16_t dport,
         rdst = &u->remote;
         rport = u->rport;
     } else {
-        if (dport == 0 || addr_unspecified(dst))
+        if (dport == 0 || ns_addr_unspecified(dst))
             return -NS_EINVAL;
         rdst = dst;
         rport = dport;
@@ -1766,9 +1667,9 @@ static void udp_input(NsShard *sh, const uint8_t *pkt, size_t len)
         return;
     }
     udp = pkt + ip_hdr;
-    sport = rd16(udp);
-    dport = rd16(udp + 2);
-    ulen = rd16(udp + 4);
+    sport = ns_rd16(udp);
+    dport = ns_rd16(udp + 2);
+    ulen = ns_rd16(udp + 4);
     if (ulen < NS_UDP_HDR || ulen > len - ip_hdr) {
         s->stats.dropped++;
         return;
@@ -1833,7 +1734,7 @@ static NsReasm *reasm_find(NsStack *s, int family, const NsAddr *src,
 
     for (e = s->reasm; e; e = e->next)
         if (e->family == family && e->proto == proto && e->id == id &&
-            addr_eq(&e->src, src) && addr_eq(&e->dst, dst))
+            ns_addr_eq(&e->src, src) && ns_addr_eq(&e->dst, dst))
             return e;
     return NULL;
 }
@@ -1980,14 +1881,14 @@ static void reasm_add(NsStack *s, int family, const NsAddr *src,
                 return;
             }
             memcpy(pkt, copy, header_len);
-            wr16(pkt + 2, (uint16_t)pkt_len);
-            frag = rd16(pkt + 6) & 0x4000; /* keep DF, clear MF/offset */
-            wr16(pkt + 6, frag);
-            wr16(pkt + 10, 0);
-            wr16(pkt + 10, ipv4_checksum(pkt, header_len));
+            ns_wr16(pkt + 2, (uint16_t)pkt_len);
+            frag = ns_rd16(pkt + 6) & 0x4000; /* keep DF, clear MF/offset */
+            ns_wr16(pkt + 6, frag);
+            ns_wr16(pkt + 10, 0);
+            ns_wr16(pkt + 10, ipv4_checksum(pkt, header_len));
         } else {
             memcpy(pkt, copy, NS_IPV6_HDR);
-            wr16(pkt + 4, (uint16_t)payload_total);
+            ns_wr16(pkt + 4, (uint16_t)payload_total);
             pkt[6] = e->proto;
         }
         free(copy);
@@ -2025,19 +1926,19 @@ static void ip_dispatch(NsStack *s, const uint8_t *pkt, size_t len, int family,
             s->stats.dropped++;
             return;
         }
-        ulen = rd16(l4 + 4);
+        ulen = ns_rd16(l4 + 4);
         if (ulen < NS_UDP_HDR || ulen > l4_len) {
             s->stats.dropped++;
             return;
         }
         len = ip_hdr + ulen;
         l4_len = ulen;
-        if (rd16(l4 + 6) == 0) {
+        if (ns_rd16(l4 + 6) == 0) {
             if (family != NS_AF_INET) {
                 s->stats.dropped++;
                 return;
             }
-        } else if (l4_checksum(src, dst, family, 17, l4, l4_len) != 0) {
+        } else if (ns_l4_checksum(src, dst, family, 17, l4, l4_len) != 0) {
             s->stats.dropped++;
             return;
         }
@@ -2129,10 +2030,10 @@ static void shard_process(NsShard *sh, NsPacket *p)
     off = (size_t)(tcp[12] >> 4) * 4;
     payload = tcp + off;
     plen = tcp_len - off;
-    sport = rd16(tcp);
-    dport = rd16(tcp + 2);
-    seq = rd32(tcp + 4);
-    ack = rd32(tcp + 8);
+    sport = ns_rd16(tcp);
+    dport = ns_rd16(tcp + 2);
+    seq = ns_rd32(tcp + 4);
+    ack = ns_rd32(tcp + 8);
     flags = tcp[13];
 
     memset(&sa, 0, sizeof(sa));
@@ -2229,7 +2130,7 @@ void ns_input(NsStack *s, const uint8_t *pkt, size_t len)
             s->stats.dropped++;
             return;
         }
-        total = rd16(pkt + 2);
+        total = ns_rd16(pkt + 2);
         if (total < ip_hdr || total > len) {
             s->stats.dropped++;
             return;
@@ -2244,7 +2145,7 @@ void ns_input(NsStack *s, const uint8_t *pkt, size_t len)
             s->stats.dropped++;
             return;
         }
-        frag = rd16(pkt + 6);
+        frag = ns_rd16(pkt + 6);
         if (frag & 0x3fff) {
             NsAddr src, dst;
 
@@ -2254,7 +2155,7 @@ void ns_input(NsStack *s, const uint8_t *pkt, size_t len)
             memcpy(src.b, pkt + 12, 4);
             memcpy(dst.b, pkt + 16, 4);
             s->stats.fragments_rx++;
-            reasm_add(s, family, &src, &dst, (uint8_t)proto, rd16(pkt + 4),
+            reasm_add(s, family, &src, &dst, (uint8_t)proto, ns_rd16(pkt + 4),
                       (size_t)(frag & 0x1fff) * 8, (frag & 0x2000) != 0,
                       pkt, ip_hdr, pkt + ip_hdr, len - ip_hdr);
             return;
@@ -2268,7 +2169,7 @@ void ns_input(NsStack *s, const uint8_t *pkt, size_t len)
             s->stats.dropped++;
             return;
         }
-        body = rd16(pkt + 4);
+        body = ns_rd16(pkt + 4);
         if (body > len - NS_IPV6_HDR) {
             s->stats.dropped++;
             return;
@@ -2293,7 +2194,7 @@ void ns_input(NsStack *s, const uint8_t *pkt, size_t len)
                 s->stats.dropped++;
                 return;
             }
-            word = rd16(pkt + NS_IPV6_HDR + 2);
+            word = ns_rd16(pkt + NS_IPV6_HDR + 2);
             off = (size_t)(word & 0xfff8);
             memset(&src, 0, sizeof(src));
             memset(&dst, 0, sizeof(dst));
@@ -2302,7 +2203,7 @@ void ns_input(NsStack *s, const uint8_t *pkt, size_t len)
             memcpy(dst.b, pkt + 24, 16);
             s->stats.fragments_rx++;
             reasm_add(s, family, &src, &dst, inner,
-                      rd32(pkt + NS_IPV6_HDR + 4), off, (word & 1) != 0,
+                      ns_rd32(pkt + NS_IPV6_HDR + 4), off, (word & 1) != 0,
                       pkt, NS_IPV6_HDR, pkt + NS_IPV6_HDR + 8,
                       len - NS_IPV6_HDR - 8);
             return;

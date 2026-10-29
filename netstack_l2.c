@@ -6,6 +6,7 @@
  * device in netstack_link.c.
  */
 #include "netstack_l2.h"
+#include "netstack_util.h"
 
 #include <errno.h>
 #include <stdlib.h>
@@ -86,6 +87,7 @@ struct NsL2 {
     NsRoute routes[NS_L2_MAX_ROUTES];
     NsNeigh neigh[NS_L2_MAX_NEIGHBORS];
     NsL2Pkt *pending;
+    NsL2Pkt *pending_tail;
     int npending;
 
     NsL2Stats stats;
@@ -95,105 +97,7 @@ static NsNeigh *neigh_find(const NsL2 *l2, const NsAddr *addr);
 static void pending_flush(NsL2 *l2, const NsAddr *addr, const uint8_t *mac);
 static void neigh_learn(NsL2 *l2, const NsAddr *addr, const uint8_t *mac);
 
-/* ---------------- byte order, addresses and checksums ---------------- */
-
-static uint16_t rd16(const uint8_t *p)
-{
-    return (uint16_t)((p[0] << 8) | p[1]);
-}
-
-static uint32_t rd32(const uint8_t *p)
-{
-    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-           ((uint32_t)p[2] << 8) | p[3];
-}
-
-static void wr16(uint8_t *p, uint16_t v)
-{
-    p[0] = (uint8_t)(v >> 8);
-    p[1] = (uint8_t)v;
-}
-
-static void wr32(uint8_t *p, uint32_t v)
-{
-    p[0] = (uint8_t)(v >> 24);
-    p[1] = (uint8_t)(v >> 16);
-    p[2] = (uint8_t)(v >> 8);
-    p[3] = (uint8_t)v;
-}
-
-static uint32_t csum_add(uint32_t sum, const uint8_t *p, size_t len)
-{
-    while (len > 1) {
-        sum += (uint16_t)((p[0] << 8) | p[1]);
-        p += 2;
-        len -= 2;
-    }
-    if (len)
-        sum += (uint16_t)(p[0] << 8);
-    return sum;
-}
-
-static uint16_t csum_fold(uint32_t sum)
-{
-    while (sum >> 16)
-        sum = (sum & 0xffff) + (sum >> 16);
-    return (uint16_t)~sum;
-}
-
-/* Return the checksum field value for an ICMPv6 message. A valid message
-   validates to zero. */
-static uint16_t icmp6_checksum(const uint8_t *src, const uint8_t *dst,
-                               const uint8_t *msg, size_t len)
-{
-    uint8_t tail[4];
-    uint8_t next[4] = { 0, 0, 0, 58 };
-    uint32_t sum = 0;
-
-    wr32(tail, (uint32_t)len);
-    sum = csum_add(sum, src, 16);
-    sum = csum_add(sum, dst, 16);
-    sum = csum_add(sum, tail, sizeof(tail));
-    sum = csum_add(sum, next, sizeof(next));
-    sum = csum_add(sum, msg, len);
-    return csum_fold(sum);
-}
-
-static int addr_eq(const NsAddr *a, const NsAddr *b)
-{
-    int family = ns_addr_family(a);
-    size_t len;
-
-    if (family != ns_addr_family(b))
-        return 0;
-    len = family == NS_AF_INET ? 4 : 16;
-    return memcmp(a->b, b->b, len) == 0;
-}
-
-static int addr_unspecified(const NsAddr *a)
-{
-    int family = ns_addr_family(a);
-    size_t len = family == NS_AF_INET ? 4 : 16;
-    size_t i;
-
-    for (i = 0; i < len; i++)
-        if (a->b[i])
-            return 0;
-    return 1;
-}
-
-static int addr_multicast(const NsAddr *a)
-{
-    if (ns_addr_family(a) == NS_AF_INET)
-        return (a->b[0] & 0xf0) == 0xe0;
-    return a->b[0] == 0xff;
-}
-
-static int addr_broadcast4(const NsAddr *a)
-{
-    return ns_addr_family(a) == NS_AF_INET && a->b[0] == 0xff &&
-           a->b[1] == 0xff && a->b[2] == 0xff && a->b[3] == 0xff;
-}
+/* ---------------- addresses ---------------- */
 
 /* fe80::/10. */
 static int addr_link_local(const NsAddr *a)
@@ -209,8 +113,8 @@ static int ipv6_enabled(const NsL2 *l2)
 
 static int is_local6(const NsL2 *l2, const NsAddr *addr)
 {
-    return (l2->has6 && addr_eq(addr, &l2->local6)) ||
-           (l2->has_link6 && addr_eq(addr, &l2->link6));
+    return (l2->has6 && ns_addr_eq(addr, &l2->local6)) ||
+           (l2->has_link6 && ns_addr_eq(addr, &l2->link6));
 }
 
 /* Build an EUI-64 link-local address from the interface MAC. */
@@ -251,7 +155,7 @@ static uint32_t mask4(int prefix_len)
 static void addr_mask(NsAddr *addr, int prefix_len)
 {
     if (ns_addr_family(addr) == NS_AF_INET) {
-        wr32(addr->b, rd32(addr->b) & mask4(prefix_len));
+        ns_wr32(addr->b, ns_rd32(addr->b) & mask4(prefix_len));
     } else {
         int full = prefix_len / 8;
         int rem = prefix_len % 8;
@@ -270,21 +174,7 @@ static int addr_in_prefix(const NsAddr *addr, const NsAddr *net, int prefix_len)
 {
     if (ns_addr_family(addr) != ns_addr_family(net))
         return 0;
-    if (ns_addr_family(addr) == NS_AF_INET)
-        return (rd32(addr->b) & mask4(prefix_len)) == rd32(net->b);
-    {
-        int full = prefix_len / 8;
-        int rem = prefix_len % 8;
-
-        if (full && memcmp(addr->b, net->b, (size_t)full) != 0)
-            return 0;
-        if (rem) {
-            uint8_t mask = (uint8_t)(0xff << (8 - rem));
-            if ((addr->b[full] & mask) != (net->b[full] & mask))
-                return 0;
-        }
-    }
-    return 1;
+    return ns_prefix_match(addr->b, net->b, prefix_len);
 }
 
 static NsRoute *route_find(NsL2 *l2, const NsAddr *dest, int prefix_len)
@@ -294,7 +184,7 @@ static NsRoute *route_find(NsL2 *l2, const NsAddr *dest, int prefix_len)
     for (i = 0; i < NS_L2_MAX_ROUTES; i++) {
         NsRoute *r = &l2->routes[i];
         if (r->kind != ROUTE_FREE && r->prefix_len == prefix_len &&
-            addr_eq(&r->dest, dest))
+            ns_addr_eq(&r->dest, dest))
             return r;
     }
     return NULL;
@@ -392,7 +282,7 @@ static int route_add_ra(NsL2 *l2, const NsAddr *gateway, uint64_t lifetime_ms)
     }
 
     existed = r != NULL;
-    changed = !r || !addr_eq(&r->gateway, gateway);
+    changed = !r || !ns_addr_eq(&r->gateway, gateway);
     rc = route_add_internal(l2, &zero, 0, gateway, ROUTE_RA);
     if (rc < 0)
         return rc;
@@ -479,7 +369,7 @@ static int subnet_broadcast4(const NsL2 *l2, const NsAddr *dst)
 
     if (ns_addr_family(dst) != NS_AF_INET)
         return 0;
-    addr = rd32(dst->b);
+    addr = ns_rd32(dst->b);
     for (i = 0; i < NS_L2_MAX_ROUTES; i++) {
         const NsRoute *r = &l2->routes[i];
         uint32_t mask;
@@ -490,7 +380,7 @@ static int subnet_broadcast4(const NsL2 *l2, const NsAddr *dst)
             continue;
         mask = mask4(r->prefix_len);
         host = ~mask;
-        if ((addr & mask) == rd32(r->dest.b) && (addr & host) == host)
+        if ((addr & mask) == ns_rd32(r->dest.b) && (addr & host) == host)
             return 1;
     }
     return 0;
@@ -551,27 +441,24 @@ static void mac_multicast6(const NsAddr *dst, uint8_t mac[NS_L2_MAC_LEN])
 static int l2_emit(NsL2 *l2, const uint8_t *dstmac, uint16_t ethertype,
                    const uint8_t *payload, size_t len)
 {
-    uint8_t *frame;
-    size_t total = ETH_HDR + len;
+    uint8_t frame[ETH_HDR + NS_L2_MTU];
 
     if (!l2->send) {
         l2->stats.dropped++;
         return -1;
     }
-    frame = malloc(total);
-    if (!frame) {
+    if (len > NS_L2_MTU) {
         l2->stats.dropped++;
         return -1;
     }
     memcpy(frame, dstmac, NS_L2_MAC_LEN);
     memcpy(frame + 6, l2->mac, NS_L2_MAC_LEN);
-    wr16(frame + 12, ethertype);
+    ns_wr16(frame + 12, ethertype);
     if (len)
         memcpy(frame + ETH_HDR, payload, len);
 
     l2->stats.tx_frames++;
-    l2->send(l2, frame, total, l2->opaque);
-    free(frame);
+    l2->send(l2, frame, ETH_HDR + len, l2->opaque);
     return 0;
 }
 
@@ -606,11 +493,11 @@ static int arp_emit_request(NsL2 *l2, const NsAddr *target)
         return -1;
     memset(bcast, 0xff, sizeof(bcast));
     memset(arp, 0, sizeof(arp));
-    wr16(arp, 1);            /* Ethernet */
-    wr16(arp + 2, 0x0800);   /* IPv4 */
+    ns_wr16(arp, 1);            /* Ethernet */
+    ns_wr16(arp + 2, 0x0800);   /* IPv4 */
     arp[4] = 6;
     arp[5] = 4;
-    wr16(arp + 6, 1);        /* request */
+    ns_wr16(arp + 6, 1);        /* request */
     memcpy(arp + 8, l2->mac, NS_L2_MAC_LEN);
     memcpy(arp + 14, l2->local4.b, 4);
     memcpy(arp + 24, target->b, 4);
@@ -625,11 +512,11 @@ static int arp_emit_reply(NsL2 *l2, const uint8_t *dstmac, const NsAddr *peer)
     if (!l2->has4)
         return -1;
     memset(arp, 0, sizeof(arp));
-    wr16(arp, 1);
-    wr16(arp + 2, 0x0800);
+    ns_wr16(arp, 1);
+    ns_wr16(arp + 2, 0x0800);
     arp[4] = 6;
     arp[5] = 4;
-    wr16(arp + 6, 2);        /* reply */
+    ns_wr16(arp + 6, 2);        /* reply */
     memcpy(arp + 8, l2->mac, NS_L2_MAC_LEN);
     memcpy(arp + 14, l2->local4.b, 4);
     memcpy(arp + 18, dstmac, NS_L2_MAC_LEN);
@@ -675,7 +562,7 @@ static int ndp_emit_ns(NsL2 *l2, const NsAddr *target)
     dstmac[5] = target->b[15];
 
     ip[0] = 0x60;
-    wr16(ip + 4, 24 + 8);
+    ns_wr16(ip + 4, 24 + 8);
     ip[6] = 58;
     ip[7] = 255;
     memcpy(ip + 8, src->b, 16);
@@ -687,8 +574,8 @@ static int ndp_emit_ns(NsL2 *l2, const NsAddr *target)
     icmp[24] = ND_OPT_SOURCE_LL;
     icmp[25] = 1;
     memcpy(icmp + 26, l2->mac, NS_L2_MAC_LEN);
-    csum = icmp6_checksum(ip + 8, ip + 24, icmp, 24 + 8);
-    wr16(icmp + 2, csum);
+    csum = ns_l4_checksum(ip + 8, ip + 24, NS_AF_INET6, 58, icmp, 24 + 8);
+    ns_wr16(icmp + 2, csum);
 
     l2->stats.tx_ndp++;
     return l2_emit(l2, dstmac, ETHERTYPE_IPV6, pkt, sizeof(pkt));
@@ -704,7 +591,7 @@ static int ndp_emit_na(NsL2 *l2, const uint8_t *dstmac, const NsAddr *dst,
 
     memset(pkt, 0, sizeof(pkt));
     ip[0] = 0x60;
-    wr16(ip + 4, 24 + 8);
+    ns_wr16(ip + 4, 24 + 8);
     ip[6] = 58;
     ip[7] = 255;
     memcpy(ip + 8, target->b, 16);
@@ -718,8 +605,8 @@ static int ndp_emit_na(NsL2 *l2, const uint8_t *dstmac, const NsAddr *dst,
     icmp[24] = ND_OPT_TARGET_LL;
     icmp[25] = 1;
     memcpy(icmp + 26, l2->mac, NS_L2_MAC_LEN);
-    csum = icmp6_checksum(ip + 8, ip + 24, icmp, 24 + 8);
-    wr16(icmp + 2, csum);
+    csum = ns_l4_checksum(ip + 8, ip + 24, NS_AF_INET6, 58, icmp, 24 + 8);
+    ns_wr16(icmp + 2, csum);
 
     l2->stats.tx_ndp++;
     return l2_emit(l2, dstmac, ETHERTYPE_IPV6, pkt, sizeof(pkt));
@@ -744,7 +631,7 @@ static int ndp_emit_rs(NsL2 *l2)
     dst6[15] = 0x02;
 
     ip[0] = 0x60;
-    wr16(ip + 4, (uint16_t)plen);
+    ns_wr16(ip + 4, (uint16_t)plen);
     ip[6] = 58;
     ip[7] = 255;
     if (l2->has_link6)
@@ -758,8 +645,8 @@ static int ndp_emit_rs(NsL2 *l2)
         icmp[9] = 1;
         memcpy(icmp + 10, l2->mac, NS_L2_MAC_LEN);
     }
-    csum = icmp6_checksum(ip + 8, dst6, icmp, plen);
-    wr16(icmp + 2, csum);
+    csum = ns_l4_checksum(ip + 8, dst6, NS_AF_INET6, 58, icmp, plen);
+    ns_wr16(icmp + 2, csum);
 
     l2->stats.tx_rs++;
     return l2_emit(l2, dstmac, ETHERTYPE_IPV6, pkt, IPV6_HDR + plen);
@@ -800,7 +687,7 @@ static void ndp_ra_input(NsL2 *l2, const uint8_t *src,
     memset(&router, 0, sizeof(router));
     router.family = NS_AF_INET6;
     memcpy(router.b, src, 16);
-    if (addr_unspecified(&router) || !addr_link_local(&router))
+    if (ns_addr_unspecified(&router) || !addr_link_local(&router))
         return;
 
     l2->stats.rx_ra++;
@@ -811,7 +698,7 @@ static void ndp_ra_input(NsL2 *l2, const uint8_t *src,
     if (mac_usable(mac))
         neigh_learn(l2, &router, mac);
 
-    lifetime = rd16(icmp + 6);
+    lifetime = ns_rd16(icmp + 6);
     route_add_ra(l2, &router, (uint64_t)lifetime * 1000);
 }
 
@@ -835,7 +722,7 @@ static int ndp_input(NsL2 *l2, const uint8_t *ip, size_t len,
     if (ip[6] != 58 || ip[7] != 255)
         return 0;
 
-    total = IPV6_HDR + (size_t)rd16(ip + 4);
+    total = IPV6_HDR + (size_t)ns_rd16(ip + 4);
     if (total > len)
         return 1;
     if (total < IPV6_HDR + 8)
@@ -845,7 +732,8 @@ static int ndp_input(NsL2 *l2, const uint8_t *ip, size_t len,
         return 0;
     icmp = ip + IPV6_HDR;
     icmp_len = total - IPV6_HDR;
-    if (icmp6_checksum(src, dst, icmp, icmp_len) != 0 || icmp[1] != 0)
+    if (ns_l4_checksum(src, dst, NS_AF_INET6, 58, icmp, icmp_len) != 0 ||
+        icmp[1] != 0)
         return 1;
 
     if (type == ND_RS)
@@ -873,8 +761,8 @@ static int ndp_input(NsL2 *l2, const uint8_t *ip, size_t len,
         const uint8_t *slla;
 
         /* DAD probes have no usable source and must not be answered. */
-        if (!ipv6_enabled(l2) || addr_unspecified(&srcaddr) ||
-            addr_multicast(&srcaddr))
+        if (!ipv6_enabled(l2) || ns_addr_unspecified(&srcaddr) ||
+            ns_addr_multicast(&srcaddr))
             return 1;
         if (!is_local6(l2, &target))
             return 1;
@@ -884,7 +772,7 @@ static int ndp_input(NsL2 *l2, const uint8_t *ip, size_t len,
     }
 
     /* Neighbour advertisement. */
-    if (!ipv6_enabled(l2) || addr_unspecified(&srcaddr))
+    if (!ipv6_enabled(l2) || ns_addr_unspecified(&srcaddr))
         return 1;
     {
         const uint8_t *tlla = ndp_option(opts, opt_len, ND_OPT_TARGET_LL);
@@ -898,7 +786,7 @@ static int ndp_input(NsL2 *l2, const uint8_t *ip, size_t len,
             int i;
             for (i = 0; i < NS_L2_MAX_NEIGHBORS; i++) {
                 if (l2->neigh[i].state != NEIGH_FREE &&
-                    addr_eq(&l2->neigh[i].addr, &target)) {
+                    ns_addr_eq(&l2->neigh[i].addr, &target)) {
                     n = &l2->neigh[i];
                     break;
                 }
@@ -924,16 +812,20 @@ static int ndp_input(NsL2 *l2, const uint8_t *ip, size_t len,
 static void pending_drop_addr(NsL2 *l2, const NsAddr *addr, int counted)
 {
     NsL2Pkt **pp = &l2->pending;
+    NsL2Pkt *prev = NULL;
 
     while (*pp) {
         NsL2Pkt *p = *pp;
-        if (addr_eq(&p->next_hop, addr)) {
+        if (ns_addr_eq(&p->next_hop, addr)) {
             *pp = p->next;
+            if (l2->pending_tail == p)
+                l2->pending_tail = prev;
             free(p);
             l2->npending--;
             if (counted)
                 l2->stats.queue_dropped++;
         } else {
+            prev = p;
             pp = &p->next;
         }
     }
@@ -945,7 +837,7 @@ static NsNeigh *neigh_find(const NsL2 *l2, const NsAddr *addr)
 
     for (i = 0; i < NS_L2_MAX_NEIGHBORS; i++) {
         NsNeigh *n = (NsNeigh *)&l2->neigh[i];
-        if (n->state != NEIGH_FREE && addr_eq(&n->addr, addr))
+        if (n->state != NEIGH_FREE && ns_addr_eq(&n->addr, addr))
             return n;
     }
     return NULL;
@@ -984,7 +876,7 @@ static int pending_count_addr(const NsL2 *l2, const NsAddr *addr)
     int n = 0;
 
     while (p) {
-        if (addr_eq(&p->next_hop, addr))
+        if (ns_addr_eq(&p->next_hop, addr))
             n++;
         p = p->next;
     }
@@ -1008,14 +900,11 @@ static int pending_push(NsL2 *l2, const NsAddr *addr, const uint8_t *pkt,
     p->next_hop.family = (uint8_t)ns_addr_family(addr);
     p->len = len;
     memcpy(p->data, pkt, len);
-    if (!l2->pending) {
+    if (l2->pending_tail)
+        l2->pending_tail->next = p;
+    else
         l2->pending = p;
-    } else {
-        NsL2Pkt *tail = l2->pending;
-        while (tail->next)
-            tail = tail->next;
-        tail->next = p;
-    }
+    l2->pending_tail = p;
     l2->npending++;
     return 0;
 }
@@ -1023,15 +912,19 @@ static int pending_push(NsL2 *l2, const NsAddr *addr, const uint8_t *pkt,
 static void pending_flush(NsL2 *l2, const NsAddr *addr, const uint8_t *mac)
 {
     NsL2Pkt **pp = &l2->pending;
+    NsL2Pkt *prev = NULL;
 
     while (*pp) {
         NsL2Pkt *p = *pp;
-        if (addr_eq(&p->next_hop, addr)) {
+        if (ns_addr_eq(&p->next_hop, addr)) {
             *pp = p->next;
+            if (l2->pending_tail == p)
+                l2->pending_tail = prev;
             l2->npending--;
             l2_emit_ip(l2, p->data, p->len, mac);
             free(p);
         } else {
+            prev = p;
             pp = &p->next;
         }
     }
@@ -1041,10 +934,10 @@ static void neigh_learn(NsL2 *l2, const NsAddr *addr, const uint8_t *mac)
 {
     NsNeigh *n;
 
-    if (addr_unspecified(addr) || addr_multicast(addr) ||
-        addr_broadcast4(addr) || !mac_usable(mac))
+    if (ns_addr_unspecified(addr) || ns_addr_multicast(addr) ||
+        ns_addr_broadcast(addr) || !mac_usable(mac))
         return;
-    if ((l2->has4 && addr_eq(addr, &l2->local4)) || is_local6(l2, addr))
+    if ((l2->has4 && ns_addr_eq(addr, &l2->local4)) || is_local6(l2, addr))
         return;
 
     n = neigh_find(l2, addr);
@@ -1115,10 +1008,10 @@ static void arp_input(NsL2 *l2, const uint8_t *arp, size_t len)
 
     if (len < 28)
         return;
-    if (rd16(arp) != 1 || rd16(arp + 2) != 0x0800 ||
+    if (ns_rd16(arp) != 1 || ns_rd16(arp + 2) != 0x0800 ||
         arp[4] != NS_L2_MAC_LEN || arp[5] != 4)
         return;
-    op = rd16(arp + 6);
+    op = ns_rd16(arp + 6);
     memcpy(sha, arp + 8, NS_L2_MAC_LEN);
     memset(&spa, 0, sizeof(spa));
     memset(&tpa, 0, sizeof(tpa));
@@ -1129,8 +1022,8 @@ static void arp_input(NsL2 *l2, const uint8_t *arp, size_t len)
     l2->stats.rx_arp++;
     neigh_learn(l2, &spa, sha);
 
-    if (op == 1 && l2->has4 && addr_eq(&tpa, &l2->local4) &&
-        !addr_unspecified(&spa))
+    if (op == 1 && l2->has4 && ns_addr_eq(&tpa, &l2->local4) &&
+        !ns_addr_unspecified(&spa))
         arp_emit_reply(l2, sha, &spa);
 }
 
@@ -1298,7 +1191,7 @@ int ns_l2_set_router_discovery(NsL2 *l2, int enable)
             continue;
         if (r->kind == ROUTE_RA ||
             (had_link && r->family == NS_AF_INET6 && r->prefix_len == 64 &&
-             addr_eq(&r->dest, &linknet)))
+             ns_addr_eq(&r->dest, &linknet)))
             memset(r, 0, sizeof(*r));
     }
     return 0;
@@ -1377,7 +1270,7 @@ int ns_l2_send_ip(NsL2 *l2, const uint8_t *pkt, size_t len)
     if (version == 4) {
         dst.family = NS_AF_INET;
         memcpy(dst.b, pkt + 16, 4);
-        if (l2->has4 && addr_eq(&dst, &l2->local4)) {
+        if (l2->has4 && ns_addr_eq(&dst, &l2->local4)) {
             l2->stats.local_delivered++;
             if (l2->stack)
                 ns_input(l2->stack, pkt, len);
@@ -1388,9 +1281,9 @@ int ns_l2_send_ip(NsL2 *l2, const uint8_t *pkt, size_t len)
             return -1;
         }
         memset(bcast, 0xff, sizeof(bcast));
-        if (addr_broadcast4(&dst) || subnet_broadcast4(l2, &dst))
+        if (ns_addr_broadcast(&dst) || subnet_broadcast4(l2, &dst))
             return l2_emit_ip(l2, pkt, len, bcast);
-        if (addr_multicast(&dst)) {
+        if (ns_addr_multicast(&dst)) {
             mac_multicast4(&dst, mcast);
             return l2_emit_ip(l2, pkt, len, mcast);
         }
@@ -1423,7 +1316,7 @@ int ns_l2_send_ip(NsL2 *l2, const uint8_t *pkt, size_t len)
             l2->stats.dropped++;
             return -1;
         }
-        if (addr_multicast(&dst)) {
+        if (ns_addr_multicast(&dst)) {
             mac_multicast6(&dst, mcast);
             return l2_emit_ip(l2, pkt, len, mcast);
         }
@@ -1463,7 +1356,7 @@ void ns_l2_input(NsL2 *l2, const uint8_t *frame, size_t len)
         return; /* our own frame looped back */
 
     l2->stats.rx_frames++;
-    ethertype = rd16(frame + 12);
+    ethertype = ns_rd16(frame + 12);
     payload = frame + ETH_HDR;
     plen = len - ETH_HDR;
 
