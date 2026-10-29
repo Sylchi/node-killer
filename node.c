@@ -1697,9 +1697,41 @@ static JSValue js_node_dns(JSContext *ctx, JSValueConst this_val,
                            int argc, JSValueConst *argv)
 {
     const char *host = node_cstr(ctx, argv[0]);
-    struct addrinfo hints, *res = NULL, *p;
     if (!host)
         return JS_EXCEPTION;
+#ifdef QNODE_FREESTANDING
+    /* try literal parsing first */
+    struct in_addr a4;
+    if (inet_pton(AF_INET, host, &a4) == 1) {
+        JS_FreeCString(ctx, host);
+        JSValue arr = JS_NewArray(ctx);
+        JSValue o = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, o, "address", JS_NewString(ctx, host));
+        JS_SetPropertyStr(ctx, o, "family", JS_NewInt32(ctx, AF_INET));
+        JS_SetPropertyUint32(ctx, arr, 0, o);
+        return node_ok(ctx, arr);
+    }
+    struct in6_addr a6;
+    if (inet_pton(AF_INET6, host, &a6) == 1) {
+        JS_FreeCString(ctx, host);
+        JSValue arr = JS_NewArray(ctx);
+        JSValue o = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, o, "address", JS_NewString(ctx, host));
+        JS_SetPropertyStr(ctx, o, "family", JS_NewInt32(ctx, AF_INET6));
+        JS_SetPropertyUint32(ctx, arr, 0, o);
+        return node_ok(ctx, arr);
+    }
+    if (!strcmp(host, "localhost")) {
+        JS_FreeCString(ctx, host);
+        JSValue arr = JS_NewArray(ctx);
+        JSValue o = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, o, "address", JS_NewString(ctx, "127.0.0.1"));
+        JS_SetPropertyStr(ctx, o, "family", JS_NewInt32(ctx, AF_INET));
+        JS_SetPropertyUint32(ctx, arr, 0, o);
+        return node_ok(ctx, arr);
+    }
+#endif
+    struct addrinfo hints, *res = NULL, *p;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
