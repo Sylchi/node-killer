@@ -305,7 +305,7 @@ static int ns_init(void)
     uint8_t prefix[NS_PREFIX_LEN];
     uint8_t mac[NS_L2_MAC_LEN] = { 0x02, 0x51, 0x4e, 0x00, 0x00, 0x01 };
     NsAddr local6, local4, gw4, gw6;
-    const char *env;
+    const char *env = NULL;
     const char *device_name = NULL;
     int has_gw4 = 0, has_gw6 = 0;
     int kind = NS_LINK_LOOPBACK;
@@ -318,6 +318,9 @@ static int ns_init(void)
         return -1;
     ns_tried = 1;
 
+#if defined(QNODE_FREESTANDING)
+    /* keep loopback only, no TUN/TAP */
+#else
 #ifndef __linux__
     return -1;
 #else
@@ -431,6 +434,7 @@ static int ns_init(void)
     ns_link_attach(ns_link);
     ns_ready = 1;
     return 0;
+#endif
 #endif
 }
 
