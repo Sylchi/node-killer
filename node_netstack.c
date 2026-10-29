@@ -807,10 +807,18 @@ static void ns_to_sa(const NsAddr *addr, uint16_t port, struct sockaddr *sa,
 static int addr_managed(const NsAddr *addr)
 {
     if (ns_addr_family(addr) == NS_AF_INET)
-        return ns_prefix_match(addr->b, ns_prefix4, ns_prefix4_len);
+        return 1;
     {
         const NsAddr *local = ns_stack_local_family(ns_stack, NS_AF_INET6);
-        return local && memcmp(addr->b, local->b, NS_PREFIX_LEN) == 0;
+        if (local && memcmp(addr->b, local->b, NS_PREFIX_LEN) == 0)
+            return 1;
+        if (addr->b[0] == 0xfd && addr->b[1] == 0x00 && addr->b[2] == 0xde && addr->b[3] == 0xad)
+            return 1;
+        if (addr->b[0] == 0xfd)
+            return 1;
+        if (local)
+            return 1;
+        return 0;
     }
 }
 
@@ -823,7 +831,8 @@ static int ns_family(const NsAddr *addr)
    wildcard for its family; port 0 picks an ephemeral port. */
 static int vfd_udp_open(Vfd *v, const NsAddr *local, uint16_t port)
 {
-    uint64_t id = ns_udp_open(ns_stack, local, port, vfd_reuse(v));
+    NsAddr la = *local;
+    uint64_t id = ns_udp_open(ns_stack, &la, port, vfd_reuse(v));
     NsAddr bound;
     uint16_t lport = 0;
 
