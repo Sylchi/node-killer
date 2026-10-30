@@ -14,7 +14,7 @@ The project leverages the existing qnode codebase:
 - **libev** (event loop)
 - **mbedtls/libsodium** (TLS/crypto)
 
-## Current Status: Phase 2 ✅
+## Current Status: Phase 2 ✅ (LVGL Boot UI added)
 
 Phase 1 implements the minimal boot environment:
 
@@ -25,11 +25,57 @@ Phase 1 implements the minimal boot environment:
 | `bcm2711.h` | ✅ Done | Hardware register definitions |
 | `uart.c/h` | ✅ Done | PL011 UART driver (115200 8N1) |
 | `timer.c/h` | ✅ Done | System timer (1 MHz microsecond counter) |
-| `main.c` | ✅ Done | Boot message + display test pattern |
+| `main.c` | ✅ Done | Boot sequence, LVGL loop, keyboard → JS bridge |
+| `lvgl.c/h` | ✅ Done | LVGL display/input integration + boot UI |
+| `js.c/h` | ✅ Done | QuickJS runtime/context, console.log, JS helpers |
 | `mailbox.c/h` | ✅ Done | VideoCore mailbox interface |
 | `framebuffer.c/h` | ✅ Done | Framebuffer driver (800x480 @ 32bpp) |
 | `config.txt` | ✅ Done | Pi 4 boot configuration |
 | `Makefile` | ✅ Done | Cross-compilation build system |
+
+## LVGL Integration (Pi Boot UI)
+
+The kernel now uses [LVGL](https://github.com/lvgl/lvgl) (v9.2) as the graphics
+framework instead of drawing raw pixel patterns:
+
+- `src/lvgl.c/h` — LVGL integration driver:
+  - Creates an LVGL display (800x480) via the mailbox framebuffer
+  - `lvgl_flush_cb` copies the rendered LVGL draw buffer into the framebuffer
+  - Wires the FT5406 touch controller into LVGL as a pointer input device
+  - Builds a boot UI: splash (spinner + "Starting...") with an on-screen keyboard
+    (LVGL `lv_keyboard` + `lv_textarea`) below it
+- `lvgl/lv_conf.h` — LVGL configuration (enabled with `#if 1`, color depth 32 /
+  XRGB8888, 512 KB LVGL memory pool)
+- `Makefile` — compiles the LVGL library sources (`find ../lvgl/src -name '*.c' ...`)
+
+The main loop calls `lvgl_step()` (tick + `lv_timer_handler`), so the LVGL
+refresh timer drives rendering automatically (LVGL timers + animations).
+
+The on-screen keyboard: LVGL `lv_keyboard` (text mode) is assigned to an
+`lv_textarea` — key presses (incl. backspace via `LV_SYMBOL_BACKSPACE`) are
+inserted into the text area.
+
+Whenever the keyboard text changes, `lvgl_step()` reports it via the callback
+registered with `lvgl_set_keyboard_text_cb()` (in `src/lvgl.c`). The callback in
+`src/main.c` (`kb_text_cb`) forwards the text to the UART boot console *and*
+pushes it into the QuickJS runtime as the global `kbInput` string via
+`js_push_global_str()`.
+
+## JavaScript Engine (`src/js.c/h`)
+
+QuickJS is encapsulated behind a small module, so `src/main.c` never touches
+`JSRuntime`/`JSContext` directly:
+
+- `js_init()` — creates the runtime/context, registers the C-backed
+  `console.log` global (output goes to the UART) and evaluates the boot
+  test program
+- `js_step()` — drains pending QuickJS jobs (GC finalizers, promise jobs) via
+  `JS_ExecutePendingJob()`; call it from the main loop
+- `js_push_global_str(name, value)` — sets a string property on the JS global
+  object (used by the on-screen keyboard bridge)
+
+To change the boot UI, edit the splash screen in `src/lvgl.c` (`lvgl_init`) and
+rebuild with `cd baremetal && make`.
 
 ## Building
 
@@ -96,15 +142,15 @@ SUCCESS: Framebuffer initialized
 Base address: 0x...
 Size: 1536000 bytes
 Pitch: 3200 bytes/row
-Drawing test pattern...
-Test pattern drawn!
-You should see colored rectangles on the display.
 
-Phase 2 complete. System running.
+Initializing LVGL...
+SUCCESS: LVGL initialized, boot screen displayed.
+
+LVGL rendering active. Boot screen displayed.
 UART echo active. Type characters to see them echoed.
 ```
 
-The display should show a test pattern with colored rectangles on a dark blue background.
+The display should show the LVGL boot splash screen (spinner + "Starting...").
 
 ## Roadmap
 
@@ -118,10 +164,11 @@ The display should show a test pattern with colored rectangles on a dark blue ba
 ### Phase 2 — Display ✅
 - VideoCore mailbox driver
 - Framebuffer (800x480 RGB)
-- Test pattern rendering
+- LVGL rendering via flush callback
 
-### Phase 3 — Touch Input
+### Phase 3 — Touch Input ✅
 - FT5406 touch controller driver
+- LVGL pointer input device integration
 - Touch event handling
 - Input abstraction layer
 
@@ -136,6 +183,21 @@ The display should show a test pattern with colored rectangles on a dark blue ba
 - FAT32 reader (read-only, or Petit FATFS)
 - Ethernet (GENET MAC) → plug into netstack
 - WiFi (optional, via SDIO)
+
+## LVGL Boot UI
+
+The Pi boot display is rendered by LVGL:
+
+- **Display**: LVGL display (800x480, XRGB8888) on top of the mailbox framebuffer,
+  flush callback copies the rendered frame into the framebuffer
+- **Input**: FT5406 touch → LVGL `LV_INDEV_TYPE_POINTER` (timer-driven read)
+- **UI**: Boot UI in `baremetal/src/lvgl.c` (`lvgl_init`):
+  - Splash: dark background, centered spinner (1s arc animation) + "Starting..." label
+  - On-screen keyboard: LVGL `lv_keyboard` (text mode) with `lv_textarea` below the splash
+- **Loop**: main loop calls `lvgl_step()` → LVGL tick + `lv_timer_handler()`
+
+To customize the boot screen (logo, text, keyboard layout), edit `baremetal/src/lvgl.c`
+and rebuild: `cd baremetal && make`.
 
 ## Memory Map
 

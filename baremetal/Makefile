@@ -12,7 +12,24 @@ OBJCOPY = $(CROSS)objcopy
 # Compiler flags for bare-metal ARM64
 CFLAGS = -Wall -O2 -ffreestanding -nostdlib -nostartfiles
 CFLAGS += -march=armv8-a -mtune=cortex-a72
-CFLAGS += -I./include -I../include -I..
+CFLAGS += -I./include -I../include -I.. -I../lvgl
+
+# LVGL library sources (vendored at ../lvgl, software renderer, no OS)
+LVGL_SRCS := $(shell find ../lvgl/src -name '*.c' \
+    -not -path '*/drivers/*' -not -path '*/port/*' -not -path '*/libs/*' \
+    -not -path '*/others/*' -not -path '*/tests/*' -not -path '*/examples/*' \
+    -not -path '*/draw/arm2d/*' -not -path '*/draw/nxp/*' -not -path '*/draw/renesas/*' \
+    -not -path '*/draw/sdl/*' -not -path '*/draw/vg_lite/*' \
+    -not -name 'lv_cmsis_rtos2.c' -not -name 'lv_freertos.c' -not -name 'lv_mqx.c' \
+    -not -name 'lv_pthread.c' -not -name 'lv_rtthread.c' -not -name 'lv_windows.c' \
+    -not -path '*/stdlib/micropython/*' -not -path '*/stdlib/rtthread/*' \
+    -not -name 'lv_mem_core_clib.c' -not -name 'lv_sprintf_clib.c' -not -name 'lv_string_clib.c')
+
+LVGL_OBJS = $(patsubst ../lvgl/src/%.c,../lvgl/src/%.o,$(LVGL_SRCS))
+
+# LVGL references the built-in binary image decoder from lv_init()
+LVGL_SRCS += ../lvgl/src/libs/bin_decoder/lv_bin_decoder.c
+LVGL_OBJS = $(patsubst ../lvgl/src/%.c,../lvgl/src/%.o,$(LVGL_SRCS))
 
 # Assembler flags
 ASFLAGS = -march=armv8-a
@@ -22,7 +39,7 @@ LDFLAGS = -T linker.ld -nostdlib
 
 # Source files
 ASM_SRCS = src/start.S
-C_SRCS = src/uart.c src/timer.c src/mailbox.c src/framebuffer.c src/touch.c src/heap.c src/baremetal_libc.c src/main.c
+C_SRCS = src/uart.c src/timer.c src/mailbox.c src/framebuffer.c src/touch.c src/heap.c src/baremetal_libc.c src/lvgl.c src/js.c src/main.c
 
 # QuickJS source (from parent directory)
 # Note: We only use quickjs.c (the core engine), not quickjs-libc.c which requires filesystem
@@ -32,7 +49,7 @@ QUICKJS_OBJS = quickjs.o libregexp.o libunicode.o dtoa.o
 # Object files
 ASM_OBJS = $(ASM_SRCS:.S=.o)
 C_OBJS = $(C_SRCS:.c=.o)
-OBJS = $(ASM_OBJS) $(C_OBJS) $(QUICKJS_OBJS)
+OBJS = $(ASM_OBJS) $(C_OBJS) $(QUICKJS_OBJS) $(LVGL_OBJS)
 
 # Output files
 TARGET = kernel8.elf
@@ -54,9 +71,14 @@ $(IMG): $(TARGET)
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
+# Compile LVGL C sources
+../lvgl/src/%.o: ../lvgl/src/%.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
 # Assemble assembly files
 %.o: %.S
 	$(AS) $(ASFLAGS) $< -o $@
+
 
 # Compile QuickJS files from parent directory
 quickjs.o: ../quickjs.c src/baremetal_stubs.h
