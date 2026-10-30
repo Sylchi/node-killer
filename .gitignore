@@ -2,3 +2,6 @@
 /node_modules/
 /build-static/
 /benchmarks/runtime-comparison/aot-build/
+
+# Generated dependency files
+*.d
