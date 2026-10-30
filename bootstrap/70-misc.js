@@ -756,6 +756,47 @@ const worker_threads = {
   moveMessagePortToContext(port) { return port; },
 };
 
+/* ------------------------------------------------------------------ */
+/* cluster (multi-process management)                                 */
+/* ------------------------------------------------------------------ */
+
+const cluster = {
+  isMaster: true,
+  isPrimary: true,
+  isWorker: false,
+  schedulingPolicy: 0,
+  settings: {},
+  workers: {},
+  worker: null,
+  setupMaster(settings) {
+    Object.assign(this.settings, settings || {});
+  },
+  setupPrimary(settings) {
+    Object.assign(this.settings, settings || {});
+  },
+  fork(env) {
+    throw new Error("cluster.fork() is not supported in qnode");
+  },
+  disconnect(cb) {
+    if (typeof cb === "function")
+      queueMicrotask(cb);
+  },
+  on() { return this; },
+  once() { return this; },
+  off() { return this; },
+  emit() { return false; },
+  removeListener() { return this; },
+  removeAllListeners() { return this; },
+  addListener() { return this; },
+  prependListener() { return this; },
+  prependOnceListener() { return this; },
+  listeners() { return []; },
+  rawListeners() { return []; },
+  listenerCount() { return 0; },
+  eventNames() { return []; },
+};
+cluster.setupMaster = cluster.setupPrimary;
+
 const timersPromises = {
   setTimeout(ms, value, options) {
     return new Promise((resolve, reject) => {
@@ -795,6 +836,32 @@ const timersPromises = {
   },
 };
 
+class PerformanceObserver {
+  constructor(callback) {
+    this._callback = callback;
+    this._entryTypes = [];
+    this._buffered = false;
+  }
+  observe(options) {
+    if (!options || typeof options !== "object")
+      throw new TypeError("options is required");
+    if (options.entryTypes)
+      this._entryTypes = Array.from(options.entryTypes);
+    if (options.buffered !== undefined)
+      this._buffered = !!options.buffered;
+  }
+  disconnect() {
+    this._entryTypes = [];
+    this._buffered = false;
+  }
+  takeRecords() {
+    return [];
+  }
+}
+PerformanceObserver.supportedEntryTypes = [
+  "mark", "measure", "resource", "gc", "function", "http2", "http"
+];
+
 const perf_hooks = {
   performance: {
     timeOrigin: START_TIME,
@@ -806,11 +873,7 @@ const perf_hooks = {
     clearMarks() {},
     clearMeasures() {},
   },
-  PerformanceObserver: class PerformanceObserver {
-    constructor() {}
-    observe() {}
-    disconnect() {}
-  },
+  PerformanceObserver,
   monitorEventLoopDelay: () => ({ enable() {}, disable() {}, reset() {},
                                   percentile: () => 0 }),
 };
@@ -871,6 +934,75 @@ diagnosticsChannel.channel = ((orig) => {
     return cache.get(name);
   };
 })(diagnosticsChannel.channel);
+
+/* ------------------------------------------------------------------ */
+/* inspector                                                          */
+/* ------------------------------------------------------------------ */
+
+const inspector = {
+  open() {
+    throw new Error("inspector is not supported in qnode");
+  },
+  close() {},
+  url() {
+    return undefined;
+  },
+  waitForDebugger() {},
+  Network: {
+    enable() {},
+    disable() {},
+  },
+  HeapProfiler: {
+    enable() {},
+    disable() {},
+  },
+  Session: class Session {
+    connect() {
+      throw new Error("inspector is not supported in qnode");
+    }
+    disconnect() {}
+    post() {}
+  },
+};
+
+/* ------------------------------------------------------------------ */
+/* repl                                                               */
+/* ------------------------------------------------------------------ */
+
+const repl = {
+  REPLServer: class REPLServer extends EventEmitter {
+    constructor(options) {
+      super();
+      this.input = options.input;
+      this.output = options.output;
+    }
+    defineCommand() {}
+    displayPrompt() {}
+    clearBufferedCommand() {}
+    setupHistory() {}
+  },
+  start(options) {
+    throw new Error("repl is not supported in qnode");
+  },
+  Recoverable: class Recoverable extends Error {
+    constructor(err) {
+      super(err.message);
+      this.error = err;
+    }
+  },
+};
+
+/* ------------------------------------------------------------------ */
+/* wasi                                                               */
+/* ------------------------------------------------------------------ */
+
+const wasi = {
+  WASI: class WASI {
+    constructor(options) {
+      throw new Error("wasi is not supported in qnode");
+    }
+  },
+};
 
 /* ------------------------------------------------------------------ */
 /* readline                                                           */

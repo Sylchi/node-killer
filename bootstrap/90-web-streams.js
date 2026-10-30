@@ -1004,6 +1004,7 @@ function registerBuiltins() {
   builtins.async_hooks = async_hooks;
   builtins.buffer = bufferModule;
   builtins.child_process = child_process;
+  builtins.cluster = cluster;
   builtins.console = console;
   builtins.constants = fsConstants;
   builtins.crypto = crypto;
@@ -1016,6 +1017,8 @@ function registerBuiltins() {
   builtins["fs/promises"] = fsp;
   builtins.http = http;
   builtins.https = https;
+  builtins.http2 = http2;
+  builtins.inspector = inspector;
   builtins.module = Module;
   builtins.net = net;
   builtins.os = os;
@@ -1028,6 +1031,7 @@ function registerBuiltins() {
   builtins.querystring = querystring;
   builtins.readline = readline;
   builtins["readline/promises"] = readlinePromises;
+  builtins.repl = repl;
   builtins.stream = stream;
   builtins["stream/promises"] = {
     pipeline: (streams, options) => new Promise((resolve, reject) => {
@@ -1085,6 +1089,7 @@ function registerBuiltins() {
     promiseHooks: { onInit() {}, onBefore() {}, onAfter() {}, onSettled() {} },
   };
   builtins.vm = vm;
+  builtins.wasi = wasi;
   builtins.worker_threads = worker_threads;
   builtins.zlib = zlib;
   builtins._http_agent = http.Agent;

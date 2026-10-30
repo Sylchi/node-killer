@@ -226,6 +226,7 @@ globalScope.CountQueuingStrategy = CountQueuingStrategy;
 globalScope.ByteLengthQueuingStrategy = ByteLengthQueuingStrategy;
 globalScope.TextEncoderStream = TextEncoderStream;
 globalScope.TextDecoderStream = TextDecoderStream;
+globalScope.PerformanceObserver = PerformanceObserver;
 globalScope.structuredClone = structuredClone;
 globalScope.reportError = reportError;
 globalScope.performance = performance;

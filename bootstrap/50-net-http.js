@@ -1927,6 +1927,75 @@ const https = Object.assign({}, http, {
 https.Agent = class HttpsAgent extends Agent {};
 https.globalAgent = new https.Agent({ keepAlive: true });
 
+/* ------------------------------------------------------------------ */
+/* http2 (HTTP/2 protocol)                                            */
+/* ------------------------------------------------------------------ */
+
+const http2 = {
+  constants: {
+    NGHTTP2_SESSION_SERVER: 0,
+    NGHTTP2_SESSION_CLIENT: 1,
+    NGHTTP2_STREAM_STATE_IDLE: 1,
+    NGHTTP2_STREAM_STATE_OPEN: 2,
+    NGHTTP2_STREAM_STATE_RESERVED_LOCAL: 3,
+    NGHTTP2_STREAM_STATE_RESERVED_REMOTE: 4,
+    NGHTTP2_STREAM_STATE_HALF_CLOSED_LOCAL: 5,
+    NGHTTP2_STREAM_STATE_HALF_CLOSED_REMOTE: 6,
+    NGHTTP2_STREAM_STATE_CLOSED: 7,
+    NGHTTP2_ERROR_NO_ERROR: 0,
+    NGHTTP2_ERROR_PROTOCOL_ERROR: 1,
+    NGHTTP2_ERROR_INTERNAL_ERROR: 2,
+    NGHTTP2_ERROR_FLOW_CONTROL_ERROR: 3,
+    NGHTTP2_ERROR_SETTINGS_TIMEOUT: 4,
+    NGHTTP2_ERROR_STREAM_CLOSED: 5,
+    NGHTTP2_ERROR_FRAME_SIZE_ERROR: 6,
+    NGHTTP2_ERROR_REFUSED_STREAM: 7,
+    NGHTTP2_ERROR_CANCEL: 8,
+    NGHTTP2_ERROR_COMPRESSION_ERROR: 9,
+    NGHTTP2_ERROR_CONNECT_ERROR: 10,
+    NGHTTP2_ERROR_ENHANCE_YOUR_CALM: 11,
+    NGHTTP2_ERROR_INADEQUATE_SECURITY: 12,
+    NGHTTP2_ERROR_HTTP_1_1_REQUIRED: 13,
+    HTTP2_HEADER_STATUS: ":status",
+    HTTP2_HEADER_METHOD: ":method",
+    HTTP2_HEADER_AUTHORITY: ":authority",
+    HTTP2_HEADER_SCHEME: ":scheme",
+    HTTP2_HEADER_PATH: ":path",
+    HTTP2_HEADER_CONTENT_TYPE: "content-type",
+    HTTP2_HEADER_CONTENT_LENGTH: "content-length",
+    HTTP2_METHOD_GET: "GET",
+    HTTP2_METHOD_POST: "POST",
+    HTTP2_METHOD_PUT: "PUT",
+    HTTP2_METHOD_DELETE: "DELETE",
+    HTTP2_METHOD_PATCH: "PATCH",
+    HTTP2_METHOD_HEAD: "HEAD",
+    HTTP2_METHOD_OPTIONS: "OPTIONS",
+  },
+  getDefaultSettings() {
+    return {};
+  },
+  getPackedSettings() {
+    throw new Error("http2 is not supported in qnode");
+  },
+  getUnpackedSettings() {
+    throw new Error("http2 is not supported in qnode");
+  },
+  createServer() {
+    throw new Error("http2 is not supported in qnode");
+  },
+  createSecureServer() {
+    throw new Error("http2 is not supported in qnode");
+  },
+  connect() {
+    throw new Error("http2 is not supported in qnode");
+  },
+  Http2Session: class Http2Session {},
+  Http2ServerRequest: class Http2ServerRequest {},
+  Http2ServerResponse: class Http2ServerResponse {},
+  Http2Stream: class Http2Stream {},
+  Http2SecureServer: class Http2SecureServer {},
+};
+
 function defaultAgentFor(protocol) {
   return protocol === "https:" ? https.globalAgent : http.globalAgent;
 }
