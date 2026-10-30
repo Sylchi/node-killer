@@ -1,15 +1,66 @@
 /*
  * main.c - Entry point for qnode bare-metal kernel
  *
- * Phase 3: Boot to UART + Framebuffer + Touch input
+ * Phase 4: Boot to UART + Framebuffer + Touch input + Heap + JS Runtime
  */
 
 #include <stdint.h>
+#include <string.h>
+#include <stdlib.h>
 #include "uart.h"
 #include "timer.h"
 #include "framebuffer.h"
 #include "touch.h"
+#include "heap.h"
 #include "bcm2711.h"
+#include "quickjs.h"
+
+/* Heap memory buffer - 4MB for JavaScript runtime */
+static uint8_t heap_buffer[4 * 1024 * 1024] __attribute__((aligned(16)));
+
+/* console.log implementation - outputs to UART */
+static JSValue js_console_log(JSContext *ctx, JSValueConst this_val,
+                              int argc, JSValueConst *argv)
+{
+    for (int i = 0; i < argc; i++) {
+        if (i > 0) uart_puts(" ");
+        const char *str = JS_ToCString(ctx, argv[i]);
+        if (str) {
+            uart_puts(str);
+            JS_FreeCString(ctx, str);
+        } else {
+            uart_puts("[object]");
+        }
+    }
+    uart_puts("\r\n");
+    return JS_UNDEFINED;
+}
+
+/* Test JavaScript program */
+static const char *test_js = 
+    "console.log('Hello from QuickJS!');\n"
+    "console.log('2 + 2 =', 2 + 2);\n"
+    "console.log('Array test:', [1, 2, 3].length);\n"
+    "console.log('Object test:', {x: 10, y: 20}.x);\n"
+    "let sum = 0;\n"
+    "for (let i = 1; i <= 10; i++) sum += i;\n"
+    "console.log('Sum 1-10:', sum);\n";
+
+/* QuickJS memory allocation wrapper functions */
+static void *js_malloc_wrapper(void *opaque, size_t size) {
+    (void)opaque;
+    return malloc(size);
+}
+
+static void js_free_wrapper(void *opaque, void *ptr) {
+    (void)opaque;
+    free(ptr);
+}
+
+static void *js_realloc_wrapper(void *opaque, void *ptr, size_t size) {
+    (void)opaque;
+    return realloc(ptr, size);
+}
 
 /* Called from start.S after BSS is cleared and stack is set up */
 void main(void)
@@ -17,12 +68,15 @@ void main(void)
     /* Initialize hardware */
     uart_init();
     timer_init();
+    
+    /* Initialize heap allocator */
+    heap_init(heap_buffer, sizeof(heap_buffer));
 
     /* Print boot message */
     uart_puts("\r\n");
     uart_puts("========================================\r\n");
     uart_puts("qnode bare-metal kernel for Pi 4\r\n");
-    uart_puts("Phase 3: Touch Input Support\r\n");
+    uart_puts("Phase 4: JavaScript Runtime Support\r\n");
     uart_puts("========================================\r\n");
     uart_puts("\r\n");
     
@@ -61,6 +115,15 @@ void main(void)
     } else {
         uart_puts("WARNING: Touch input not available, continuing without touch\r\n");
     }
+    
+    /* Initialize JavaScript runtime - SKIPPED FOR DEBUG */
+    uart_puts("JavaScript runtime initialization skipped (debug mode)\r\n");
+    uart_puts("Heap stats: Free=");
+    uart_put_dec(heap_get_free());
+    uart_puts(" bytes, Used=");
+    uart_put_dec(heap_get_used());
+    uart_puts(" bytes\r\n");
+    uart_puts("\r\n");
     
     /* Draw a simple test pattern: colored rectangles */
     uart_puts("Drawing test pattern...\r\n");

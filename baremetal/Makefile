@@ -12,7 +12,7 @@ OBJCOPY = $(CROSS)objcopy
 # Compiler flags for bare-metal ARM64
 CFLAGS = -Wall -O2 -ffreestanding -nostdlib -nostartfiles
 CFLAGS += -march=armv8-a -mtune=cortex-a72
-CFLAGS += -I./include -I../include
+CFLAGS += -I./include -I../include -I..
 
 # Assembler flags
 ASFLAGS = -march=armv8-a
@@ -22,12 +22,17 @@ LDFLAGS = -T linker.ld -nostdlib
 
 # Source files
 ASM_SRCS = src/start.S
-C_SRCS = src/uart.c src/timer.c src/mailbox.c src/framebuffer.c src/touch.c src/main.c
+C_SRCS = src/uart.c src/timer.c src/mailbox.c src/framebuffer.c src/touch.c src/heap.c src/baremetal_libc.c src/main.c
+
+# QuickJS source (from parent directory)
+# Note: We only use quickjs.c (the core engine), not quickjs-libc.c which requires filesystem
+QUICKJS_SRCS = ../quickjs.c ../libregexp.c ../libunicode.c ../dtoa.c
+QUICKJS_OBJS = quickjs.o libregexp.o libunicode.o dtoa.o
 
 # Object files
 ASM_OBJS = $(ASM_SRCS:.S=.o)
 C_OBJS = $(C_SRCS:.c=.o)
-OBJS = $(ASM_OBJS) $(C_OBJS)
+OBJS = $(ASM_OBJS) $(C_OBJS) $(QUICKJS_OBJS)
 
 # Output files
 TARGET = kernel8.elf
@@ -37,9 +42,9 @@ IMG = kernel8.img
 
 all: $(IMG)
 
-# Link object files into ELF
+# Link object files into ELF (use CC driver to find libgcc)
 $(TARGET): $(OBJS) linker.ld
-	$(LD) $(LDFLAGS) $(OBJS) -o $(TARGET)
+	$(CC) $(CFLAGS) -T linker.ld -nostdlib -nostartfiles $(OBJS) -lgcc -o $(TARGET)
 
 # Convert ELF to raw binary image
 $(IMG): $(TARGET)
@@ -52,6 +57,19 @@ $(IMG): $(TARGET)
 # Assemble assembly files
 %.o: %.S
 	$(AS) $(ASFLAGS) $< -o $@
+
+# Compile QuickJS files from parent directory
+quickjs.o: ../quickjs.c src/baremetal_stubs.h
+	$(CC) $(CFLAGS) -I../include -I./src -include baremetal_stubs.h -DCONFIG_BIGNUM -DCONFIG_CHECK_JSVALUE -mno-outline-atomics -c $< -o $@
+
+libregexp.o: ../libregexp.c src/baremetal_stubs.h
+	$(CC) $(CFLAGS) -I../include -I./src -include baremetal_stubs.h -mno-outline-atomics -c $< -o $@
+
+libunicode.o: ../libunicode.c src/baremetal_stubs.h
+	$(CC) $(CFLAGS) -I../include -I./src -include baremetal_stubs.h -mno-outline-atomics -c $< -o $@
+
+dtoa.o: ../dtoa.c src/baremetal_stubs.h
+	$(CC) $(CFLAGS) -I../include -I./src -include baremetal_stubs.h -mno-outline-atomics -c $< -o $@
 
 clean:
 	rm -f $(OBJS) $(TARGET) $(IMG)

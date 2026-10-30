@@ -39,6 +39,14 @@ SECTIONS
         *(.data .data.*)
     }
 
+    /* Global constructors */
+    .init_array : ALIGN(8) {
+        __init_array_start = .;
+        KEEP(*(.init_array))
+        KEEP(*(SORT_BY_NAME(.init_array.*)))
+        __init_array_end = .;
+    }
+
     /* BSS (zero-initialized) */
     .bss : ALIGN(16) {
         __bss_start = .;
@@ -51,9 +59,9 @@ SECTIONS
     __kernel_end = .;
 
     /* Stack starts at 0x80000 (below the kernel image) and grows down.
-     * We reserve 64KB for the initial stack. */
+     * We reserve 256KB for the stack (QuickJS needs more stack space). */
     . = ALIGN(16);
-    __stack_bottom = 0x80000 - 0x10000;
+    __stack_bottom = 0x80000 - 0x40000;
     __stack_top = 0x80000;
 
     /* Provide symbols for BSS clearing in start.S */

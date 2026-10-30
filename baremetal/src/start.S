@@ -87,6 +87,17 @@ _start:
     b       .Lclear_bss
 .Lbss_done:
 
+    /* Call global constructors (.init_array) */
+    ldr     x0, =__init_array_start
+    ldr     x1, =__init_array_end
+.Linit_loop:
+    cmp     x0, x1
+    b.ge    .Linit_done
+    ldr     x2, [x0], #8
+    blr     x2
+    b       .Linit_loop
+.Linit_done:
+
     /* Jump to C main() */
     bl      main
 
