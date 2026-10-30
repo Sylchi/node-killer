@@ -28,9 +28,7 @@ static inline int clock_gettime(int clk_id, struct timespec *tp) {
     return 0;
 }
 
-/* pthread stubs - single-threaded environment
- * These work with newlib's pthread type definitions
- */
+/* pthread stubs - single-threaded environment */
 
 /* Mutex operations - no-op in single-threaded */
 static inline int pthread_mutex_init(pthread_mutex_t *mutex, const void *attr) {
@@ -100,8 +98,6 @@ static inline int pthread_cond_timedwait(pthread_cond_t *cond, pthread_mutex_t *
 }
 
 /* Thread operations - stubs */
-/* Note: PTHREAD_CREATE_DETACHED is already defined by newlib */
-
 static inline int pthread_attr_init(pthread_attr_t *attr) {
     (void)attr;
     return 0;
@@ -124,7 +120,6 @@ static inline int pthread_attr_destroy(pthread_attr_t *attr) {
 
 static inline int pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start_routine)(void*), void *arg) {
     (void)thread; (void)attr; (void)start_routine; (void)arg;
-    /* Can't create threads in bare-metal, just call the function directly */
     return 0;
 }
 
@@ -133,18 +128,17 @@ static inline int pthread_join(pthread_t thread, void **retval) {
     return 0;
 }
 
-/* pthread_once - execute once */
-/* Use a simple zero initializer that works with newlib's structure */
+/* pthread_once - execute once per control object */
 #ifndef PTHREAD_ONCE_INIT
-#define PTHREAD_ONCE_INIT {0}
+#define PTHREAD_ONCE_INIT {1, 0}
 #endif
 
 static inline int pthread_once(pthread_once_t *once_control, void (*init_routine)(void)) {
-    /* In single-threaded environment, just check and execute */
-    static int initialized = 0;
-    if (!initialized) {
-        initialized = 1;
-        init_routine();
+    if (!once_control->init_executed) {
+        once_control->init_executed = 1;
+        if (init_routine) {
+            init_routine();
+        }
     }
     return 0;
 }

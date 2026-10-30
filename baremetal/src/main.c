@@ -116,6 +116,18 @@ void main(void)
         uart_puts("WARNING: Touch input not available, continuing without touch\r\n");
     }
     
+    /* Initialize JavaScript runtime */
+    uart_puts("Initializing JavaScript runtime...\r\n");
+    
+    /* Print heap statistics before QuickJS init */
+    uart_puts("Heap stats before JS init:\r\n");
+    uart_puts("  Free: ");
+    uart_put_dec(heap_get_free());
+    uart_puts(" bytes\r\n");
+    uart_puts("  Used: ");
+    uart_put_dec(heap_get_used());
+    uart_puts(" bytes\r\n");
+    
     /* Initialize JavaScript runtime - SKIPPED FOR DEBUG */
     uart_puts("JavaScript runtime initialization skipped (debug mode)\r\n");
     uart_puts("Heap stats: Free=");
