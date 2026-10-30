@@ -1,0 +1,13 @@
+# Build artifacts
+*.o
+*.elf
+*.img
+*.bin
+
+# Build directory
+build/
+
+# Editor files
+*.swp
+*.swo
+*~

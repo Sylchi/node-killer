@@ -1,0 +1,35 @@
+# Raspberry Pi 4 boot configuration for qnode bare-metal kernel
+
+# Enable 64-bit mode
+arm_64bit=1
+
+# Disable Bluetooth UART to free up PL011 (UART0)
+dtoverlay=disable-bt
+
+# Enable UART for debug output
+enable_uart=1
+
+# Set UART clock for reliable 115200 baud
+init_uart_clock=48000000
+
+# Kernel image name
+kernel=kernel8.img
+
+# Disable overscan (use full display area)
+disable_overscan=1
+
+# Framebuffer depth
+framebuffer_depth=32
+
+# Force HDMI/DPI output (uncomment if needed for your display)
+# hdmi_force_hotplug=1
+# hdmi_group=2
+# hdmi_mode=87
+# hdmi_cvt=800 480 60 3 0 0 0
+
+# Memory split (give more to ARM since we're not running Linux)
+# Default is fine for now, but can be adjusted if needed
+# gpu_mem=16
+
+# Boot delay
+boot_delay=0
