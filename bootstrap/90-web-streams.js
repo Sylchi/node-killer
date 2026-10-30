@@ -37,6 +37,58 @@ class ReadableStreamDefaultController {
   error(e) { this._stream._error(e); }
 }
 
+class ReadableStreamBYOBRequest {
+  constructor(controller, view) {
+    this._controller = controller;
+    this._view = view;
+  }
+  get view() { return this._view; }
+  respond(bytesWritten) {
+    if (!this._controller)
+      throw new TypeError("This BYOB request has been invalidated");
+    if (bytesWritten === undefined)
+      bytesWritten = 0;
+    this._controller._respondToPull(bytesWritten, false);
+  }
+  respondWithNewView(view) {
+    if (!this._controller)
+      throw new TypeError("This BYOB request has been invalidated");
+    if (!ArrayBuffer.isView(view))
+      throw new TypeError("A TypedArray view is required");
+    this._controller._respondToPull(view.byteLength, true, view);
+  }
+}
+
+class ReadableByteStreamController {
+  constructor(stream) {
+    this._stream = stream;
+    this._byobRequest = null;
+    this._closeRequested = false;
+  }
+  get byobRequest() { return this._byobRequest; }
+  get desiredSize() { return this._stream._desiredSize(); }
+  enqueue(chunk) {
+    if (!ArrayBuffer.isView(chunk))
+      throw new TypeError("chunk must be an ArrayBufferView");
+    if (this._closeRequested)
+      throw new TypeError("stream is closed or closing");
+    // Convert to Uint8Array for consistent byte-oriented handling
+    const bytes = new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+    if (bytes.byteLength === 0)
+      return;
+    // Delegate to stream's queue mechanism
+    this._stream._enqueue(bytes);
+  }
+  close() {
+    if (this._byobRequest)
+      throw new TypeError("cannot close when BYOB request is pending");
+    this._closeRequested = true;
+    this._stream._close();
+  }
+  error(e) { this._stream._error(e); }
+}
+ReadableByteStreamController.prototype[Symbol.toStringTag] = "ReadableByteStreamController";
+
 class ReadableStreamDefaultReader {
   constructor(stream) {
     if (stream._reader)
@@ -133,7 +185,12 @@ class ReadableStream {
     this._disturbed = false;
     this._hwm = qnodeHighWaterMark(strategy, source.type === "bytes" ? 0 : 1);
     this._sizeFn = typeof strategy.size === "function" ? strategy.size : null;
-    this._controller = new ReadableStreamDefaultController(this);
+    this._isByteStream = source.type === "bytes";
+    if (this._isByteStream) {
+      this._controller = new ReadableByteStreamController(this);
+    } else {
+      this._controller = new ReadableStreamDefaultController(this);
+    }
     if (typeof source.start === "function") {
       try {
         const r = source.start(this._controller);
@@ -985,6 +1042,8 @@ function registerBuiltins() {
     ReadableStreamDefaultReader,
     ReadableStreamBYOBReader,
     ReadableStreamDefaultController,
+    ReadableByteStreamController,
+    ReadableStreamBYOBRequest,
     WritableStream,
     WritableStreamDefaultWriter,
     WritableStreamDefaultController,
@@ -1110,4 +1169,109 @@ function structuredClone(value) {
   };
   return clone(value);
 }
+
+/* ------------------------------------------------------------------ */
+/* CompressionStream / DecompressionStream                            */
+/* ------------------------------------------------------------------ */
+
+class CompressionStream {
+  constructor(format) {
+    if (format !== "gzip" && format !== "deflate" && format !== "deflate-raw") {
+      throw new TypeError(
+        "Failed to construct 'CompressionStream': '" + format + "' (compression format) is not supported."
+      );
+    }
+    
+    const zlibKind = format === "gzip" ? "gzip" : format === "deflate" ? "zlib" : "raw";
+    const chunks = [];
+    
+    const transformStream = new TransformStream({
+      transform(chunk, controller) {
+        if (typeof chunk === "string") {
+          chunks.push(Buffer.from(chunk, "utf8"));
+        } else if (chunk instanceof ArrayBuffer) {
+          chunks.push(Buffer.from(new Uint8Array(chunk)));
+        } else if (ArrayBuffer.isView(chunk)) {
+          chunks.push(Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength));
+        } else {
+          throw new TypeError("The provided value is not of type '(ArrayBuffer or ArrayBufferView or ByteString)'");
+        }
+      },
+      flush(controller) {
+        if (!hasZlib()) {
+          throw new Error("CompressionStream: zlib is not available");
+        }
+        const combined = Buffer.concat(chunks);
+        const compressed = zlibCompressSync(combined, {}, zlibKind);
+        controller.enqueue(compressed);
+      }
+    });
+    
+    Object.defineProperty(this, "readable", {
+      value: transformStream.readable,
+      writable: false,
+      enumerable: true,
+      configurable: true
+    });
+    Object.defineProperty(this, "writable", {
+      value: transformStream.writable,
+      writable: false,
+      enumerable: true,
+      configurable: true
+    });
+  }
+}
+
+CompressionStream.prototype[Symbol.toStringTag] = "CompressionStream";
+
+class DecompressionStream {
+  constructor(format) {
+    if (format !== "gzip" && format !== "deflate" && format !== "deflate-raw") {
+      throw new TypeError(
+        "Failed to construct 'DecompressionStream': '" + format + "' (decompression format) is not supported."
+      );
+    }
+    
+    const zlibKind = format === "gzip" ? "auto" : format === "deflate" ? "zlib" : "raw";
+    const chunks = [];
+    
+    const transformStream = new TransformStream({
+      transform(chunk, controller) {
+        if (typeof chunk === "string") {
+          chunks.push(Buffer.from(chunk, "utf8"));
+        } else if (chunk instanceof ArrayBuffer) {
+          chunks.push(Buffer.from(new Uint8Array(chunk)));
+        } else if (ArrayBuffer.isView(chunk)) {
+          chunks.push(Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength));
+        } else {
+          throw new TypeError("The provided value is not of type '(ArrayBuffer or ArrayBufferView or ByteString)'");
+        }
+      },
+      flush(controller) {
+        if (!hasZlib()) {
+          throw new Error("DecompressionStream: zlib is not available");
+        }
+        const combined = Buffer.concat(chunks);
+        const decompressed = zlibDecompressSync(combined, {}, zlibKind);
+        controller.enqueue(decompressed);
+      }
+    });
+    
+    Object.defineProperty(this, "readable", {
+      value: transformStream.readable,
+      writable: false,
+      enumerable: true,
+      configurable: true
+    });
+    Object.defineProperty(this, "writable", {
+      value: transformStream.writable,
+      writable: false,
+      enumerable: true,
+      configurable: true
+    });
+  }
+}
+
+DecompressionStream.prototype[Symbol.toStringTag] = "DecompressionStream";
+
 

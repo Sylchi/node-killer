@@ -70,15 +70,6 @@ function wsValidCloseCode(code) {
   return (code >= 1000 && code <= 1014) || (code >= 3000 && code <= 4999);
 }
 
-class WebSocketCloseEvent extends Event {
-  constructor(code, reason, wasClean) {
-    super("close");
-    this.code = code;
-    this.reason = reason;
-    this.wasClean = wasClean;
-  }
-}
-
 class WebSocket extends EventTarget {
   constructor(url, protocols, internal) {
     super();
@@ -526,7 +517,7 @@ class WebSocket extends EventTarget {
   }
 
   _emitClose(code, reason, wasClean) {
-    const event = new WebSocketCloseEvent(code, reason, wasClean);
+    const event = new CloseEvent("close", { code, reason, wasClean });
     super.dispatchEvent(event);
     this._emitNode("close", code, reason, event);
   }

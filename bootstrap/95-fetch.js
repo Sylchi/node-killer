@@ -327,17 +327,28 @@ function normalizeRequestBody(body, headers, duplex) {
   throw new TypeError("Request body: unsupported body type");
 }
 
-async function readStreamFully(stream) {
+async function readStreamFully(stream, target) {
   if (stream.locked)
     throw new TypeError("Body is unusable: Body has already been read");
   const reader = stream.getReader();
   const chunks = [];
+  let loaded = 0;
   try {
     for (;;) {
       const r = await reader.read();
       if (r.done)
         break;
-      chunks.push(Buffer.from(r.value));
+      const chunk = Buffer.from(r.value);
+      chunks.push(chunk);
+      loaded += chunk.length;
+      if (target && typeof target.dispatchEvent === "function") {
+        target._loadedBytes = loaded;
+        target.dispatchEvent(new ProgressEvent("progress", {
+          lengthComputable: target._totalBytes > 0,
+          loaded: loaded,
+          total: target._totalBytes
+        }));
+      }
     }
   } finally {
     try { reader.releaseLock(); } catch (e) {}
@@ -414,9 +425,31 @@ function bodyConsume(target) {
     if (target._bodyStream.locked)
       return Promise.reject(
         new TypeError("Body is unusable: Body has already been read"));
-    return readStreamFully(target._bodyStream);
+    return readStreamFully(target._bodyStream, target).then((buf) => {
+      if (typeof target.dispatchEvent === "function") {
+        target.dispatchEvent(new ProgressEvent("load", {
+          lengthComputable: true,
+          loaded: buf.length,
+          total: buf.length
+        }));
+      }
+      return buf;
+    });
   }
-  return Promise.resolve(target._bodyBuffer || Buffer.alloc(0));
+  const buf = target._bodyBuffer || Buffer.alloc(0);
+  if (typeof target.dispatchEvent === "function") {
+    target.dispatchEvent(new ProgressEvent("progress", {
+      lengthComputable: true,
+      loaded: buf.length,
+      total: buf.length
+    }));
+    target.dispatchEvent(new ProgressEvent("load", {
+      lengthComputable: true,
+      loaded: buf.length,
+      total: buf.length
+    }));
+  }
+  return Promise.resolve(buf);
 }
 
 function bodyCloneInto(source, target) {
@@ -478,8 +511,9 @@ class Headers {
   [Symbol.iterator]() { return this.entries(); }
 }
 
-class Response {
+class Response extends EventTarget {
   constructor(body, init) {
+    super();
     init = init || {};
     this.status = init.status === undefined ? 200 : Number(init.status);
     this.statusText = init.statusText === undefined ? "" : String(init.statusText);
@@ -491,22 +525,31 @@ class Response {
     this._bodyUsed = false;
     this._bodyBuffer = null;
     this._bodyStream = null;
+    this._totalBytes = 0;
+    this._loadedBytes = 0;
     if (body === null || body === undefined) {
       /* null body: HEAD, 204 and 304 responses have no readable stream */
     } else if (body instanceof ReadableStream) {
       this._bodyStream = body;
+      const contentLength = this.headers.get("content-length");
+      if (contentLength) {
+        this._totalBytes = parseInt(contentLength, 10) || 0;
+      }
     } else if (body instanceof Blob) {
       this._bodyBuffer = body._bytes();
+      this._totalBytes = this._bodyBuffer.length;
       if (body.type && !this.headers.has("content-type"))
         this.headers.set("content-type", body.type);
     } else if (body instanceof FormData) {
       const m = formDataToBuffer(body);
       this._bodyBuffer = m.buffer;
+      this._totalBytes = this._bodyBuffer.length;
       this.headers.set("content-type",
                        "multipart/form-data; boundary=" + m.boundary);
     } else {
       const bytes = copyBodyBytes(body);
       this._bodyBuffer = bytes || Buffer.from(String(body), "utf8");
+      this._totalBytes = this._bodyBuffer.length;
     }
   }
   get body() {

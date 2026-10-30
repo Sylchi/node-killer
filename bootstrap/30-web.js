@@ -17,6 +17,33 @@ class Event {
   stopImmediatePropagation() { this._stop = true; }
 }
 
+class CustomEvent extends Event {
+  constructor(type, init) {
+    super(type, init);
+    this.detail = init && init.detail !== undefined ? init.detail : null;
+  }
+}
+
+class ProgressEvent extends Event {
+  constructor(type, init) {
+    super(type, init);
+    init = init || {};
+    this.lengthComputable = !!init.lengthComputable;
+    this.loaded = typeof init.loaded === "number" ? init.loaded : 0;
+    this.total = typeof init.total === "number" ? init.total : 0;
+  }
+}
+
+class CloseEvent extends Event {
+  constructor(type, init) {
+    super(type, init);
+    init = init || {};
+    this.wasClean = !!init.wasClean;
+    this.code = typeof init.code === "number" ? init.code : 0;
+    this.reason = typeof init.reason === "string" ? init.reason : "";
+  }
+}
+
 class EventTarget {
   constructor() { this._listeners = Object.create(null); }
   addEventListener(type, fn, options) {

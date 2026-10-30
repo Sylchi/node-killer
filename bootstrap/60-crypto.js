@@ -780,10 +780,115 @@ const crypto = {
       .set(Buffer.from(bytes));
     return arr;
   },
-  webcrypto: {},
-  subtle: {},
 };
+
+/* Web Crypto API classes */
+class CryptoKey {
+  constructor(type, extractable, algorithm, usages, keyData) {
+    this.type = type;
+    this.extractable = extractable;
+    this.algorithm = algorithm;
+    this.usages = usages;
+    this._keyData = keyData;
+  }
+}
+
+class SubtleCrypto {
+  async digest(algorithm, data) {
+    if (typeof algorithm === "string") {
+      algorithm = { name: algorithm };
+    }
+    const algo = algorithm.name.toLowerCase().replace("-", "");
+    const hashFn = {
+      "sha1": sha1,
+      "sha256": (bytes) => {
+        const h = createHash("sha256");
+        h.update(Buffer.from(bytes));
+        return h.digest();
+      },
+      "sha384": (bytes) => {
+        const h = createHash("sha384");
+        h.update(Buffer.from(bytes));
+        return h.digest();
+      },
+      "sha512": (bytes) => {
+        const h = createHash("sha512");
+        h.update(Buffer.from(bytes));
+        return h.digest();
+      },
+    }[algo];
+    
+    if (!hashFn) {
+      throw new Error("Unsupported algorithm: " + algorithm.name);
+    }
+    
+    const input = data instanceof ArrayBuffer 
+      ? new Uint8Array(data)
+      : data;
+    const result = hashFn(input);
+    const buffer = new ArrayBuffer(result.length);
+    new Uint8Array(buffer).set(result);
+    return buffer;
+  }
+
+  async encrypt(algorithm, key, data) {
+    throw new Error("encrypt() not yet implemented");
+  }
+
+  async decrypt(algorithm, key, data) {
+    throw new Error("decrypt() not yet implemented");
+  }
+
+  async sign(algorithm, key, data) {
+    throw new Error("sign() not yet implemented");
+  }
+
+  async verify(algorithm, key, signature, data) {
+    throw new Error("verify() not yet implemented");
+  }
+
+  async generateKey(algorithm, extractable, keyUsages) {
+    throw new Error("generateKey() not yet implemented");
+  }
+
+  async deriveKey(algorithm, baseKey, derivedKeyType, extractable, keyUsages) {
+    throw new Error("deriveKey() not yet implemented");
+  }
+
+  async deriveBits(algorithm, baseKey, length) {
+    throw new Error("deriveBits() not yet implemented");
+  }
+
+  async importKey(format, keyData, algorithm, extractable, keyUsages) {
+    if (format !== "raw") {
+      throw new Error("importKey() only supports 'raw' format currently");
+    }
+    return new CryptoKey("secret", extractable, algorithm, keyUsages, keyData);
+  }
+
+  async exportKey(format, key) {
+    if (format !== "raw") {
+      throw new Error("exportKey() only supports 'raw' format currently");
+    }
+    if (!key.extractable) {
+      throw new Error("Key is not extractable");
+    }
+    return key._keyData;
+  }
+
+  async wrapKey(format, key, wrappingKey, wrapAlgorithm) {
+    throw new Error("wrapKey() not yet implemented");
+  }
+
+  async unwrapKey(format, wrappedKey, unwrappingKey, unwrapAlgorithm, unwrappedKeyAlgorithm, extractable, keyUsages) {
+    throw new Error("unwrapKey() not yet implemented");
+  }
+}
+
+crypto.webcrypto = {};
 crypto.webcrypto.getRandomValues = crypto.getRandomValues;
 crypto.webcrypto.randomUUID = crypto.randomUUID;
-crypto.webcrypto.subtle = crypto.subtle;
+crypto.webcrypto.subtle = new SubtleCrypto();
+crypto.webcrypto.CryptoKey = CryptoKey;
+crypto.webcrypto.SubtleCrypto = SubtleCrypto;
 
