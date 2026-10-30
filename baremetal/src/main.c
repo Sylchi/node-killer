@@ -64,7 +64,7 @@ void main(void)
 
     uart_puts("SUCCESS: Framebuffer initialized\r\n");
     uart_puts("Base address: 0x");
-    uart_put_hex((uint32_t)fb.base);
+    uart_put_hex((uint32_t)(uintptr_t)fb.base);
     uart_puts("\r\n");
     uart_puts("Size: ");
     uart_put_dec(fb.size);

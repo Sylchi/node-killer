@@ -43,7 +43,6 @@ void *heap_alloc(size_t size) {
     size = align_size(size);
     
     // First-fit search
-    Block *prev = NULL;
     Block *curr = free_list;
     
     while (curr != NULL) {
@@ -68,7 +67,6 @@ void *heap_alloc(size_t size) {
             return (void *)((uint8_t *)curr + BLOCK_HEADER_SIZE);
         }
         
-        prev = curr;
         curr = curr->next;
     }
     

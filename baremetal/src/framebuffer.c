@@ -74,7 +74,7 @@ int framebuffer_init(framebuffer_t *fb, uint32_t width, uint32_t height, uint32_
     
     // Parse response
     ptr = fb_property_buffer;
-    uint32_t buffer_size = *ptr++;
+    (void)*ptr++;                 // skip buffer size (bytes)
     uint32_t status = *ptr++;
     
     if ((status & 0x80000000) == 0) {
@@ -86,7 +86,7 @@ int framebuffer_init(framebuffer_t *fb, uint32_t width, uint32_t height, uint32_
     while (*ptr != TAG_END) {
         uint32_t tag = *ptr++;
         uint32_t value_size = *ptr++;
-        uint32_t indicator = *ptr++;
+        (void)*ptr++;             // skip tag indicator
         
         if (tag == TAG_ALLOC_FB) {
             fb->base = (void *)(uintptr_t)(*ptr++);
