@@ -1,13 +1,14 @@
 /*
  * main.c - Entry point for qnode bare-metal kernel
  *
- * Phase 2: Boot to UART + Framebuffer output
+ * Phase 3: Boot to UART + Framebuffer + Touch input
  */
 
 #include <stdint.h>
 #include "uart.h"
 #include "timer.h"
 #include "framebuffer.h"
+#include "touch.h"
 #include "bcm2711.h"
 
 /* Called from start.S after BSS is cleared and stack is set up */
@@ -21,7 +22,7 @@ void main(void)
     uart_puts("\r\n");
     uart_puts("========================================\r\n");
     uart_puts("qnode bare-metal kernel for Pi 4\r\n");
-    uart_puts("Phase 2: Display Support\r\n");
+    uart_puts("Phase 3: Touch Input Support\r\n");
     uart_puts("========================================\r\n");
     uart_puts("\r\n");
     
@@ -51,6 +52,15 @@ void main(void)
     uart_puts("Pitch: ");
     uart_put_dec(fb.pitch);
     uart_puts(" bytes/row\r\n");
+    
+    /* Initialize touch input */
+    uart_puts("Initializing touch input...\r\n");
+    result = touch_init();
+    if (result == 0) {
+        uart_puts("SUCCESS: Touch input initialized\r\n");
+    } else {
+        uart_puts("WARNING: Touch input not available, continuing without touch\r\n");
+    }
     
     /* Draw a simple test pattern: colored rectangles */
     uart_puts("Drawing test pattern...\r\n");
@@ -121,12 +131,18 @@ void main(void)
     uart_puts("You should see colored rectangles on the display.\r\n");
     uart_puts("\r\n");
     
-    uart_puts("Phase 2 complete. System running.\r\n");
+    uart_puts("Phase 3 complete. System running.\r\n");
     uart_puts("UART echo active. Type characters to see them echoed.\r\n");
+    if (result == 0) {
+        uart_puts("Touch input active. Touch the screen to see coordinates.\r\n");
+    }
     uart_puts("\r\n");
 
-    /* Main loop: echo characters back and show heartbeat */
+    /* Main loop: echo characters back, handle touch, and show heartbeat */
     int heartbeat = 0;
+    TouchPoint last_touch = {0};
+    bool had_touch = false;
+    
     while (1) {
         /* Check for UART input */
         if (uart_rx_ready()) {
@@ -140,6 +156,38 @@ void main(void)
                 break;
             } else {
                 uart_putc(c);
+            }
+        }
+        
+        /* Check for touch input */
+        TouchPoint touch;
+        if (result == 0 && touch_read(&touch)) {
+            if (touch.pressed) {
+                /* Draw a white dot at touch position */
+                int tx = touch.x;
+                int ty = touch.y;
+                
+                /* Draw a 5x5 white square at touch point */
+                for (int dy = -2; dy <= 2; dy++) {
+                    for (int dx = -2; dx <= 2; dx++) {
+                        int px = tx + dx;
+                        int py = ty + dy;
+                        if (px >= 0 && px < 800 && py >= 0 && py < 480) {
+                            pixels[py * pitch_pixels + px] = 0xFFFFFF;
+                        }
+                    }
+                }
+                
+                /* Report touch on UART */
+                if (!had_touch || last_touch.x != touch.x || last_touch.y != touch.y) {
+                    uart_puts("Touch at (");
+                    uart_put_dec(touch.x);
+                    uart_puts(", ");
+                    uart_put_dec(touch.y);
+                    uart_puts(")\r\n");
+                    last_touch = touch;
+                    had_touch = true;
+                }
             }
         }
         

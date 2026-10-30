@@ -22,7 +22,7 @@ LDFLAGS = -T linker.ld -nostdlib
 
 # Source files
 ASM_SRCS = src/start.S
-C_SRCS = src/uart.c src/timer.c src/mailbox.c src/framebuffer.c src/main.c
+C_SRCS = src/uart.c src/timer.c src/mailbox.c src/framebuffer.c src/touch.c src/main.c
 
 # Object files
 ASM_OBJS = $(ASM_SRCS:.S=.o)
