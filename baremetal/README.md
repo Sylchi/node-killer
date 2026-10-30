@@ -14,7 +14,7 @@ The project leverages the existing qnode codebase:
 - **libev** (event loop)
 - **mbedtls/libsodium** (TLS/crypto)
 
-## Current Status: Phase 2 ✅ (LVGL Boot UI added)
+## Current Status: Phase 4 🚧 (LVGL Boot UI + QuickJS integration)
 
 Phase 1 implements the minimal boot environment:
 
@@ -114,26 +114,11 @@ Insert SD card, power on Pi 4. Connect USB serial to GPIO 14/15 (TX/RX) at 11520
 
 ## Expected Output
 
-### Phase 1 Output (UART):
+### UART (115200 8N1):
 ```
 ========================================
 qnode bare-metal kernel for Pi 4
-========================================
-
-Phase 1: UART initialized
-Timer frequency: 1 MHz
-
-Testing timer... delayed for ~1000000 us (expected ~1000000)
-
-Phase 1 complete. Entering main loop...
-Type characters to see them echoed back (Ctrl+C to halt)
-```
-
-### Phase 2 Output (Display):
-```
-========================================
-qnode bare-metal kernel for Pi 4
-Phase 2: Display Support
+Phase 4: JavaScript Runtime Support
 ========================================
 
 Initializing framebuffer...
@@ -142,15 +127,24 @@ SUCCESS: Framebuffer initialized
 Base address: 0x...
 Size: 1536000 bytes
 Pitch: 3200 bytes/row
-
+Initializing touch input...
+SUCCESS: Touch input initialized
 Initializing LVGL...
 SUCCESS: LVGL initialized, boot screen displayed.
-
+Hello from QuickJS!
+2 + 2 = 4
+Array test: 3
+Object test: 10
+Sum 1-10: 55
 LVGL rendering active. Boot screen displayed.
 UART echo active. Type characters to see them echoed.
 ```
 
-The display should show the LVGL boot splash screen (spinner + "Starting...").
+Typing on the on-screen keyboard echoes the text over UART and pushes it into
+the QuickJS global `kbInput`.
+
+The display shows the LVGL boot splash screen (spinner + "Starting...") with
+the on-screen keyboard below it.
 
 ## Roadmap
 
@@ -172,9 +166,11 @@ The display should show the LVGL boot splash screen (spinner + "Starting...").
 - Touch event handling
 - Input abstraction layer
 
-### Phase 4 — JS Runtime
+### Phase 4 — JS Runtime 🚧
+- QuickJS integration with UART console (`console.log`) ✅
+- Keyboard input bridged to JS global `kbInput` ✅
+- JS resource limits (heap 2 MB, stack 160 KB, 2 s watchdog) ✅
 - libev virtual fd polling backend
-- QuickJS integration with UART console
 - setTimeout/setInterval support
 - Web API polyfills
 
