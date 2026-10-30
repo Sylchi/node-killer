@@ -134,11 +134,10 @@ static inline int pthread_join(pthread_t thread, void **retval) {
 #endif
 
 static inline int pthread_once(pthread_once_t *once_control, void (*init_routine)(void)) {
-    if (!once_control->init_executed) {
+    if (!once_control || !init_routine) return 0;
+    if (once_control->init_executed == 0) {
         once_control->init_executed = 1;
-        if (init_routine) {
-            init_routine();
-        }
+        init_routine();
     }
     return 0;
 }

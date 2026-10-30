@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <stdarg.h>
 #include <time.h>
+#include <setjmp.h>
 
 #include "uart.h"
 #include "timer.h"
@@ -813,49 +814,4 @@ void __assert_func(const char *file, int line, const char *func, const char *exp
     abort();
 }
 
-/* setjmp/longjmp for QuickJS error handling */
-typedef unsigned long jmp_buf[32];
-
-int setjmp(jmp_buf env) {
-    __asm__ volatile(
-        "stp x19, x20, [%0, #0]\n"
-        "stp x21, x22, [%0, #16]\n"
-        "stp x23, x24, [%0, #32]\n"
-        "stp x25, x26, [%0, #48]\n"
-        "stp x27, x28, [%0, #64]\n"
-        "stp x29, x30, [%0, #80]\n"
-        "mov x2, sp\n"
-        "str x2, [%0, #96]\n"
-        "stp d8, d9, [%0, #112]\n"
-        "stp d10, d11, [%0, #128]\n"
-        "stp d12, d13, [%0, #144]\n"
-        "stp d14, d15, [%0, #160]\n"
-        :
-        : "r"(env)
-        : "memory"
-    );
-    return 0;
-}
-
-void longjmp(jmp_buf env, int val) {
-    __asm__ volatile(
-        "ldp x19, x20, [%0, #0]\n"
-        "ldp x21, x22, [%0, #16]\n"
-        "ldp x23, x24, [%0, #32]\n"
-        "ldp x25, x26, [%0, #48]\n"
-        "ldp x27, x28, [%0, #64]\n"
-        "ldp x29, x30, [%0, #80]\n"
-        "ldr x2, [%0, #96]\n"
-        "mov sp, x2\n"
-        "ldp d8, d9, [%0, #112]\n"
-        "ldp d10, d11, [%0, #128]\n"
-        "ldp d12, d13, [%0, #144]\n"
-        "ldp d14, d15, [%0, #160]\n"
-        "mov x0, %1\n"
-        "ret"
-        :
-        : "r"(env), "r"(val)
-        : "memory"
-    );
-    __builtin_unreachable();
-}
+/* setjmp/longjmp for QuickJS error handling - using newlib */

@@ -128,14 +128,15 @@ void main(void)
     uart_put_dec(heap_get_used());
     uart_puts(" bytes\r\n");
     
-    /* Initialize JavaScript runtime - SKIPPED FOR DEBUG */
-    uart_puts("JavaScript runtime initialization skipped (debug mode)\r\n");
-    uart_puts("Heap stats: Free=");
-    uart_put_dec(heap_get_free());
-    uart_puts(" bytes, Used=");
-    uart_put_dec(heap_get_used());
-    uart_puts(" bytes\r\n");
-    uart_puts("\r\n");
+    /* Initialize JavaScript runtime */
+    uart_puts("Initializing JavaScript runtime...\r\n");
+    uart_puts("B\r\n");
+    
+    /* Try to create runtime without custom malloc */
+    uart_puts("calling\r\n");
+    /* Call the function directly */
+    void *rt_ptr = JS_NewRuntime();
+    uart_puts("ret\r\n");
     
     /* Draw a simple test pattern: colored rectangles */
     uart_puts("Drawing test pattern...\r\n");
