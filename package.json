@@ -24,6 +24,7 @@
     "precommit:install": "node scripts/install-pre-commit.js",
     "precommit:uninstall": "node scripts/install-pre-commit.js --uninstall",
     "cc": "node scripts/cc.js",
-    "cc-test": "node scripts/cc/test.js"
+    "cc-test": "node scripts/cc/test.js",
+    "selfhost": "node scripts/selfhost.js"
   }
 }

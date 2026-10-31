@@ -23,6 +23,36 @@ function fail(message) {
   process.exit(1);
 }
 
+/**
+ * @param {string[]} argv
+ * @returns {string|null} compiler executable, or null to run scripts/cc.js
+ */
+function parseArgs(argv) {
+  let compiler = null;
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === '--compiler') {
+      compiler = argv[++i];
+      if (!compiler) fail('--compiler requires a path');
+    } else if (arg.startsWith('--compiler=')) {
+      compiler = arg.slice('--compiler='.length);
+      if (!compiler) fail('--compiler requires a path');
+    } else if (arg === '-h' || arg === '--help') {
+      process.stdout.write(
+        'Usage: node scripts/cc/test.js [--compiler <path>]\n\n' +
+          '  --compiler <path>  compile tests with this executable instead of scripts/cc.js\n',
+      );
+      process.exit(0);
+    } else {
+      fail(`unknown option '${arg}' (try --help)`);
+    }
+  }
+  return compiler;
+}
+
+const compiler = parseArgs(process.argv.slice(2));
+const compileCommand = compiler ? [compiler] : ['node', ccScript];
+
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
     stdio: options.capture ? 'pipe' : 'inherit',
@@ -40,7 +70,7 @@ function runTest(testFile) {
   const outputFile = path.join(buildDir, baseName);
 
   // Compile
-  const compileResult = run('node', [ccScript, testFile, '-o', outputFile], {
+  const compileResult = run(compileCommand[0], [...compileCommand.slice(1), testFile, '-o', outputFile], {
     capture: true,
     allowFail: true,
   });
