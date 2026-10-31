@@ -73,11 +73,7 @@ static char *resolve_entry(const char *path)
             return NULL;
         }
         snprintf(cand, n, "%s%s", abs, exts[i]);
-        if (exts[i][0] == '\0' && file_exists(cand)) {
-            free(abs);
-            return cand;
-        }
-        if (exts[i][0] != '\0' && file_exists(cand)) {
+        if (file_exists(cand)) {
             free(abs);
             return cand;
         }

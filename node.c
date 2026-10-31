@@ -154,6 +154,47 @@ static void node_free_bytes(JSContext *ctx, NodeBytes *b)
         JS_FreeValue(ctx, b->abuf);
 }
 
+/* ---------------- direct memory access ---------------- */
+
+/* ArrayBuffer data release callback for externally allocated (C-side) memory.
+ * QuickJS calls this with a size of zero when the JS ArrayBuffer backing store
+ * is detached or finalized, which releases the C block. Returns NULL after
+ * releasing, or the new pointer when growing. */
+static void *node_mem_realloc(JSRuntime *rt, void *opaque, void *ptr, size_t size)
+{
+    (void)opaque;
+    return js_realloc_rt(rt, ptr, size);
+}
+
+/* Allocate 'size' bytes of native heap memory and expose it to JS as an
+ * ArrayBuffer backed by that block. The block is allocated through the
+ * QuickJS allocator (so it counts against the engine memory limit) and released
+ * automatically once the ArrayBuffer becomes unreachable (GC finalizer /
+ * detach) through node_mem_realloc above. JS can read and write the backing
+ * bytes directly, e.g. to prepare a frame for the compositor. */
+static JSValue js_node_alloc_memory(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv)
+{
+    int32_t len;
+    JSValue ab;
+    void *p;
+
+    (void)this_val;
+    if (argc < 1)
+        return JS_ThrowTypeError(ctx, "allocMemory: missing size argument");
+    if (JS_ToInt32(ctx, &len, argv[0]) || len < 0)
+        return JS_ThrowRangeError(ctx, "allocMemory: invalid size");
+    p = js_malloc_rt(JS_GetRuntime(ctx), len > 0 ? (size_t)len : 1);
+    if (!p)
+        return JS_ThrowOutOfMemory(ctx);
+    ab = JS_NewArrayBuffer(ctx, p, (size_t)len, 0, node_mem_realloc, NULL, false);
+    if (JS_IsException(ab)) {
+        js_free_rt(JS_GetRuntime(ctx), p);
+        return ab;
+    }
+    return ab;
+}
+
 /* ---------------- process ---------------- */
 
 static JSValue js_node_getpid(JSContext *ctx, JSValueConst this_val,
@@ -4927,6 +4968,7 @@ static const JSCFunctionListEntry js_node_funcs[] = {
     JS_CFUNC_DEF("cpuCount", 0, js_node_cpu_count),
     JS_CFUNC_DEF("meminfo", 0, js_node_meminfo),
     JS_CFUNC_DEF("memoryUsage", 0, js_node_memory_usage),
+    JS_CFUNC_DEF("allocMemory", 1, js_node_alloc_memory),
     JS_CFUNC_DEF("rusage", 0, js_node_rusage),
     JS_CFUNC_DEF("utf8Decode", 1, js_node_utf8_decode),
     JS_CFUNC_DEF("utf8Encode", 1, js_node_utf8_encode),

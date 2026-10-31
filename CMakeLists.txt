@@ -1,6 +1,59 @@
 cmake_minimum_required(VERSION 3.13)
 
+# qnode links prebuilt archives that are built for Linux with zig's bundled
+# musl libc. Selecting zig here keeps the same archives usable on glibc and
+# musl hosts instead of maintaining one archive set per libc. An explicit
+# compiler, CC, or toolchain file always wins; without zig the build falls
+# back to the host compiler and qnode is disabled.
+if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux"
+   AND NOT CMAKE_C_COMPILER
+   AND NOT DEFINED ENV{CC}
+   AND NOT CMAKE_TOOLCHAIN_FILE
+   AND NOT CMAKE_CROSSCOMPILING)
+    set(QNODE_ZIG_HOST_ARCH "${CMAKE_HOST_SYSTEM_PROCESSOR}")
+    if(NOT QNODE_ZIG_HOST_ARCH)
+        execute_process(COMMAND uname -m
+            OUTPUT_VARIABLE QNODE_ZIG_HOST_ARCH
+            OUTPUT_STRIP_TRAILING_WHITESPACE)
+    endif()
+    string(TOLOWER "${QNODE_ZIG_HOST_ARCH}" QNODE_ZIG_ARCH)
+    if(QNODE_ZIG_ARCH MATCHES "^(amd64|x86_64)$")
+        set(QNODE_ZIG_ARCH x86_64)
+    elseif(QNODE_ZIG_ARCH MATCHES "^(arm64|aarch64)$")
+        set(QNODE_ZIG_ARCH aarch64)
+    elseif(QNODE_ZIG_ARCH MATCHES "^(i[3-6]86|x86)$")
+        set(QNODE_ZIG_ARCH x86)
+    endif()
+    # Prefer the checked-in static zig toolchain (x86-64 only); fall back to
+    # an installed zig otherwise.
+    if(QNODE_ZIG_ARCH STREQUAL "x86_64"
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/vendor/zig/zig")
+        set(QNODE_ZIG "${CMAKE_CURRENT_SOURCE_DIR}/vendor/zig/zig")
+    else()
+        find_program(QNODE_ZIG NAMES zig)
+    endif()
+    if(QNODE_ZIG)
+        set(CMAKE_C_COMPILER "${QNODE_ZIG}" CACHE FILEPATH "C compiler")
+        set(CMAKE_C_COMPILER_ARG1 "cc" CACHE STRING
+            "Extra argument passed to the C compiler")
+        set(CMAKE_C_FLAGS_INIT "-target ${QNODE_ZIG_ARCH}-linux-musl")
+        set(QNODE_ZIG_TARGET "${QNODE_ZIG_ARCH}-linux-musl")
+        set(QNODE_ZIG_ARCH "${QNODE_ZIG_ARCH}" CACHE INTERNAL
+            "Host architecture for the zig musl target")
+        message(STATUS "Using zig cc (${QNODE_ZIG_TARGET})")
+    endif()
+endif()
+
 project(quickjs LANGUAGES C)
+
+# CMake's Makefile generator asks the linker for a dependency file. zig's
+# linker driver crashes on the generated `-Xlinker --dependency-file` flag, so
+# fall back to CMake's own link dependency tracking for zig builds.
+get_filename_component(QNODE_C_COMPILER_NAME "${CMAKE_C_COMPILER}" NAME)
+string(TOLOWER "${QNODE_C_COMPILER_NAME}" QNODE_C_COMPILER_NAME)
+if(QNODE_C_COMPILER_NAME MATCHES "^zig(\\.exe)?$")
+    set(CMAKE_LINK_DEPENDS_USE_LINKER FALSE)
+endif()
 
 include(CheckCCompilerFlag)
 include(GNUInstallDirs)
@@ -147,6 +200,74 @@ if(CMAKE_BUILD_TYPE MATCHES "Debug")
     xcheck_add_c_compiler_flag(-fno-omit-frame-pointer)
 endif()
 
+#
+# Prebuilt dependency archives
+#
+# zlib, mbedTLS, libsodium, libev and wasm3 are vendored but do not change
+# with qnode. They are linked from static archives in
+# vendor/prebuilt/<os>-<arch>/, so their sources are not compiled on every
+# build. The archives are produced by zig cc for <arch>-linux-musl; zig
+# supplies the libc, so a single archive set works on every Linux host.
+# libev and wasm3 keep their sources because they are also compiled for WASI,
+# Emscripten, Windows and macOS; zlib, mbedTLS and libsodium ship as headers
+# plus archives only.
+set(QNODE_PREBUILT_DIR "")
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # Archives are compiled by zig for <arch>-linux-musl; any other compiler
+    # would use the host libc, so qnode stays disabled for those builds.
+    get_filename_component(QNODE_C_COMPILER_NAME "${CMAKE_C_COMPILER}" NAME)
+    string(TOLOWER "${QNODE_C_COMPILER_NAME}" QNODE_C_COMPILER_NAME)
+    if(QNODE_C_COMPILER_NAME MATCHES "^zig(\\.exe)?$")
+        string(TOLOWER "${CMAKE_SYSTEM_NAME}" QNODE_PREBUILT_OS)
+        set(QNODE_PREBUILT_ARCH "${CMAKE_SYSTEM_PROCESSOR}")
+        if(NOT QNODE_PREBUILT_ARCH)
+            set(QNODE_PREBUILT_ARCH "${QNODE_ZIG_ARCH}")
+        endif()
+        if(NOT QNODE_PREBUILT_ARCH)
+            execute_process(COMMAND uname -m
+                OUTPUT_VARIABLE QNODE_PREBUILT_ARCH
+                OUTPUT_STRIP_TRAILING_WHITESPACE)
+        endif()
+        string(TOLOWER "${QNODE_PREBUILT_ARCH}" QNODE_PREBUILT_ARCH)
+        set(QNODE_PREBUILT_DIR
+            ${CMAKE_CURRENT_SOURCE_DIR}/vendor/prebuilt/${QNODE_PREBUILT_OS}-${QNODE_PREBUILT_ARCH})
+    endif()
+endif()
+
+if(QNODE_PREBUILT_DIR AND EXISTS ${QNODE_PREBUILT_DIR})
+    message(STATUS "Using prebuilt dependencies from ${QNODE_PREBUILT_DIR}")
+
+    function(qnode_import_prebuilt name archive)
+        set(archive_path ${QNODE_PREBUILT_DIR}/${archive})
+        if(NOT EXISTS ${archive_path})
+            message(FATAL_ERROR
+                "missing prebuilt archive ${archive_path}; see vendor/README.md "
+                "for the supported targets and how to regenerate the archives")
+        endif()
+        add_library(${name} STATIC IMPORTED)
+        set_target_properties(${name} PROPERTIES
+            IMPORTED_LOCATION ${archive_path})
+    endfunction()
+
+    # libev and wasm3 keep their sources, so only use their archives when the
+    # host has one. The other three libraries are archive-only.
+    if(EXISTS ${QNODE_PREBUILT_DIR}/libqnode_libev.a)
+        set(QNODE_PREBUILT_LIBEV TRUE)
+    endif()
+    if(EXISTS ${QNODE_PREBUILT_DIR}/libqnode_wasm3.a)
+        set(QNODE_PREBUILT_WASM3 TRUE)
+    endif()
+    # quickjs, like the libraries above, is upstream code that does not change
+    # with qnode. A prebuilt archive keeps its 2 MB quickjs.c translation unit
+    # off the build's critical path. Rebuild the archive when quickjs.c or a
+    # header it includes changes, see vendor/README.md.
+    option(QNODE_USE_PREBUILT_QJS
+        "Link quickjs from vendor/prebuilt instead of compiling its sources" ON)
+    if(QNODE_USE_PREBUILT_QJS AND EXISTS ${QNODE_PREBUILT_DIR}/libqjs.a)
+        set(QNODE_PREBUILT_QJS TRUE)
+    endif()
+endif()
+
 
 #
 # QuickJS library
@@ -164,49 +285,55 @@ set(qjs_sources
 # WASI modules work without a separate runtime. The only exception is a build
 # that is itself WebAssembly.
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "WASI" AND NOT EMSCRIPTEN)
-    set(wasm3_sources
-        vendor/wasm3/source/m3_bind.c
-        vendor/wasm3/source/m3_code.c
-        vendor/wasm3/source/m3_compile.c
-        vendor/wasm3/source/m3_core.c
-        vendor/wasm3/source/m3_deterministic.c
-        vendor/wasm3/source/m3_env.c
-        vendor/wasm3/source/m3_exec.c
-        vendor/wasm3/source/m3_function.c
-        vendor/wasm3/source/m3_info.c
-        vendor/wasm3/source/m3_module.c
-        vendor/wasm3/source/m3_parse.c
-        vendor/wasm3/source/m3_snapshot.c
-        vendor/wasm3/source/m3_validate.c
-        vendor/wasm3/source/m3_xxh64.c
-        vendor/wasm3/source/m3_api_wasi.c
-    )
-    # An object library keeps the vendored objects inside libqjs without
-    # adding a second installable target to the export set.
-    add_library(wasm3 OBJECT ${wasm3_sources})
-    set_target_properties(wasm3 PROPERTIES POSITION_INDEPENDENT_CODE ON)
-    target_include_directories(wasm3 PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/vendor/wasm3/source
-    )
-    # The "simple" WASI backend talks to POSIX directly, so it does not pull in
-    # libuv/uvwasi. d_m3HasFloat is on by default but spelled out because the
-    # JS bridge assumes it.
-    target_compile_definitions(wasm3 PRIVATE
-        d_m3HasWASI
-        d_m3HasFloat=1
-        _GNU_SOURCE
-    )
-    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
-        # wasm3 is not built clean under every warning the host project turns on.
-        target_compile_options(wasm3 PRIVATE
-            -Wno-unused-parameter
-            -Wno-unused-function
-            -Wno-sign-compare
+    if(QNODE_PREBUILT_WASM3)
+        qnode_import_prebuilt(qnode_wasm3 libqnode_wasm3.a)
+        list(APPEND qjs_prebuilt_libs qnode_wasm3)
+        message(STATUS "  wasm3: prebuilt (static)")
+    else()
+        set(wasm3_sources
+            vendor/wasm3/source/m3_bind.c
+            vendor/wasm3/source/m3_code.c
+            vendor/wasm3/source/m3_compile.c
+            vendor/wasm3/source/m3_core.c
+            vendor/wasm3/source/m3_deterministic.c
+            vendor/wasm3/source/m3_env.c
+            vendor/wasm3/source/m3_exec.c
+            vendor/wasm3/source/m3_function.c
+            vendor/wasm3/source/m3_info.c
+            vendor/wasm3/source/m3_module.c
+            vendor/wasm3/source/m3_parse.c
+            vendor/wasm3/source/m3_snapshot.c
+            vendor/wasm3/source/m3_validate.c
+            vendor/wasm3/source/m3_xxh64.c
+            vendor/wasm3/source/m3_api_wasi.c
         )
+        # An object library keeps the vendored objects inside libqjs without
+        # adding a second installable target to the export set.
+        add_library(wasm3 OBJECT ${wasm3_sources})
+        set_target_properties(wasm3 PROPERTIES POSITION_INDEPENDENT_CODE ON)
+        target_include_directories(wasm3 PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/vendor/wasm3/source
+        )
+        # The "simple" WASI backend talks to POSIX directly, so it does not pull in
+        # libuv/uvwasi. d_m3HasFloat is on by default but spelled out because the
+        # JS bridge assumes it.
+        target_compile_definitions(wasm3 PRIVATE
+            d_m3HasWASI
+            d_m3HasFloat=1
+            _GNU_SOURCE
+        )
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+            # wasm3 is not built clean under every warning the host project turns on.
+            target_compile_options(wasm3 PRIVATE
+                -Wno-unused-parameter
+                -Wno-unused-function
+                -Wno-sign-compare
+            )
+        endif()
+        list(APPEND qjs_sources $<TARGET_OBJECTS:wasm3>)
+        message(STATUS "  wasm3: vendored (static)")
     endif()
-    list(APPEND qjs_sources $<TARGET_OBJECTS:wasm3>)
     set(QJS_WASM3 TRUE)
-    message(STATUS "  wasm3: vendored (static)")
 else()
     set(QJS_WASM3 FALSE)
 endif()
@@ -214,7 +341,14 @@ endif()
 # libev is vendored and statically linked into the core library. It backs
 # quickjs-libc's event loop (io, timers, signals) on POSIX platforms.
 if(NOT WIN32 AND NOT CMAKE_SYSTEM_NAME STREQUAL "WASI" AND NOT EMSCRIPTEN)
-    list(APPEND qjs_sources vendor/libev/ev.c)
+    if(QNODE_PREBUILT_LIBEV)
+        qnode_import_prebuilt(qnode_libev libqnode_libev.a)
+        list(APPEND qjs_prebuilt_libs qnode_libev)
+        message(STATUS "  libev: prebuilt (static)")
+    else()
+        list(APPEND qjs_sources vendor/libev/ev.c)
+        message(STATUS "  libev: vendored (static)")
+    endif()
     list(APPEND qjs_defines EV_STANDALONE QJS_HAVE_LIBEV)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         # libev only auto-selects epoll when it detects glibc; musl has
@@ -222,7 +356,6 @@ if(NOT WIN32 AND NOT CMAKE_SYSTEM_NAME STREQUAL "WASI" AND NOT EMSCRIPTEN)
         # the O(n) poll backend on static musl builds.
         list(APPEND qjs_defines EV_USE_EPOLL=1)
     endif()
-    message(STATUS "  libev: vendored (static)")
 endif()
 
 list(APPEND qjs_defines _GNU_SOURCE)
@@ -244,27 +377,34 @@ find_package(Threads)
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "WASI")
     list(APPEND qjs_libs ${CMAKE_THREAD_LIBS_INIT})
 endif()
+list(APPEND qjs_libs ${qjs_prebuilt_libs})
 
-add_library(qjs STATIC ${qjs_sources})
-target_compile_definitions(qjs PRIVATE ${qjs_defines})
-if(QJS_WASM3)
-    target_compile_definitions(qjs PRIVATE QJS_BUILD_WASM3)
+if(QNODE_PREBUILT_QJS)
+    # Link quickjs from the checked-in archive instead of compiling its sources.
+    # The archive is built from the same sources and flags; see vendor/README.md
+    # for the regeneration command after touching quickjs.c or its headers.
+    qnode_import_prebuilt(qjs libqjs.a)
+    set_target_properties(qjs PROPERTIES
+        INTERFACE_INCLUDE_DIRECTORIES
+            "${CMAKE_CURRENT_SOURCE_DIR};${CMAKE_CURRENT_SOURCE_DIR}/vendor/libev;${CMAKE_CURRENT_SOURCE_DIR}/vendor/wasm3/source"
+    )
+    target_link_libraries(qjs INTERFACE ${qjs_libs})
+    message(STATUS "  quickjs: prebuilt (static)")
+else()
+    add_library(qjs STATIC ${qjs_sources})
+    target_compile_definitions(qjs PRIVATE ${qjs_defines})
+    if(QJS_WASM3)
+        target_compile_definitions(qjs PRIVATE QJS_BUILD_WASM3)
+    endif()
+    target_include_directories(qjs PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/vendor/libev>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/vendor/wasm3/source>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+    )
+    target_link_libraries(qjs PUBLIC ${qjs_libs})
+    message(STATUS "  quickjs: compiled from source")
 endif()
-target_include_directories(qjs PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/vendor/libev>
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/vendor/wasm3/source>
-    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
-)
-target_link_libraries(qjs PUBLIC ${qjs_libs})
-
-#
-# quickjs-libc
-#
-
-add_library(qjs-libc STATIC quickjs-libc.c)
-target_compile_definitions(qjs-libc PRIVATE ${qjs_defines})
-target_link_libraries(qjs-libc PRIVATE ${qjs_libs} qjs)
 
 # qnode embeds the JS bootstrap as a C array. The bootstrap lives in
 # bootstrap/ as ordered parts that are concatenated into one script (they
@@ -317,93 +457,41 @@ set_source_files_properties(node.c PROPERTIES OBJECT_DEPENDS ${NODE_BOOTSTRAP_H}
 #
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    # qnode compiles the vendored zlib and mbedTLS sources in-tree and links
-    # them statically, so the build has no external TLS or compression
-    # dependencies.
-    set(QNODE_ZLIB_DIR ${CMAKE_CURRENT_SOURCE_DIR}/vendor/zlib)
-    add_library(qnode_zlib STATIC
-        ${QNODE_ZLIB_DIR}/adler32.c
-        ${QNODE_ZLIB_DIR}/compress.c
-        ${QNODE_ZLIB_DIR}/crc32.c
-        ${QNODE_ZLIB_DIR}/deflate.c
-        ${QNODE_ZLIB_DIR}/gzclose.c
-        ${QNODE_ZLIB_DIR}/gzlib.c
-        ${QNODE_ZLIB_DIR}/gzread.c
-        ${QNODE_ZLIB_DIR}/gzwrite.c
-        ${QNODE_ZLIB_DIR}/infback.c
-        ${QNODE_ZLIB_DIR}/inffast.c
-        ${QNODE_ZLIB_DIR}/inflate.c
-        ${QNODE_ZLIB_DIR}/inftrees.c
-        ${QNODE_ZLIB_DIR}/trees.c
-        ${QNODE_ZLIB_DIR}/uncompr.c
-        ${QNODE_ZLIB_DIR}/zutil.c
-    )
-    target_include_directories(qnode_zlib PUBLIC ${QNODE_ZLIB_DIR})
-    target_compile_definitions(qnode_zlib PUBLIC _LARGEFILE64_SOURCE=1)
+    # zlib, mbedTLS and libsodium are shipped as headers plus prebuilt static
+    # archives; their sources are not part of the tree. They do not change
+    # with qnode, so keeping them precompiled avoids rebuilding ~250 C files
+    # on every build. See vendor/README.md for versions, supported targets,
+    # and how to regenerate the archives after an upgrade.
+    if(NOT QNODE_PREBUILT_DIR OR NOT EXISTS ${QNODE_PREBUILT_DIR})
+        # Keep other targets buildable for qjs/qjsc; qnode needs the archived
+        # crypto/compression libraries.
+        message(STATUS
+            "  qnode: disabled (no prebuilt archives for "
+            "${CMAKE_SYSTEM_NAME} ${CMAKE_SYSTEM_PROCESSOR}; install zig so "
+            "CMake can build for <arch>-linux-musl)")
+    else()
 
-    set(QNODE_MBEDTLS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/vendor/mbedtls)
-    file(GLOB QNODE_MBEDTLS_SOURCES CONFIGURE_DEPENDS
-        ${QNODE_MBEDTLS_DIR}/library/*.c)
-    add_library(qnode_mbedtls STATIC ${QNODE_MBEDTLS_SOURCES})
-    target_include_directories(qnode_mbedtls PUBLIC
-        ${QNODE_MBEDTLS_DIR}/include)
+    qnode_import_prebuilt(qnode_zlib libqnode_zlib.a)
+    set_target_properties(qnode_zlib PROPERTIES
+        INTERFACE_INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/vendor/zlib
+        INTERFACE_COMPILE_DEFINITIONS _LARGEFILE64_SOURCE=1)
+
+    qnode_import_prebuilt(qnode_mbedtls libqnode_mbedtls.a)
+    set_target_properties(qnode_mbedtls PROPERTIES
+        INTERFACE_INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/vendor/mbedtls/include)
 
     # libsodium is used for Ed25519, which the vendored mbedTLS build does
-    # not provide. It is compiled from the vendored sources with a portable
-    # configuration so the build needs no system crypto packages.
-    set(QNODE_SODIUM_DIR ${CMAKE_CURRENT_SOURCE_DIR}/vendor/libsodium)
-    if(NOT EXISTS ${QNODE_SODIUM_DIR}/src/libsodium/include/sodium.h)
-        message(FATAL_ERROR
-            "vendor/libsodium is missing; see vendor/README.md")
-    endif()
-    file(GLOB_RECURSE QNODE_SODIUM_SOURCES CONFIGURE_DEPENDS
-        ${QNODE_SODIUM_DIR}/src/libsodium/*.c)
-    add_library(qnode_sodium STATIC ${QNODE_SODIUM_SOURCES})
-    target_include_directories(qnode_sodium PUBLIC
-        ${QNODE_SODIUM_DIR}/src/libsodium/include
-        ${QNODE_SODIUM_DIR}/src/libsodium/include/sodium)
-    include(TestBigEndian)
-    test_big_endian(QNODE_BIG_ENDIAN)
-    if(QNODE_BIG_ENDIAN)
-        set(QNODE_SODIUM_ENDIAN NATIVE_BIG_ENDIAN=1)
-    else()
-        set(QNODE_SODIUM_ENDIAN NATIVE_LITTLE_ENDIAN=1)
-    endif()
-    target_compile_definitions(qnode_sodium PRIVATE
-        CONFIGURED=1
-        ${QNODE_SODIUM_ENDIAN}
-        HAVE_SYS_RANDOM_H=1
-        HAVE_SYS_MMAN_H=1
-        HAVE_SYS_PARAM_H=1
-        HAVE_SYS_AUXV_H=1
-        HAVE_DLFCN_H=1
-        HAVE_GETRANDOM=1
-        HAVE_GETENTROPY=1
-        HAVE_GETPID=1
-        HAVE_GETAUXVAL=1
-        HAVE_SYSCONF=1
-        HAVE_MMAP=1
-        HAVE_MLOCK=1
-        HAVE_MADVISE=1
-        HAVE_MPROTECT=1
-        HAVE_RAISE=1
-        HAVE_POSIX_MEMALIGN=1
-        HAVE_NANOSLEEP=1
-        HAVE_CLOCK_GETTIME=1
-        HAVE_EXPLICIT_BZERO=1
-        HAVE_C11_MEMORY_FENCES=1
-        HAVE_GCC_MEMORY_FENCES=1
-        HAVE_ATOMIC_OPS=1
-        HAVE_WEAK_SYMBOLS=1
-        TLS=_Thread_local
-        _GNU_SOURCE=1)
-    target_link_libraries(qnode_sodium PUBLIC Threads::Threads)
+    # not provide.
+    qnode_import_prebuilt(qnode_sodium libqnode_sodium.a)
+    set_target_properties(qnode_sodium PROPERTIES
+        INTERFACE_INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/vendor/libsodium/src/libsodium/include;${CMAKE_CURRENT_SOURCE_DIR}/vendor/libsodium/src/libsodium/include/sodium"
+        INTERFACE_LINK_LIBRARIES Threads::Threads)
 
     add_library(qnode_core STATIC node.c netstack.c netstack_l2.c
-        netstack_link.c node_netstack.c)
+        netstack_link.c node_netstack.c quickjs-libc.c)
     target_compile_definitions(qnode_core PRIVATE ${qjs_defines} QNODE_FREESTANDING)
     target_include_directories(qnode_core PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
-    target_link_libraries(qnode_core PRIVATE qjs qjs-libc
+    target_link_libraries(qnode_core PRIVATE qjs
         qnode_zlib qnode_mbedtls qnode_sodium)
     add_dependencies(qnode_core node_bootstrap_header)
 
@@ -416,6 +504,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_compile_definitions(qnode_exe PRIVATE ${qjs_defines} QNODE_FREESTANDING)
     target_link_libraries(qnode_exe PRIVATE qnode_core)
     target_link_options(qnode_exe PRIVATE -static)
+    endif()
 endif()
 
 #
@@ -424,16 +513,12 @@ endif()
 
 add_executable(qjsc
     qjsc.c
+    quickjs-libc.c
 )
 target_compile_definitions(qjsc PRIVATE ${qjs_defines})
-target_link_libraries(qjsc PRIVATE qjs qjs-libc)
+target_link_libraries(qjsc PRIVATE qjs)
 if(MINGW)
     target_link_options(qjsc PRIVATE -static -static-libgcc)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_options(qjsc PRIVATE -static)
-endif()
-
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    # Owned TCP/IP stack library used by qnode_core
-    add_library(netstack STATIC netstack.c netstack_l2.c)
 endif()

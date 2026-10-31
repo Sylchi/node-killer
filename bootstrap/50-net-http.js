@@ -18,8 +18,62 @@ function shardIndex(address) {
   return native.shardIndex(String(address));
 }
 
+/* Numeric address predicates. Kept here so net.isIP() and the connect path
+   agree on what counts as a literal; DNS is only consulted for non-literals. */
+function isIPv4String(s) {
+  const parts = s.split(".");
+  if (parts.length !== 4)
+    return false;
+  for (const p of parts) {
+    if (!/^\d{1,3}$/.test(p))
+      return false;
+    if (p.length > 1 && p[0] === "0")
+      return false;
+    if (Number(p) > 255)
+      return false;
+  }
+  return true;
+}
+
+function isIPv6String(s) {
+  const pct = s.indexOf("%");
+  if (pct >= 0)
+    s = s.slice(0, pct);            /* zone id: allowed, not validated */
+  if (s.indexOf(":") < 0 || !/^[0-9a-fA-F:.]+$/.test(s))
+    return false;
+  const halves = s.split("::");
+  if (halves.length > 2)
+    return false;
+  const compressed = halves.length === 2;
+  const left = halves[0] ? halves[0].split(":") : [];
+  const right = compressed && halves[1] ? halves[1].split(":") : [];
+  const groups = left.concat(right);
+  const n = groups.length;
+  let count = 0;
+  for (let i = 0; i < n; i++) {
+    const g = groups[i];
+    if (g === "")
+      return false;                 /* ":::" and friends */
+    if (g.indexOf(".") >= 0) {
+      /* An embedded dotted quad must be the final group and must not be
+         followed by a compressed run ("1.2.3.4::" is invalid). */
+      if (i !== n - 1 || (compressed && right.length === 0))
+        return false;
+      if (!isIPv4String(g))
+        return false;
+      count += 2;
+    } else {
+      if (!/^[0-9a-fA-F]{1,4}$/.test(g))
+        return false;
+      count += 1;
+    }
+  }
+  return compressed ? count <= 7 : count === 8;
+}
+
+/* True when `host` is a numeric address and needs no name lookup. */
 function isIpLiteral(host) {
-  return /^[0-9.]+$/.test(host) || host.indexOf(":") >= 0;
+  return net.isIP(host) !== 0;
 }
 
 /* Native socket mode: 1 forces the owned TCP stack, -1 forces the kernel,
@@ -313,7 +367,13 @@ class Socket extends Duplex {
       cb(new Error("Socket is closed"));
       return;
     }
-    if (this._fd === undefined) {
+    /* Connect readiness is detected with a write handler on the same fd.
+       Writing while the connection is still in progress can return EAGAIN,
+       and parking that write would install a second write handler that
+       overwrites the connect probe; the connect event would then never fire
+       and no read handler would ever be attached. Queue the write behind the
+       connect event instead. */
+    if (this._fd === undefined || this.connecting) {
       this.once("connect", () => this._flushWrite(buf, cb));
       return;
     }
@@ -796,11 +856,9 @@ const net = {
   },
   isIP(input) {
     const s = String(input);
-    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(s) &&
-        s.split(".").every((n) => Number(n) <= 255))
+    if (isIPv4String(s))
       return 4;
-    if (/^[0-9a-fA-F:]+$/.test(s) && s.indexOf(":") >= 0 &&
-        s.split(":").length <= 8)
+    if (isIPv6String(s))
       return 6;
     return 0;
   },

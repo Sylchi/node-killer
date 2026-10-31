@@ -9,13 +9,10 @@ Installing QuickJS is simple, and we provide several ways to do so.
 
 ## Build from source
 
-If you built it from source as outlined in [building](./building) you can just run:
-
-```bash
-make install
-```
-
-and it will be installed in your system. The default installation path is `/usr/local`.
+If you built it from source as outlined in [building](./building), the binaries
+are in `build/`: `qnode` is the Node.js-compatible runtime and `qjsc` the
+bytecode compiler. This tree has no install target, so copy the binary you need
+onto your `PATH` (for example `install -m755 build/qnode /usr/local/bin/`).
 
 
 ## Using a prebuilt binary

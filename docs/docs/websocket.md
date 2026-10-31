@@ -155,7 +155,7 @@ between fragments. Pings are answered automatically.
 ## Testing
 
 ```sh
-make qnode-test
+node scripts/build.js qnode-test
 ```
 
 `tests/qnode/websocket.js` covers client/server echoing over an HTTP upgrade,

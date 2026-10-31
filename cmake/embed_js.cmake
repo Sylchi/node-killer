@@ -9,27 +9,17 @@ file(READ "${INPUT}" content HEX)
 string(LENGTH "${content}" hexlen)
 math(EXPR nbytes "${hexlen} / 2")
 
-set(bytes "")
-set(line "")
-math(EXPR last "${nbytes} - 1")
+# Prefix every byte in a single regex pass. A per-byte foreach loop spends
+# minutes on a few hundred KiB of bootstrap code.
+string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," bytes "${content}")
 if(nbytes GREATER 0)
-    foreach(i RANGE 0 ${last})
-        math(EXPR off "${i} * 2")
-        string(SUBSTRING "${content}" ${off} 2 byte)
-        if(line STREQUAL "")
-            set(line "  0x${byte}")
-        else()
-            set(line "${line}, 0x${byte}")
-        endif()
-        math(EXPR col "${i} % 12")
-        if(col EQUAL 11)
-            set(bytes "${bytes}${line},\n")
-            set(line "")
-        endif()
-    endforeach()
-endif()
-if(NOT line STREQUAL "")
-    set(bytes "${bytes}${line}\n")
+    string(LENGTH "${bytes}" byteslen)
+    math(EXPR byteslen "${byteslen} - 1")
+    string(SUBSTRING "${bytes}" 0 ${byteslen} bytes)
+    # Wrap at 12 bytes per line, like xxd.
+    string(REGEX REPLACE
+        "(0x[0-9a-f][0-9a-f],0x[0-9a-f][0-9a-f],0x[0-9a-f][0-9a-f],0x[0-9a-f][0-9a-f],0x[0-9a-f][0-9a-f],0x[0-9a-f][0-9a-f],0x[0-9a-f][0-9a-f],0x[0-9a-f][0-9a-f],0x[0-9a-f][0-9a-f],0x[0-9a-f][0-9a-f],0x[0-9a-f][0-9a-f],0x[0-9a-f][0-9a-f],)"
+        "\\1\n" bytes "${bytes}")
 endif()
 
 get_filename_component(basename "${INPUT}" NAME_WE)
@@ -37,5 +27,5 @@ string(MAKE_C_IDENTIFIER "${basename}" ident)
 
 file(WRITE "${OUTPUT}"
     "/* generated from ${basename}.js -- do not edit */\n"
-    "unsigned char ${ident}_js[] = {\n${bytes}};\n"
+    "unsigned char ${ident}_js[] = {\n${bytes}\n};\n"
     "unsigned int ${ident}_js_len = ${nbytes};\n")

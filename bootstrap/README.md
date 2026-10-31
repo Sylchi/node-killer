@@ -40,4 +40,4 @@ The parts are **not** ES modules. They share one top-level scope, so:
 3. Add a native primitive to `node.c` and expose it through
    `__qnode_native` if the implementation needs one.
 4. Add a test under `tests/qnode/` and make sure it runs through
-   `make qnode-test`.
+   `node scripts/build.js qnode-test`.

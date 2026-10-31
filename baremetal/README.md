@@ -38,6 +38,11 @@ Phase 1 implements the minimal boot environment:
 The kernel now uses [LVGL](https://github.com/lvgl/lvgl) (v9.2) as the graphics
 framework instead of drawing raw pixel patterns:
 
+> The vendored tree is a build subset: `lvgl/src`, the public headers and the
+> licence are kept, while the upstream demos, tests, docs, examples, scripts,
+> environments and unused fonts are not vendored. That trims about 128 MB of
+> source that the kernel never compiled.
+
 - `src/lvgl.c/h` — LVGL integration driver:
   - Creates an LVGL display (800x480) via the mailbox framebuffer
   - `lvgl_flush_cb` copies the rendered LVGL draw buffer into the framebuffer

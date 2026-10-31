@@ -1,4 +1,5 @@
 /build/
+/build-act/
 /node_modules/
 /build-static/
 /benchmarks/runtime-comparison/aot-build/

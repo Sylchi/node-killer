@@ -1,0 +1,29 @@
+{
+  "name": "node-killer",
+  "version": "0.1.0",
+  "private": true,
+  "description": "QuickJS fork with qnode, a Node.js-compatible runtime",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "node scripts/build.js",
+    "configure": "node scripts/build.js configure",
+    "qnode": "node scripts/build.js qnode",
+    "qjsc": "node scripts/build.js qjsc",
+    "codegen": "node scripts/build.js codegen",
+    "debug": "node scripts/build.js debug",
+    "clean": "node scripts/build.js clean",
+    "distclean": "node scripts/build.js distclean",
+    "test": "node scripts/build.js qnode-test",
+    "net-test": "node scripts/build.js net-test",
+    "net-bench": "node scripts/build.js net-bench",
+    "netstack-tun-test": "node scripts/build.js netstack-tun-test",
+    "netstack-tap-test": "node scripts/build.js netstack-tap-test",
+    "precommit:install": "node scripts/install-pre-commit.js",
+    "precommit:uninstall": "node scripts/install-pre-commit.js --uninstall",
+    "cc": "node scripts/cc.js",
+    "cc-test": "node scripts/cc/test.js"
+  }
+}
