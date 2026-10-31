@@ -682,6 +682,9 @@ function parseBackgroundShorthand(value, fontSize, root) {
   if (repeat) out.backgroundRepeat = repeat;
   if (position.length) out.backgroundPosition = position.join(" ");
   if (size) out.backgroundSize = size;
+  /* The shorthand resets every longhand it does not mention. */
+  out.backgroundColor = out.backgroundColor === undefined ?
+    "transparent" : out.backgroundColor;
   return out;
 }
 

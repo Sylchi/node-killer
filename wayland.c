@@ -702,11 +702,7 @@ int wayland_open(const char *display_name, uint32_t width, uint32_t height)
     if (msg_send(&m, 1, WL_DISPLAY_GET_REGISTRY) < 0)
         goto fail;
 
-    if (getenv("QNODE_WL_NOSYNC")) {
-        for (int i = 0; i < 20; i++)
-            if (dispatch(50) < 0)
-                break;
-    } else if (roundtrip() < 0) {
+    if (roundtrip() < 0) {
         WL_DBG("first roundtrip failed\n");
         goto fail;
     }

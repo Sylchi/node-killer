@@ -125,7 +125,7 @@ function parseBackgroundPosition(value, boxW, boxH, imgW, imgH) {
     return parseFloat(token) || 0;
   };
   const x = one(parts[0] || "0%", boxW, imgW);
-  const y = one(parts[1] || "center", boxH, imgH);
+  const y = one(parts[1] || "0%", boxH, imgH);
   return { x, y };
 }
 
