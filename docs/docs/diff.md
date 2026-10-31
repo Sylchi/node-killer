@@ -27,13 +27,9 @@ The `test262` suite is also run for every change.
 
 ## Cross-platform support
 
-In order to better support other platforms such as Windows the build system was
-changed to use [CMake].
-
-In addition, Windows is treated as a first class citizen, with the addition of support
-for the MSVC compiler.
-
-[CMake]: https://cmake.org/
+Windows is treated as a first class citizen, with support for the MSVC compiler
+in the original quickjs-ng build. This fork builds with the in-repo JavaScript C
+compiler and targets Linux on x86-64.
 
 ## Performance
 

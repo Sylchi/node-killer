@@ -1349,7 +1349,7 @@ function createSocketForRequest(o) {
     return o.createConnection(Object.assign({}, o, { port, host }));
   const connectOpts = { port, host };
   for (const k of ["family", "localAddress", "localPort", "shard", "subnet",
-                   "freeBind", "noDelay"]) {
+                   "freeBind", "noDelay", "netstack"]) {
     if (o[k] !== undefined)
       connectOpts[k] = o[k];
   }

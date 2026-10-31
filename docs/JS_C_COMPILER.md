@@ -4,20 +4,16 @@ This repo now uses a custom C compiler written in JavaScript (under `scripts/cc/
 
 ## What was done
 - Implemented/leveraged a JS-based C toolchain: preprocessor (`scripts/cc/tokenize.js`), parser (`scripts/cc/parse.js`), codegen (`scripts/cc/codegen.js`), assembler/object writer (`scripts/cc/object.js`), ELF linker (`scripts/cc/link.js`).
-- Updated `scripts/cc.js` to be more tolerant of common compiler flags and to link with system libc/libgcc from the host when needed.
-- Modified `CMakeLists.txt` to use `node scripts/cc.js` as the C compiler on Linux.
-- Modified `scripts/build.js` to not require Zig and to allow building `qnode` with the JS toolchain.
-- Updated link invocation in the CMake build to work with the JS linker (handling archives/objects properly).
+- `scripts/build.js` drives `scripts/cc.js` directly; there is no CMake, make, zig or system C compiler in the build path.
+- The compiler emits GNU `as` syntax and assembles and links it itself, so no external `as` or `ld` is needed either.
 
 ## Result
 - Built `build/qnode` (3.5M, statically linked musl binary) using only the JS C compiler.
 - Core Node.js-compatible APIs load correctly (`fs`, `crypto`, `net`, `http`, `https`, `tls`, `child_process`, `worker_threads`, `fetch` exists, etc.). Some advanced network test scenarios show segfaults in this build configuration, but the runtime is functional.
-- Removed the vendored Zig toolchain from `vendor/zig/`.
 
 ## Usage
 ```bash
-node scripts/build.js qnode
-# or just build with cmake using node as CC
+node scripts/build.js
 ```
 
 The JS C compiler can compile and link C programs independently:
@@ -51,7 +47,7 @@ The host provides the filesystem and process primitives the compiler needs
 `console`.
 
 Options: `--build-dir=<dir>`, `--out=<file>`, `--qjsc=<file>`, `--test`,
-`--self-qjsc`, `--verbose`. If `qjsc` is missing, the `qjsc` build target is run
+`--self-qjsc`, `--verbose`. If `qjsc` is missing, the `qjsc` build step runs
 first. `--self-qjsc` additionally rebuilds `qjsc` with the new compiler
 (`<build-dir>/qjsc-native`), which exercises the full loop: the JavaScript
 compiler compiles `qjsc.c`, and the resulting `qjsc` compiles JavaScript back
@@ -59,9 +55,10 @@ to C for the compiler to build.
 
 ### Caveats
 
-- The result still links against the C library, libgcc, and the prebuilt
-  `vendor/prebuilt/linux-x86_64` archives. It removes the Node.js dependency
-  from running the compiler, not every native dependency.
+- The result still links against the C library and the compiler runtime
+  archives, plus the prebuilt `vendor/prebuilt/linux-x86_64` archives. It
+  removes the Node.js dependency from running the compiler, not every native
+  dependency.
 - The self-hosted compiler is slower than Node.js (about 8 s versus 1.2 s to
   compile `qjsc.c`), so it is a bootstrap and validation path, not the normal
   build path.

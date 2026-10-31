@@ -256,16 +256,59 @@ export function parseIntegerLiteral(text, loc) {
 }
 
 /**
+ * Parse a floating-point literal, including the C99 hexadecimal form and the
+ * `f`/`l` suffixes used throughout system headers.
+ *
+ * @param {string} text
+ * @param {Loc} loc
+ * @returns {{val: number, numType: string}}
+ */
+export function parseFloatLiteral(text, loc) {
+  let body = text.replace(/[']/g, '');
+  let numType = 'double';
+  const suffix = body[body.length - 1];
+  if (suffix === 'f' || suffix === 'F') {
+    numType = 'float';
+    body = body.slice(0, -1);
+  } else if (suffix === 'l' || suffix === 'L') {
+    numType = 'double';
+    body = body.slice(0, -1);
+  }
+
+  let value;
+  if (/^0[xX]/.test(body)) {
+    const m = /^0[xX]([0-9a-fA-F]*)(?:\.([0-9a-fA-F]*))?[pP]([+-]?\d+)$/.exec(body);
+    if (!m || (!m[1] && !m[2])) throw new CcError(`invalid floating point literal '${text}'`, loc);
+    const intPart = m[1] ? parseInt(m[1], 16) : 0;
+    let frac = 0;
+    if (m[2]) {
+      for (let i = 0; i < m[2].length; i += 1) {
+        frac += parseInt(m[2][i], 16) / 16 ** (i + 1);
+      }
+    }
+    value = (intPart + frac) * 2 ** Number(m[3]);
+  } else {
+    if (!/^(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/.test(body)) {
+      throw new CcError(`invalid floating point literal '${text}'`, loc);
+    }
+    value = Number(body);
+  }
+  // Overflow to infinity is valid C (e.g. `1e5000f` in <math.h>); NaN is not.
+  if (Number.isNaN(value)) throw new CcError(`invalid floating point literal '${text}'`, loc);
+  return { val: value, numType };
+}
+
+/**
  * Tokenize a single source string.
  * @param {string} source
  * @param {string} file used for diagnostics
  * @returns {Token[]} tokens terminated by an eof token
  */
 export function tokenizeString(source, file) {
-  // Splice continued lines first. Keep the newline count stable by replacing
-  // `\` + newline with just the newline: directive spilling is rare in the
-  // subset this compiler targets, and correctness of positions matters more.
-  const src = source.replace(/\\\r?\n/g, '\n');
+  // Line splicing happens before tokenization in C: `\` + newline disappears
+  // entirely. This matters for multi-line preprocessor directives, which are
+  // common in libc headers.
+  const src = source.replace(/\\\r?\n/g, '');
   const tokens = [];
   let i = 0;
   let line = 1;
@@ -344,14 +387,13 @@ export function tokenizeString(source, file) {
         }
         break;
       }
-      const isFP = /[.eEpP]/.test(text) && !/^0[xX][0-9a-fA-F]+$/.test(text);
+      const isHex = /^0[xX]/.test(text);
+      const isFP = isHex ? /[pP]/.test(text) : /[.eE]/.test(text);
       if (isFP) {
-        // Floating point literal: convert to a double value.
-        const value = Number(text);
-        if (!Number.isFinite(value)) throw new CcError(`invalid floating point literal '${text}'`, start);
+        const parsed = parseFloatLiteral(text, start);
         token = new Token('num', text, start);
-        token.val = value;
-        token.numType = 'double';
+        token.val = parsed.val;
+        token.numType = parsed.numType;
       } else {
         const parsed = parseIntegerLiteral(text, start);
         token = new Token('num', text, start);
@@ -359,12 +401,15 @@ export function tokenizeString(source, file) {
         token.numType = parsed.numType;
       }
     } else if (ch === '"' || ch === "'") {
+      const begin = i;
       const { bytes, next } = readQuoted(src, i + 1, ch);
       while (i < next) advance();
       if (ch === '"') {
-        token = new Token('str', '');
+        // Keep the quoted source spelling in `text` so that syntactic
+        // comparisons against punctuators cannot accidentally match the
+        // decoded contents (e.g. the string "--").
+        token = new Token('str', src.slice(begin, i), start);
         token.strBytes = bytes;
-        token.text = Buffer.from(bytes).toString('latin1');
       } else {
         let value = 0n;
         for (const byte of bytes) value = (value << 8n) | BigInt(byte);
@@ -441,6 +486,7 @@ export class Preprocessor {
     this.includeDepth = 0;
     this.pragmaOnce = new Set();
     this.counter = 0;
+    this.counterMacro = 0;
 
     const predefined = {
       __STDC__: '1',
@@ -536,7 +582,9 @@ export class Preprocessor {
         const end = lineStart(i + 1);
         const directive = tokens.slice(i + 1, end);
         i = end;
-        this.handleDirective(directive, conds, (produced) => out.push(...produced), active);
+        this.handleDirective(directive, conds, (produced) => {
+          for (const t of produced) out.push(t);
+        }, active);
         continue;
       }
 
@@ -546,7 +594,7 @@ export class Preprocessor {
       }
 
       const segment = this.expandSegment(tokens, i);
-      out.push(...segment.tokens);
+      for (const t of segment.tokens) out.push(t);
       i = segment.next;
     }
 
@@ -606,6 +654,19 @@ export class Preprocessor {
    */
   expandOne(tok, pull, pushBack) {
     if (tok.kind !== 'ident') return null;
+    // Predefined dynamic macros expand from the token's own location.
+    if (tok.text === '__LINE__' || tok.text === '__COUNTER__') {
+      const value = tok.text === '__LINE__' ? tok.loc.line : this.counterMacro++;
+      const num = new Token('num', String(value), tok.loc);
+      num.val = BigInt(value);
+      num.numType = 'int';
+      return [num];
+    }
+    if (tok.text === '__FILE__') {
+      const str = new Token('str', JSON.stringify(tok.loc.file), tok.loc);
+      str.strBytes = [...Buffer.from(tok.loc.file, 'utf8')];
+      return [str];
+    }
     const macro = this.macros.get(tok.text);
     if (!macro) return null;
     if (tok.hideset.has(tok.text)) return null;
@@ -687,7 +748,11 @@ export class Preprocessor {
     macro.params.forEach((param, index) => {
       raw.set(param, args[index] ?? []);
     });
-    if (macro.variadic) raw.set('__VA_ARGS__', args[macro.params.length] ?? []);
+    if (macro.variadic) {
+      const vaTokens = args[macro.params.length] ?? [];
+      raw.set('__VA_ARGS__', vaTokens);
+      if (macro.vaName) raw.set(macro.vaName, vaTokens);
+    }
 
     const getExpanded = (name) => {
       if (!expanded.has(name)) expanded.set(name, this.expandTokens(raw.get(name) ?? []));
@@ -776,8 +841,8 @@ export class Preprocessor {
       text += tok.text;
     });
     const escaped = text.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-    const tok = new Token('str', escaped, loc);
-    tok.strBytes = [...Buffer.from(escaped, 'latin1'), 0];
+    const tok = new Token('str', `"${escaped}"`, loc);
+    tok.strBytes = [...Buffer.from(escaped, 'latin1')];
     return tok;
   }
 
@@ -822,8 +887,9 @@ export class Preprocessor {
     switch (name) {
       case 'include': {
         if (!active()) return;
+        const quoted = rest[0]?.kind === 'str';
         const file = this.parseIncludeName(rest);
-        const resolved = this.resolveInclude(file, line[0].loc.file);
+        const resolved = this.resolveInclude(file, line[0].loc.file, quoted);
         const included = this.include(resolved);
         emit(included);
         return;
@@ -917,6 +983,8 @@ export class Preprocessor {
     let index = 1;
     const params = [];
     let variadic = false;
+    /** GNU named variadic parameter, e.g. `#define M(a, rest...)`. */
+    let vaName = null;
 
     if (rest[index]?.text === '(' && !rest[index].space) {
       index += 1;
@@ -934,6 +1002,16 @@ export class Preprocessor {
           if (rest[index]?.kind !== 'ident') throw new CcError('expected macro parameter', rest[index]?.loc);
           params.push(rest[index].text);
           index += 1;
+          // GNU named variadic parameter: `name...` acts like `...` but the
+          // collected arguments are bound to `name` instead of `__VA_ARGS__`.
+          if (rest[index]?.text === '...') {
+            variadic = true;
+            vaName = params.pop();
+            index += 1;
+            if (rest[index]?.text !== ')') throw new CcError('expected ) after ...', rest[index]?.loc);
+            index += 1;
+            break;
+          }
           if (rest[index]?.text === ',') {
             index += 1;
             continue;
@@ -953,7 +1031,7 @@ export class Preprocessor {
       return copy;
     });
     if (body.length > 0) body[0].space = false;
-    this.macros.set(name, { name, isFunc: rest[1]?.text === '(' && !rest[1].space, params, variadic, body });
+    this.macros.set(name, { name, isFunc: rest[1]?.text === '(' && !rest[1].space, params, variadic, vaName, body });
   }
 
   /**
@@ -962,7 +1040,7 @@ export class Preprocessor {
    */
   parseIncludeName(rest) {
     if (rest.length === 0) throw new CcError('#include needs a file name');
-    if (rest[0].kind === 'str') return rest[0].text;
+    if (rest[0].kind === 'str') return Buffer.from(rest[0].strBytes ?? []).toString('latin1');
     const text = rest.map((t) => t.text).join('');
     const match = text.match(/^<(.+)>$/);
     if (!match) throw new CcError(`invalid #include '${text}'`, rest[0].loc);
@@ -973,14 +1051,15 @@ export class Preprocessor {
    * Resolve an include name against the including file and `-I` paths.
    * @param {string} name
    * @param {string} fromFile
+   * @param {boolean} [quoted] quoted includes also search the including directory
    * @returns {string}
    */
-  resolveInclude(name, fromFile) {
+  resolveInclude(name, fromFile, quoted = true) {
     const candidates = [];
     if (path.isAbsolute(name)) {
       candidates.push(name);
     } else {
-      candidates.push(path.join(path.dirname(fromFile), name));
+      if (quoted) candidates.push(path.join(path.dirname(fromFile), name));
       for (const dir of this.includeDirs) candidates.push(path.join(dir, name));
     }
     for (const candidate of candidates) {
@@ -995,6 +1074,7 @@ export class Preprocessor {
    * @returns {Token[]}
    */
   include(file) {
+    if (process.env.CC_TRACE_INCLUDES) console.error('include', this.includeDepth, file);
     if (this.pragmaOnce.has(file)) return [];
     this.includeDepth += 1;
     if (this.includeDepth > 64) throw new CcError(`#include nesting too deep at '${file}'`);

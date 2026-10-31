@@ -62,6 +62,7 @@
 #include "node.h"
 #include "node_netstack.h"
 #include "qjs-wasm.h"
+#include "wayland.h"
 
 #ifndef NODE_PATH_MAX
 #define NODE_PATH_MAX 4096
@@ -193,6 +194,141 @@ static JSValue js_node_alloc_memory(JSContext *ctx, JSValueConst this_val,
         return ab;
     }
     return ab;
+}
+
+/* ---------------- wayland window ---------------- */
+
+/* native.waylandOpen(name, width, height) -> 0 on success. */
+static JSValue js_node_wayland_open(JSContext *ctx, JSValueConst this_val,
+                                    int argc, JSValueConst *argv)
+{
+    const char *display = NULL;
+    int32_t width = 800, height = 600;
+    int ret;
+
+    (void)this_val;
+    if (argc > 0 && !JS_IsUndefined(argv[0]) && !JS_IsNull(argv[0])) {
+        display = node_cstr(ctx, argv[0]);
+        if (!display)
+            return JS_EXCEPTION;
+    }
+    if (argc > 1 && !JS_IsUndefined(argv[1]) &&
+        JS_ToInt32(ctx, &width, argv[1])) {
+        if (display)
+            JS_FreeCString(ctx, display);
+        return JS_EXCEPTION;
+    }
+    if (argc > 2 && !JS_IsUndefined(argv[2]) &&
+        JS_ToInt32(ctx, &height, argv[2])) {
+        if (display)
+            JS_FreeCString(ctx, display);
+        return JS_EXCEPTION;
+    }
+    if (width <= 0 || height <= 0) {
+        if (display)
+            JS_FreeCString(ctx, display);
+        return JS_ThrowRangeError(ctx, "waylandOpen: invalid window size");
+    }
+    ret = wayland_open(display, (uint32_t)width, (uint32_t)height);
+    if (display)
+        JS_FreeCString(ctx, display);
+    return JS_NewInt32(ctx, ret);
+}
+
+/* native.waylandRender(frame) -> 0 once the frame was presented. */
+static JSValue js_node_wayland_render(JSContext *ctx, JSValueConst this_val,
+                                      int argc, JSValueConst *argv)
+{
+    NodeBytes b;
+    int ret;
+
+    (void)this_val;
+    if (argc < 1)
+        return JS_ThrowTypeError(ctx, "waylandRender: missing frame");
+    if (node_get_bytes(ctx, argv[0], &b))
+        return JS_EXCEPTION;
+    ret = wayland_render(b.data, b.len);
+    node_free_bytes(ctx, &b);
+    return JS_NewInt32(ctx, ret);
+}
+
+static JSValue js_node_wayland_resize(JSContext *ctx, JSValueConst this_val,
+                                      int argc, JSValueConst *argv)
+{
+    int32_t width, height;
+
+    (void)this_val;
+    if (argc < 2 || JS_ToInt32(ctx, &width, argv[0]) ||
+        JS_ToInt32(ctx, &height, argv[1]))
+        return JS_ThrowTypeError(ctx, "waylandResize: expected (width, height)");
+    if (width <= 0 || height <= 0)
+        return JS_ThrowRangeError(ctx, "waylandResize: invalid size");
+    return JS_NewInt32(ctx, wayland_resize((uint32_t)width, (uint32_t)height));
+}
+
+/* native.waylandPoll(timeoutMs) -> 0 open, 1 closed, -1 error. */
+static JSValue js_node_wayland_poll(JSContext *ctx, JSValueConst this_val,
+                                    int argc, JSValueConst *argv)
+{
+    int32_t timeout = 100;
+
+    (void)this_val;
+    if (argc > 0 && !JS_IsUndefined(argv[0]) &&
+        JS_ToInt32(ctx, &timeout, argv[0]))
+        return JS_EXCEPTION;
+    return JS_NewInt32(ctx, wayland_poll(timeout));
+}
+
+static JSValue js_node_wayland_close(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv)
+{
+    (void)ctx;
+    (void)this_val;
+    (void)argc;
+    (void)argv;
+    wayland_close();
+    return JS_UNDEFINED;
+}
+
+/* native.waylandInfo() -> window and monitor description. */
+static JSValue js_node_wayland_info(JSContext *ctx, JSValueConst this_val,
+                                    int argc, JSValueConst *argv)
+{
+    struct wayland_output out;
+    JSValue o, monitor;
+
+    (void)this_val;
+    (void)argc;
+    (void)argv;
+    wayland_fill_output(&out);
+
+    o = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, o, "width",
+                      JS_NewInt32(ctx, (int32_t)wayland_width()));
+    JS_SetPropertyStr(ctx, o, "height",
+                      JS_NewInt32(ctx, (int32_t)wayland_height()));
+    monitor = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, monitor, "make",
+                      JS_NewString(ctx, out.make[0] ? out.make : "unknown"));
+    JS_SetPropertyStr(ctx, monitor, "model",
+                      JS_NewString(ctx, out.model[0] ? out.model : "unknown"));
+    JS_SetPropertyStr(ctx, monitor, "width", JS_NewInt32(ctx, out.width));
+    JS_SetPropertyStr(ctx, monitor, "height", JS_NewInt32(ctx, out.height));
+    JS_SetPropertyStr(ctx, monitor, "refresh",
+                      JS_NewInt32(ctx, out.refresh));
+    JS_SetPropertyStr(ctx, monitor, "scale", JS_NewInt32(ctx, out.scale));
+    JS_SetPropertyStr(ctx, monitor, "physicalWidth",
+                      JS_NewInt32(ctx, out.physical_width));
+    JS_SetPropertyStr(ctx, monitor, "physicalHeight",
+                      JS_NewInt32(ctx, out.physical_height));
+    {
+        double dpi = 0.0;
+        if (out.physical_width > 0 && out.width > 0)
+            dpi = (double)out.width * 25.4 / (double)out.physical_width;
+        JS_SetPropertyStr(ctx, monitor, "dpi", JS_NewFloat64(ctx, dpi));
+    }
+    JS_SetPropertyStr(ctx, o, "monitor", monitor);
+    return o;
 }
 
 /* ---------------- process ---------------- */
@@ -4969,6 +5105,12 @@ static const JSCFunctionListEntry js_node_funcs[] = {
     JS_CFUNC_DEF("meminfo", 0, js_node_meminfo),
     JS_CFUNC_DEF("memoryUsage", 0, js_node_memory_usage),
     JS_CFUNC_DEF("allocMemory", 1, js_node_alloc_memory),
+    JS_CFUNC_DEF("waylandOpen", 3, js_node_wayland_open),
+    JS_CFUNC_DEF("waylandRender", 1, js_node_wayland_render),
+    JS_CFUNC_DEF("waylandResize", 2, js_node_wayland_resize),
+    JS_CFUNC_DEF("waylandPoll", 1, js_node_wayland_poll),
+    JS_CFUNC_DEF("waylandClose", 0, js_node_wayland_close),
+    JS_CFUNC_DEF("waylandInfo", 0, js_node_wayland_info),
     JS_CFUNC_DEF("rusage", 0, js_node_rusage),
     JS_CFUNC_DEF("utf8Decode", 1, js_node_utf8_decode),
     JS_CFUNC_DEF("utf8Encode", 1, js_node_utf8_encode),

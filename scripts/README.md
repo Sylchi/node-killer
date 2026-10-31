@@ -32,15 +32,9 @@ Docker is used as a fallback when its daemon is reachable.
 ## Runner image
 
 The hook uses a small image built from `scripts/act-runner.Dockerfile`, which
-extends `catthehacker/ubuntu:act-latest` with cmake. Building it once removes
-the apt download from every run; the hook does it automatically when the image
-is missing. The build context is only `scripts/`, so the vendored toolchain is
+extends `catthehacker/ubuntu:act-latest`. The hook builds it automatically when
+the image is missing. The build context is only `scripts/`, so the checkout is
 never uploaded to the builder.
-
-The hook also mounts `${XDG_CACHE_HOME:-~/.cache}/qnode-act/zig` at `/zig-cache`
-and sets `ZIG_GLOBAL_CACHE_DIR`, so zig reuses its generated libc and
-compiler_rt objects between runs. Point `ACT_PRECOMMIT_ZIG_CACHE` elsewhere to
-move it.
 
 Preparing the image (build or pull) happens before the 30 second clock starts,
 so only the `act` run itself counts against the limit.
@@ -64,7 +58,6 @@ so only the `act` run itself counts against the limit.
 | `ACT_PRECOMMIT_SOCKET` | auto | Podman API socket override |
 | `ACT_PRECOMMIT_PULL_TIMEOUT_MS` | `600000` | limit for the one-time image pull |
 | `ACT_PRECOMMIT_DOCKER_USER` | `uid:gid` | `--user` for the Docker fallback |
-| `ACT_PRECOMMIT_ZIG_CACHE` | `~/.cache/qnode-act/zig` | host dir mounted as zig's global cache |
 
 Examples:
 

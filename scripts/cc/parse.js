@@ -37,6 +37,7 @@ export class Obj {
     this.isDefinition = false;
     this.isStatic = false;
     this.isExtern = false;
+    this.isThreadLocal = false;
     this.isTentative = false;
     this.isString = false;
     this.isInline = false;
@@ -101,6 +102,7 @@ const KEYWORDS = new Set([
   '__attribute',
   'typeof',
   '__typeof__',
+  '__builtin_va_list',
 ]);
 
 const STORAGE = new Set(['typedef', 'static', 'extern', 'inline', '__inline', '__inline__', '_Thread_local', '__thread']);
@@ -111,6 +113,7 @@ const QUALIFIERS = new Set([
   '__restrict',
   '__restrict__',
   '_Noreturn',
+  '_Atomic',
   'auto',
   'register',
   '__extension__',
@@ -123,7 +126,10 @@ const QUALIFIERS = new Set([
  */
 function withName(ty, name) {
   if (name === null) return ty;
-  const copy = Object.assign(Object.create(Object.getPrototypeOf(ty)), ty);
+  // Delegate to the underlying type instead of copying it: typedefs can be
+  // created from an incomplete tag that is completed later, and a shallow
+  // copy would freeze the empty member list.
+  const copy = Object.create(ty);
   copy.name = name;
   return copy;
 }
@@ -155,6 +161,28 @@ class Parser {
     this.unique = 0;
     /** @type {{cases: Node[], defaultLabel: string | null}[]} */
     this.switchStack = [];
+    /** @type {T.CType | null} */
+    this._vaListType = null;
+  }
+
+  /**
+   * SysV x86-64 va_list: an array of one tag struct holding the register save
+   * area offsets and the overflow argument pointer.
+   * @returns {T.CType}
+   */
+  vaListType() {
+    if (!this._vaListType) {
+      const tag = T.aggregateType('struct', '__va_list_tag');
+      tag.members = [
+        { name: 'gp_offset', ty: T.uintType, offset: 0 },
+        { name: 'fp_offset', ty: T.uintType, offset: 0 },
+        { name: 'overflow_arg_area', ty: T.pointerTo(T.voidType), offset: 0 },
+        { name: 'reg_save_area', ty: T.pointerTo(T.voidType), offset: 0 },
+      ];
+      T.layoutAggregate(tag, false);
+      this._vaListType = T.arrayOf(tag, 1);
+    }
+    return this._vaListType;
   }
 
   // ---------------------------------------------------------------- tokens
@@ -318,6 +346,7 @@ class Parser {
         else if (text === 'static') attr.isStatic = true;
         else if (text === 'extern') attr.isExtern = true;
         else if (text === 'inline' || text === '__inline' || text === '__inline__') attr.isInline = true;
+        else if (text === '_Thread_local' || text === '__thread') attr.isThreadLocal = true;
         this.next();
         continue;
       }
@@ -373,13 +402,13 @@ class Parser {
         this.next();
         continue;
       }
-      if (text === 'signed') {
+      if (text === 'signed' || text === '__signed__' || text === '__signed') {
         signedCount += 1;
         sawType = true;
         this.next();
         continue;
       }
-      if (text === 'unsigned') {
+      if (text === 'unsigned' || text === '__unsigned__' || text === '__unsigned') {
         unsignedCount += 1;
         sawType = true;
         this.next();
@@ -392,12 +421,21 @@ class Parser {
         this.next();
         continue;
       }
+      if (text === '__builtin_va_list') {
+        if (explicit || sawType) break;
+        explicit = this.vaListType();
+        sawType = true;
+        this.next();
+        continue;
+      }
       if (text === 'typeof' || text === '__typeof__') {
         this.error('typeof is not supported yet');
       }
       const typedef = this.findTypedef(text);
       if (typedef) {
-        if (explicit || sawType) this.error(`unexpected type name '${text}'`);
+        // Once a type specifier has been seen, another typedef name can only
+        // be a declarator (C allows a member/variable to shadow a typedef).
+        if (explicit || sawType) break;
         explicit = typedef;
         sawType = true;
         this.next();
@@ -467,15 +505,36 @@ class Parser {
       const members = [];
       while (!this.consume('}')) {
         const base = this.declspec();
-        if (this.consume(';')) continue;
-        for (;;) {
-          const mty = this.declarator(base, true);
-          if (mty.kind === 'func') this.error('struct member cannot be a function');
-          if (this.consume(':')) {
-            this.error('bit-fields are not supported yet');
+        if (this.consume(';')) {
+          // An anonymous struct/union member promotes its fields into the
+          // enclosing aggregate, e.g. `struct { int x; };`.
+          if (T.isAggregate(base) && !base.name) {
+            members.push({ name: null, ty: base, offset: 0, anonymous: true });
           }
-          if (mty.name) members.push({ name: mty.name, ty: mty, offset: 0 });
-          else this.error('struct member needs a name');
+          continue;
+        }
+        for (;;) {
+          if (this.at(':')) {
+            // Unnamed bit-field, commonly zero-width padding in libc headers.
+            this.next();
+            const width = Number(this.constExpr().value);
+            members.push({ name: null, ty: base, offset: 0, bitWidth: width, anonymous: true });
+          } else {
+            const mty = this.declarator(base, true);
+            if (mty.kind === 'func') this.error('struct member cannot be a function');
+            if (this.consume(':')) {
+              const width = Number(this.constExpr().value);
+              if (mty.name) {
+                members.push({ name: mty.name, ty: mty, offset: 0, bitWidth: width });
+              } else {
+                members.push({ name: null, ty: mty, offset: 0, bitWidth: width, anonymous: true });
+              }
+            } else if (mty.name) {
+              members.push({ name: mty.name, ty: mty, offset: 0 });
+            } else {
+              this.error('struct member needs a name');
+            }
+          }
           if (!this.consume(',')) break;
         }
         this.expect(';');
@@ -588,6 +647,8 @@ class Parser {
       return T.funcType(ty, params, variadic);
     }
     if (this.consume('[')) {
+      // C99 array parameter qualifiers: `[static 4]`, `[const]`, ...
+      while (this.at('static') || this.at('const') || this.at('volatile') || this.at('restrict') || this.at('__restrict') || this.at('__restrict__')) this.next();
       let len = -1;
       if (!this.consume(']')) {
         const value = this.constExpr().value;
@@ -724,6 +785,34 @@ class Parser {
       return node;
     }
 
+    if ((T.isFloating(lt) || T.isFloating(rt)) && kind !== 'logand' && kind !== 'logor') {
+      const allowed = ['add', 'sub', 'mul', 'div', 'eq', 'ne', 'lt', 'le', 'gt', 'ge'];
+      const arith = (ty) => T.isInteger(ty) || T.isFloating(ty);
+      if (!arith(lt) || !arith(rt) || !allowed.includes(kind)) {
+        this.error(`invalid operands to '${kind}' (${lt.toString()} and ${rt.toString()})`);
+      }
+      const common = T.commonType(lt, rt);
+      const node = new Node(kind, this.tok());
+      node.lhs = this.castTo(lhs, common);
+      node.rhs = this.castTo(rhs, common);
+      node.opTy = common;
+      node.ty = ['eq', 'ne', 'lt', 'le', 'gt', 'ge'].includes(kind) ? T.intType : common;
+      return node;
+    }
+
+    if (kind === 'logand' || kind === 'logor') {
+      const scalar = (ty) => T.isInteger(ty) || T.isPointer(ty) || T.isFloating(ty);
+      if (!scalar(lt) || !scalar(rt)) {
+        this.error(`invalid operands to '${kind}' (${lt.toString()} and ${rt.toString()})`);
+      }
+      const node = new Node(kind, this.tok());
+      node.lhs = lhs;
+      node.rhs = rhs;
+      node.ty = T.intType;
+      node.opTy = T.intType;
+      return node;
+    }
+
     if (!T.isInteger(lt) || !T.isInteger(rt)) {
       this.error(`invalid operands to '${kind}' (${lt.toString()} and ${rt.toString()})`);
     }
@@ -829,8 +918,16 @@ class Parser {
         return;
       case 'cond': {
         this.addType(node.then);
+        if (!node.then.ty) this.error('invalid conditional expression');
         this.addType(node.els);
-        node.ty = T.commonType(T.decay(node.then.ty), T.decay(node.els.ty));
+        if (!node.els.ty) this.error('invalid conditional expression');
+        if (T.isAggregate(node.then.ty) && T.isAggregate(node.els.ty)) {
+          node.ty = node.then.ty;
+        } else if (node.then.ty.kind === 'void' || node.els.ty.kind === 'void') {
+          node.ty = T.voidType;
+        } else {
+          node.ty = T.commonType(T.decay(node.then.ty), T.decay(node.els.ty));
+        }
         return;
       }
       case 'funcall': {
@@ -944,6 +1041,14 @@ class Parser {
     node.op = op;
     node.ty = lhs.ty;
     node.opTy = lhs.ty;
+    if (T.isPointer(lhs.ty) && (op === 'add' || op === 'sub')) {
+      // `p += n` / `p -= n` scales n by the pointed-to type, exactly like the
+      // non-assignment form handled by newBinary().
+      if (!T.isInteger(T.decay(rhs.ty))) this.error('pointer arithmetic needs an integer operand');
+      node.rhs = this.castTo(rhs, T.longType);
+      node.opTy = T.longType;
+      node.ptrScale = lhs.ty.base && lhs.ty.base.size > 0 ? lhs.ty.base.size : 1;
+    }
     return node;
   }
 
@@ -1122,12 +1227,26 @@ class Parser {
   }
 
   cast() {
+    const tok = this.tok();
     if (this.at('(') && this.isTypenameStartAt(1)) {
       this.next();
       const ty = this.typename();
       this.expect(')');
       if (this.at('{')) {
-        this.error('compound literals are not supported yet');
+        // Compound literal: allocate a hidden local object, then leave its
+        // address in %rax. The initializer runs every time the expression is
+        // evaluated, matching C semantics for block-scope compound literals.
+        if (!this.currentFn) this.error('compound literals at file scope are not supported yet');
+        const init = this.parseInitializer(ty);
+        const obj = new Obj(this.uniqueLabel('compound'), init.ty);
+        obj.isLocal = true;
+        this.currentFn.locals.push(obj);
+        this.assignLocalOffset(obj);
+        const node = new Node('compound', tok);
+        node.var = obj;
+        node.ty = init.ty;
+        node.init = this.localInitializer(obj, init, tok);
+        return node;
       }
       const expr = this.cast();
       const node = new Node('cast', expr.tok);
@@ -1246,6 +1365,22 @@ class Parser {
         node = deref;
         continue;
       }
+      if (node.kind === 'builtin' && node.builtin === '__builtin_va_arg' && this.at('(')) {
+        // GCC's va_arg macro passes a type name as its second operand, which
+        // is not a normal expression.
+        this.next();
+        const ap = this.assign();
+        this.expect(',');
+        const ty = this.typename();
+        this.expect(')');
+        const arg = new Node('builtin', node.tok);
+        arg.builtin = '__builtin_va_arg';
+        arg.args = [ap];
+        arg.vaTy = ty;
+        arg.ty = T.decay(ty);
+        node = arg;
+        continue;
+      }
       if (this.consume('(')) {
         /** @type {Node[]} */
         const args = [];
@@ -1294,13 +1429,33 @@ class Parser {
     this.addType(base);
     const ty = base.ty;
     if (!T.isAggregate(ty)) this.error(`member access on non-aggregate type '${ty.toString()}'`, tok);
-    const member = (ty.members ?? []).find((m) => m.name === name);
-    if (!member) this.error(`no member named '${name}'`, tok);
+    const found = this.findMember(ty, name, 0);
+    if (!found) this.error(`no member named '${name}'`, tok);
     const node = new Node('member', tok);
     node.lhs = base;
-    node.member = member;
-    node.ty = member.ty;
+    // Anonymous struct/union members add their own offset to the enclosing
+    // aggregate, so keep a flattened copy for the backend.
+    node.member = { ...found.member, offset: found.offset };
+    node.ty = found.member.ty;
     return node;
+  }
+
+  /**
+   * Find a member, descending into anonymous aggregates.
+   * @param {T.CType} ty
+   * @param {string} name
+   * @param {number} baseOffset
+   * @returns {{member: any, offset: number} | null}
+   */
+  findMember(ty, name, baseOffset) {
+    for (const member of ty.members ?? []) {
+      if (member.name === name) return { member, offset: baseOffset + member.offset };
+      if ((!member.name || member.anonymous) && T.isAggregate(member.ty)) {
+        const inner = this.findMember(member.ty, name, baseOffset + member.offset);
+        if (inner) return inner;
+      }
+    }
+    return null;
   }
 
   /**
@@ -1309,6 +1464,7 @@ class Parser {
    * @returns {Node}
    */
   newFuncall(fn, args) {
+    if (fn.kind === 'builtin') return this.newBuiltin(fn, args);
     this.addType(fn);
     const fty = fn.ty.kind === 'ptr' ? fn.ty.base : fn.ty;
     if (!fty || fty.kind !== 'func') this.error('called object is not a function');
@@ -1318,7 +1474,9 @@ class Parser {
       if (i < params.length) {
         args[i] = this.castTo(args[i], params[i].ty);
       } else {
-        const ty = T.decay(args[i].ty);
+        let ty = T.decay(args[i].ty);
+        // Default argument promotions for variadic arguments.
+        if (ty.kind === 'float') ty = T.doubleType;
         if (T.isInteger(ty) && ty.size < 4) args[i] = this.castTo(args[i], T.intType);
         else if (ty.kind !== args[i].ty.kind) args[i] = this.castTo(args[i], ty);
       }
@@ -1331,6 +1489,58 @@ class Parser {
     node.args = args;
     node.ty = fty.returnTy;
     node.funcTy = fty;
+    if (T.isAggregate(fty.returnTy) && this.currentFn) {
+      // Aggregates are returned in registers; reserve a slot to materialize
+      // the value so that the result can be used as an address.
+      const obj = new Obj(this.uniqueLabel('ret'), fty.returnTy);
+      obj.isLocal = true;
+      this.currentFn.locals.push(obj);
+      this.assignLocalOffset(obj);
+      node.retTemp = obj;
+    }
+    return node;
+  }
+
+  /**
+   * Build a node for one of the GCC builtins the compiler implements.
+   * @param {Node} fn
+   * @param {Node[]} args
+   * @returns {Node}
+   */
+  newBuiltin(fn, args) {
+    for (const arg of args) this.addType(arg);
+    const node = new Node('builtin', fn.tok);
+    node.builtin = fn.builtin;
+    node.args = args;
+    switch (fn.builtin) {
+      case '__builtin_expect':
+        node.ty = args[0]?.ty ?? T.intType;
+        break;
+      case '__builtin_clz':
+      case '__builtin_clzll':
+      case '__builtin_ctz':
+      case '__builtin_ctzll':
+      case '__builtin_popcount':
+      case '__builtin_popcountll':
+      case '__builtin_constant_p':
+        node.ty = T.intType;
+        break;
+      case '__builtin_bswap16':
+        node.ty = T.ushortType;
+        break;
+      case '__builtin_bswap32':
+        node.ty = T.uintType;
+        break;
+      case '__builtin_bswap64':
+        node.ty = T.ulongType;
+        break;
+      case '__builtin_frame_address':
+        node.ty = T.pointerTo(T.voidType);
+        break;
+      default:
+        node.ty = T.voidType;
+        break;
+    }
     return node;
   }
 
@@ -1346,6 +1556,18 @@ class Parser {
     }
     if (tok.kind === 'ident') {
       if (tok.text === '(') this.error('unexpected ('); // unreachable, keeps linters calm
+      if (tok.text === '__func__' && this.currentFn && !this.lookup('__func__')) {
+        this.next();
+        const bytes = [...Buffer.from(this.currentFn.name, 'utf8'), 0];
+        return this.makeString(bytes, tok);
+      }
+      if (tok.text.startsWith('__builtin_') && !this.lookup(tok.text)) {
+        this.next();
+        const node = new Node('builtin', tok);
+        node.builtin = tok.text;
+        node.ty = T.funcType(T.intType, [], true);
+        return node;
+      }
       const entry = this.lookup(tok.text);
       if (!entry) this.error(`undefined variable '${tok.text}'`);
       if (entry.kind === 'enum') {
@@ -1377,6 +1599,16 @@ class Parser {
       bytes.push(...(tok.strBytes ?? [...Buffer.from(tok.text, 'latin1')]));
     }
     bytes.push(0);
+    return this.makeString(bytes, this.tok());
+  }
+
+  /**
+   * Create a static string object and return a node that names it.
+   * @param {number[]} bytes
+   * @param {import('./tokenize.js').Token} tok
+   * @returns {Node}
+   */
+  makeString(bytes, tok) {
     const label = this.uniqueLabel('str');
     const obj = new Obj(label, T.arrayOf(T.charType, bytes.length));
     obj.isStatic = true;
@@ -1384,7 +1616,7 @@ class Parser {
     obj.isString = true;
     obj.initData = Buffer.from(bytes);
     this.globals.push(obj);
-    const node = new Node('var', this.tok());
+    const node = new Node('var', tok);
     node.var = obj;
     node.ty = obj.ty;
     return node;
@@ -1699,7 +1931,7 @@ class Parser {
         const ty = this.declarator(base, false);
         if (!ty.name) this.error('static local needs a name');
         if (ty.kind === 'func') this.error('static local function is invalid');
-        this.localStatic(ty, tok, stmts);
+        this.localStatic(ty, tok, stmts, attr);
       } else if (!attr.isTypedef) {
         const ty = this.declarator(base, false);
         if (!ty.name) this.error('declaration needs a name');
@@ -1762,11 +1994,12 @@ class Parser {
    * @param {import('./tokenize.js').Token} tok
    * @param {Node[]} stmts
    */
-  localStatic(ty, tok, stmts) {
+  localStatic(ty, tok, stmts, attr = {}) {
     if (!ty.name) this.error('static local needs a name');
     if (ty.kind === 'func') this.error('static local cannot be a function');
     const obj = new Obj(ty.name, ty);
     obj.isStatic = true;
+    obj.isThreadLocal = Boolean(attr.isThreadLocal);
     obj.isDefinition = true;
     obj.label = this.uniqueLabel('static');
     this.declare(ty.name, { kind: 'var', obj });
@@ -1816,12 +2049,14 @@ class Parser {
       obj = new Obj(name, ty);
       obj.isStatic = Boolean(attr.isStatic);
       obj.isExtern = Boolean(attr.isExtern);
+      obj.isThreadLocal = Boolean(attr.isThreadLocal);
       if (obj.isStatic && !this.currentFn) obj.label = this.uniqueLabel('static');
       this.scopes[0].vars.set(name, { kind: 'var', obj });
       this.globals.push(obj);
     } else {
       obj.isStatic = obj.isStatic || Boolean(attr.isStatic);
       obj.isExtern = obj.isExtern && Boolean(attr.isExtern);
+      obj.isThreadLocal = obj.isThreadLocal || Boolean(attr.isThreadLocal);
     }
 
     if (this.consume('=')) {
@@ -1853,8 +2088,11 @@ class Parser {
     if (obj) {
       if (!obj.isFunction) this.error(`redefinition of '${name}' as a function`);
       // Prefer the definition's prototype when a later declaration provides
-      // full type information.
-      if ((obj.ty.params ?? []).length === 0 && (ty.params ?? []).length > 0) obj.ty = ty;
+      // full type information (including parameter names).
+      const oldParams = obj.ty.params ?? [];
+      const newParams = ty.params ?? [];
+      const named = newParams.length > 0 && newParams.every((p) => p.name);
+      if (named || oldParams.length === 0) obj.ty = ty;
     } else {
       obj = new Obj(name, ty);
       obj.isFunction = true;
@@ -1880,6 +2118,26 @@ class Parser {
     this.currentFn = fn;
     this.localBottom = 0;
     this.pushScope();
+
+    // Large aggregates are returned through a hidden pointer passed by the
+    // caller in the first integer register. Reserve a slot for it.
+    if (T.isAggregate(fn.ty.returnTy) && fn.ty.returnTy.size > 16) {
+      const slot = new Obj(this.uniqueLabel('sret'), T.pointerTo(T.voidType));
+      slot.isLocal = true;
+      this.currentFn.locals.push(slot);
+      this.assignLocalOffset(slot);
+      fn.sretSlot = slot;
+    }
+
+    // Variadic functions need a register save area for the incoming argument
+    // registers (6 GP + 8 SSE, laid out as the SysV va_list expects).
+    if (fn.ty.isVariadic) {
+      const area = new Obj(this.uniqueLabel('vaarea'), T.arrayOf(T.charType, 176));
+      area.isLocal = true;
+      fn.locals.push(area);
+      this.assignLocalOffset(area);
+      fn.vaArea = area;
+    }
 
     for (const param of fn.ty.params ?? []) {
       if (!param.name) this.error(`parameter name omitted in definition of '${fn.name}'`);
@@ -1965,6 +2223,7 @@ class Parser {
         return;
       }
       // `struct T x = y;`
+      const save = this.pos;
       const expr = this.assign();
       this.addType(expr);
       if (expr.ty.kind === 'struct' || expr.ty.kind === 'union') {
@@ -1973,6 +2232,7 @@ class Parser {
         return;
       }
       // Unbraced member list, nested inside another braced initializer.
+      this.pos = save;
       this.structInitializerUnbraced(init, 0);
       return;
     }
@@ -2017,14 +2277,22 @@ class Parser {
     const children = init.children;
     const fixedLen = init.ty.arrayLen;
     let i = 0;
+    let first = true;
     while (!this.at('}')) {
-      if (i > 0) this.expect(',');
+      if (!first) this.expect(',');
       if (this.at('}')) break;
-      if (this.at('[') || this.at('.')) this.error('designated initializers are not supported yet');
+      first = false;
+      if (this.at('[')) {
+        // Designated initializer: `[index] = value`.
+        this.next();
+        i = Number(this.constExpr().value);
+        this.expect(']');
+        this.expect('=');
+      }
       let child;
       if (fixedLen < 0) {
-        child = this.newInitializer(init.ty.base);
-        children.push(child);
+        while (children.length <= i) children.push(this.newInitializer(init.ty.base));
+        child = children[i];
       } else if (i < fixedLen) {
         child = children[i];
       } else {
@@ -2044,10 +2312,21 @@ class Parser {
     this.expect('{');
     const members = init.ty.members ?? [];
     let m = 0;
+    let first = true;
     while (!this.at('}')) {
-      if (m > 0) this.expect(',');
+      if (!first) this.expect(',');
       if (this.at('}')) break;
-      if (this.at('.')) this.error('designated initializers are not supported yet');
+      first = false;
+      if (this.at('.')) {
+        // Designated initializer: `.member = value`.
+        this.next();
+        const name = this.tok();
+        if (name.kind !== 'ident') this.error('expected a member name');
+        this.next();
+        m = members.findIndex((member) => member.name === name.text);
+        if (m < 0) this.error(`unknown member '${name.text}' in struct initializer`, name);
+        this.expect('=');
+      }
       if (m >= members.length) this.error('excess elements in struct initializer');
       this.initializer2(init.children[m]);
       m += 1;
@@ -2070,14 +2349,37 @@ class Parser {
 
   /** @param {any} init */
   unionInitializer(init) {
-    init.mem = (init.ty.members ?? [])[0] ?? null;
-    if (this.consume('{')) {
-      if (this.at('.')) this.error('designated initializers are not supported yet');
-      if (!this.at('}')) this.initializer2(init.children[0]);
+    const members = init.ty.members ?? [];
+    init.mem = members[0] ?? null;
+    if (this.at('{')) {
+      this.next();
+      let m = 0;
+      if (this.at('.')) {
+        this.next();
+        const name = this.tok();
+        if (name.kind !== 'ident') this.error('expected a member name');
+        this.next();
+        m = members.findIndex((member) => member.name === name.text);
+        if (m < 0) this.error(`unknown member '${name.text}' in union initializer`, name);
+        this.expect('=');
+      }
+      init.mem = members[m] ?? init.mem;
+      if (!this.at('}')) this.initializer2(init.children[m]);
       this.consume(',');
       this.expect('}');
       return;
     }
+    // A struct/union expression, e.g. a compound literal.
+    const save = this.pos;
+    const expr = this.assign();
+    this.addType(expr);
+    if (expr.ty.kind === 'struct' || expr.ty.kind === 'union') {
+      if (!T.sameType(expr.ty, init.ty)) this.error('incompatible union initializer');
+      init.expr = expr;
+      return;
+    }
+    // Unbraced member initializer: rewind and initialize the first member.
+    this.pos = save;
     if (init.children[0]) this.initializer2(init.children[0]);
   }
 
@@ -2161,11 +2463,12 @@ class Parser {
       return node;
     }
 
-    if (ty.kind === 'union') {
+    if (ty.kind === 'union' && !init.expr) {
       const member = init.mem ?? (ty.members ?? [])[0];
       if (!member) return new Node('null', tok);
+      const idx = (ty.members ?? []).indexOf(member);
       const childDesg = { var: null, member, idx: 0, next: desg };
-      return this.createLvarInit(init.children[0], member.ty, childDesg, tok);
+      return this.createLvarInit(init.children[idx], member.ty, childDesg, tok);
     }
 
     if (!init.expr) return new Node('null', tok);
@@ -2240,9 +2543,12 @@ class Parser {
       return;
     }
     if (ty.kind === 'union') {
-      const member = init.mem ?? (ty.members ?? [])[0];
+      const members = ty.members ?? [];
+      const member = init.mem ?? members[0];
       if (member) {
-        this.writeGlobalInit(obj, init.children[0], member.ty, offset);
+        const idx = members.indexOf(member);
+        const child = init.children?.[idx];
+        if (child) this.writeGlobalInit(obj, child, member.ty, offset);
       }
       return;
     }

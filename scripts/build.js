@@ -1,20 +1,19 @@
 #!/usr/bin/env node
 /**
- * Build driver for qnode. Replaces the small Makefile that used to wrap cmake.
+ * Build driver for qnode.
+ *
+ * Everything is compiled and linked by the JavaScript C compiler in
+ * `scripts/cc.js`. There is no CMake, make, zig or system C compiler in the
+ * build path, and no external assembler or linker either.
  *
  * Usage:
  *   node scripts/build.js [target] [options]
  *
  * Targets:
- *   build (default)  configure if needed, then build qnode (or qjsc when the
- *                    host cannot link the checked-in archives)
- *   configure        configure only
- *   qnode            build the qnode executable
+ *   build (default)  build build/qnode
  *   qjsc             build the QuickJS compiler
  *   codegen          regenerate the builtin-*.h bytecode headers with qjsc
- *   debug            configure and build with CMAKE_BUILD_TYPE=Debug
- *   clean            remove compiled objects, keep the configuration
- *   distclean        remove the whole build directory
+ *   clean            remove the build directory
  *   qnode-test       run the qnode test suites
  *   net-test         run the net_shards suite
  *   net-bench        run the net-shards benchmark
@@ -23,14 +22,12 @@
  *
  * Options:
  *   --build-dir=<dir>   build directory (default: $BUILD_DIR or "build")
- *   --build-type=<t>    CMAKE_BUILD_TYPE (default: $BUILD_TYPE or "Release")
- *   -j, --jobs=<n>      parallel jobs (default: every online CPU)
+ *   -j, --jobs=<n>      parallel jobs for the test suites (default: every CPU)
  *   --verbose           echo every command before running it
  *   -h, --help          show this help
  *
  * Environment variables with the same names as the options are honoured, so
- * `BUILD_TYPE=Debug node scripts/build.js` works like the old
- * `make BUILD_TYPE=Debug` did.
+ * `BUILD_DIR=out node scripts/build.js` works.
  */
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -40,17 +37,13 @@ import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const ccScript = path.join(root, 'scripts', 'cc.js');
 
 const TARGETS = new Set([
   'build',
-  'all',
-  'configure',
-  'qnode',
   'qjsc',
   'codegen',
-  'debug',
   'clean',
-  'distclean',
   'qnode-test',
   'net-test',
   'net-bench',
@@ -61,12 +54,11 @@ const TARGETS = new Set([
 /**
  * Parse argv into a target plus options.
  * @param {string[]} argv
- * @returns {{target: string, buildDir: string, buildType: string, jobs: number, verbose: boolean}}
+ * @returns {{target: string, buildDir: string, jobs: number, verbose: boolean}}
  */
 function parseArgs(argv) {
   let target = 'build';
   let buildDir = process.env.BUILD_DIR || 'build';
-  let buildType = process.env.BUILD_TYPE || 'Release';
   let jobs = Number(process.env.JOBS) || availableJobs();
   let verbose = false;
 
@@ -89,10 +81,6 @@ function parseArgs(argv) {
       buildDir = argv[++i];
     } else if (arg.startsWith('--build-dir=')) {
       buildDir = arg.slice('--build-dir='.length);
-    } else if (arg === '--build-type') {
-      buildType = argv[++i];
-    } else if (arg.startsWith('--build-type=')) {
-      buildType = arg.slice('--build-type='.length);
     } else if (arg.startsWith('-')) {
       fail(`unknown option '${arg}' (try --help)`);
     } else if (TARGETS.has(arg)) {
@@ -103,13 +91,12 @@ function parseArgs(argv) {
   }
 
   if (!Number.isInteger(jobs) || jobs < 1) fail(`--jobs must be a positive integer, got '${jobs}'`);
-  if (!buildType) fail('--build-type must not be empty');
   if (!buildDir) fail('--build-dir must not be empty');
-  return { target, buildDir, buildType, jobs, verbose };
+  return { target, buildDir, jobs, verbose };
 }
 
 /**
- * Number of parallel jobs, matching the Makefile's getconf/nproc fallback.
+ * Number of parallel jobs for the test suites.
  * @returns {number}
  */
 function availableJobs() {
@@ -155,81 +142,166 @@ function run(command, args, options = {}) {
 }
 
 /**
- * @param {string} command
- * @returns {boolean}
+ * Compile and link with the JavaScript C compiler.
+ * @param {string[]} args
+ * @param {{verbose: boolean}} options
  */
-function onPath(command) {
-  const dirs = (process.env.PATH || '').split(path.delimiter);
-  const exts = process.platform === 'win32' ? ['.exe', '.cmd', '.bat', ''] : [''];
-  return dirs.some((dir) => {
-    if (!dir) return false;
-    return exts.some((ext) => {
-      try {
-        fs.accessSync(path.join(dir, command + ext), fs.constants.X_OK);
-        return true;
-      } catch {
-        return false;
-      }
-    });
-  });
+function cc(args, { verbose }) {
+  run(process.execPath, [ccScript, ...args], { verbose });
 }
 
 /**
- * uname -m style architecture name, matching CMake's QNODE_PREBUILT_ARCH.
+ * Absolute build directory.
+ * @param {string} buildDir
  * @returns {string}
  */
-function hostArch() {
-  switch (process.arch) {
-    case 'x64':
-      return 'x86_64';
-    case 'arm64':
-      return 'aarch64';
-    case 'ia32':
-      return 'i386';
-    default:
-      return process.arch;
+function buildPath(buildDir) {
+  return path.resolve(root, buildDir);
+}
+
+/**
+ * The prebuilt archive directory for this host.
+ * @returns {string}
+ */
+function prebuiltDir() {
+  if (process.platform !== 'linux' || process.arch !== 'x64') {
+    fail('the JavaScript C compiler only targets linux-x86_64');
   }
+  const dir = path.join(root, 'vendor', 'prebuilt', 'linux-x86_64');
+  if (!fs.existsSync(dir)) fail(`missing prebuilt archives in ${path.relative(root, dir)}`);
+  return dir;
 }
 
 /**
- * Mirror CMake's compiler selection: qnode links the checked-in archives, which
- * need zig to supply the libc. Prefer the vendored toolchain on x86-64 and fall
- * back to a zig on PATH elsewhere.
- * @returns {{zig: string | null, prebuiltDir: string | null, qnode: boolean}}
+ * Concatenate the bootstrap parts and embed the result as a C header.
+ *
+ * The parts share one top-level scope and filename order is execution order.
+ * The result is embedded as a C array, so no external `xxd` is needed.
+ * @param {string} buildDir absolute build directory
+ * @returns {string} path to the generated header
  */
-function detectToolchain() {
-  const arch = hostArch();
-  const vendored = path.join(root, 'vendor', 'zig', 'zig');
-  const hasVendored = arch === 'x86_64' && fs.existsSync(vendored);
-  const zig = hasVendored ? vendored : onPath('zig') ? 'zig' : null;
-  const prebuilt = path.join(root, 'vendor', 'prebuilt', `linux-${arch}`);
-  const hasPrebuilt = fs.existsSync(prebuilt);
-  const qnode = process.platform === 'linux' && hasPrebuilt && zig !== null;
-  return { zig, prebuiltDir: hasPrebuilt ? prebuilt : null, qnode };
-}
+function generateBootstrap(buildDir) {
+  const partsDir = path.join(root, 'bootstrap');
+  const parts = fs
+    .readdirSync(partsDir)
+    .filter((name) => name.endsWith('.js'))
+    .sort();
+  if (parts.length === 0) fail('bootstrap/ has no .js parts');
 
-/**
- * Configure only when the build tree is missing or its generator settings
- * changed, so repeated builds skip the configure step like make did.
- * @param {{buildDir: string, buildType: string, verbose: boolean}} options
- */
-function configure({ buildDir, buildType, verbose }) {
-  const cache = path.join(root, buildDir, 'CMakeCache.txt');
-  if (fs.existsSync(cache)) {
-    const cached = fs.readFileSync(cache, 'utf8');
-    const match = cached.match(/^CMAKE_BUILD_TYPE:[A-Z]+=(.*)$/m);
-    const cachedType = match ? match[1].trim() : '';
-    if (cachedType === buildType) return;
+  const source = parts.map((name) => fs.readFileSync(path.join(partsDir, name), 'utf8')).join('');
+  const jsFile = path.join(buildDir, 'node_bootstrap.js');
+  fs.writeFileSync(jsFile, source);
+
+  const bytes = Buffer.from(source, 'utf8');
+  const lines = ['unsigned char node_bootstrap_js[] = {'];
+  for (let i = 0; i < bytes.length; i += 12) {
+    const chunk = bytes.subarray(i, i + 12);
+    lines.push(`  ${Array.from(chunk, (byte) => `0x${byte.toString(16).padStart(2, '0')}`).join(', ')},`);
   }
-  run('cmake', ['-B', buildDir, `-DCMAKE_BUILD_TYPE=${buildType}`], { verbose });
+  lines.push('};');
+  lines.push(`unsigned int node_bootstrap_js_len = ${bytes.length};`);
+
+  const header = path.join(buildDir, 'node_bootstrap.h');
+  fs.writeFileSync(header, `${lines.join('\n')}\n`);
+  return header;
 }
 
 /**
- * @param {{buildDir: string, jobs: number, verbose: boolean}} options
- * @param {string} target
+ * Compiler flags shared by qnode and qjsc.
+ * @param {string} buildDir absolute build directory
+ * @param {string[]} extraIncludes
+ * @returns {string[]}
  */
-function buildTarget({ buildDir, jobs, verbose }, target) {
-  run('cmake', ['--build', buildDir, '--target', target, '-j', String(jobs)], { verbose });
+function commonFlags(buildDir, extraIncludes = []) {
+  return [
+    '-I', path.join(root, 'scripts', 'cc', 'include'),
+    '-I', '/usr/include',
+    '-I', root,
+    '-I', buildDir,
+    ...extraIncludes.flatMap((dir) => ['-I', dir]),
+    '-D', 'EV_STANDALONE',
+    '-D', 'EV_USE_EPOLL=1',
+    '-D', 'QJS_HAVE_LIBEV',
+    '-D', '_GNU_SOURCE',
+    '-funsigned-char',
+  ];
+}
+
+/**
+ * Build build/qnode with the JavaScript C compiler.
+ * @param {{buildDir: string, verbose: boolean}} options
+ * @returns {string} absolute path to the binary
+ */
+function buildQnode({ buildDir, verbose }) {
+  const outDir = buildPath(buildDir);
+  const prebuilt = prebuiltDir();
+  fs.mkdirSync(outDir, { recursive: true });
+
+  const includes = [
+    path.join(root, 'vendor', 'libev'),
+    path.join(root, 'vendor', 'wasm3', 'source'),
+    path.join(root, 'vendor', 'zlib'),
+    path.join(root, 'vendor', 'mbedtls', 'include'),
+    path.join(root, 'vendor', 'libsodium', 'src', 'libsodium', 'include'),
+    path.join(root, 'vendor', 'libsodium', 'src', 'libsodium', 'include', 'sodium'),
+  ];
+  const sources = [
+    'node.c',
+    'netstack.c',
+    'netstack_l2.c',
+    'netstack_link.c',
+    'node_netstack.c',
+    'quickjs-libc.c',
+    'qnode.c',
+    'wayland.c',
+  ].map((name) => path.join(root, name));
+  const archives = [
+    'libqjs.a',
+    'libqnode_wasm3.a',
+    'libqnode_libev.a',
+    'libqnode_zlib.a',
+    'libqnode_mbedtls.a',
+    'libqnode_sodium.a',
+  ].map((name) => path.join(prebuilt, name));
+
+  const out = path.join(outDir, 'qnode');
+  generateBootstrap(outDir);
+  cc(
+    [
+      ...commonFlags(outDir, includes),
+      '-D', 'QNODE_FREESTANDING',
+      '-D', '_LARGEFILE64_SOURCE=1',
+      ...sources,
+      ...archives,
+      '-o', out,
+    ],
+    { verbose },
+  );
+  return out;
+}
+
+/**
+ * Build build/qjsc with the JavaScript C compiler.
+ * @param {{buildDir: string, verbose: boolean}} options
+ * @returns {string} absolute path to the binary
+ */
+function buildQjsc({ buildDir, verbose }) {
+  const outDir = buildPath(buildDir);
+  const prebuilt = prebuiltDir();
+  fs.mkdirSync(outDir, { recursive: true });
+
+  const includes = [
+    path.join(root, 'vendor', 'libev'),
+    path.join(root, 'vendor', 'wasm3', 'source'),
+  ];
+  const sources = [path.join(root, 'qjsc.c'), path.join(root, 'quickjs-libc.c')];
+  const archives = ['libqjs.a', 'libqnode_wasm3.a', 'libqnode_libev.a'].map((name) =>
+    path.join(prebuilt, name),
+  );
+
+  const out = path.join(outDir, 'qjsc');
+  cc([...commonFlags(outDir, includes), ...sources, ...archives, '-o', out], { verbose });
+  return out;
 }
 
 /**
@@ -333,53 +405,21 @@ async function runQnodeTests({ qnodeBinary, jobs, verbose }) {
 
 async function main() {
   const options = parseArgs(process.argv.slice(2));
-  const { target, buildDir, buildType, jobs, verbose } = options;
-  const buildTypeForTarget = target === 'debug' ? 'Debug' : buildType;
-  const toolchain = detectToolchain();
+  const { target, buildDir, jobs, verbose } = options;
   const qnodeBinary = path.join(buildDir, 'qnode');
   const qjscBinary = path.join(buildDir, 'qjsc');
 
   switch (target) {
-    case 'configure':
-      configure({ buildDir, buildType: buildTypeForTarget, verbose });
-      return;
-
     case 'build':
-    case 'all':
-    case 'debug': {
-      configure({ buildDir, buildType: buildTypeForTarget, verbose });
-      if (toolchain.qnode) {
-        buildTarget({ buildDir, jobs, verbose }, 'qnode_exe');
-      } else {
-        process.stderr.write(
-          'build: qnode needs zig plus vendor/prebuilt/' +
-            `linux-${hostArch()} (archives) so it can link a static musl binary; ` +
-            'building qjsc instead\n',
-        );
-        buildTarget({ buildDir, jobs, verbose }, 'qjsc');
-      }
-      return;
-    }
-
-    case 'qnode':
-      configure({ buildDir, buildType, verbose });
-      if (!toolchain.qnode) {
-        fail(
-          `qnode needs zig and vendor/prebuilt/linux-${hostArch()}; ` +
-            'install zig or use the "qjsc" target',
-        );
-      }
-      buildTarget({ buildDir, jobs, verbose }, 'qnode_exe');
+      buildQnode(options);
       return;
 
     case 'qjsc':
-      configure({ buildDir, buildType, verbose });
-      buildTarget({ buildDir, jobs, verbose }, 'qjsc');
+      buildQjsc(options);
       return;
 
     case 'codegen': {
-      configure({ buildDir, buildType, verbose });
-      buildTarget({ buildDir, jobs, verbose }, 'qjsc');
+      buildQjsc(options);
       const qjsc = path.resolve(root, qjscBinary);
       for (const name of ['array-fromasync', 'iterator-zip', 'iterator-zip-keyed']) {
         run(qjsc, ['-C', '-ss', '-o', `builtin-${name}.h`, `builtin-${name}.js`], { verbose });
@@ -388,26 +428,18 @@ async function main() {
     }
 
     case 'clean':
-      if (!fs.existsSync(path.join(root, buildDir, 'CMakeCache.txt'))) {
-        fs.rmSync(path.join(root, buildDir), { recursive: true, force: true });
-        return;
-      }
-      run('cmake', ['--build', buildDir, '--target', 'clean'], { verbose, allowFailure: true });
-      return;
-
-    case 'distclean':
-      fs.rmSync(path.join(root, buildDir), { recursive: true, force: true });
+      fs.rmSync(buildPath(buildDir), { recursive: true, force: true });
       return;
 
     case 'qnode-test': {
-      buildQnodeOrExit();
+      buildQnode(options);
       const status = await runQnodeTests({ qnodeBinary, jobs, verbose });
       if (status !== 0) process.exit(status);
       return;
     }
 
     case 'net-test':
-      buildQnodeOrExit();
+      buildQnode(options);
       run(path.join(root, 'tests', 'qnode', 'net_shards.sh'), [], {
         env: { ...process.env, QNODE: path.resolve(root, qnodeBinary) },
         verbose,
@@ -415,7 +447,7 @@ async function main() {
       return;
 
     case 'net-bench':
-      buildQnodeOrExit();
+      buildQnode(options);
       run(path.join(root, 'benchmarks', 'net-shards', 'bench.sh'), [], {
         env: { ...process.env, QNODE: path.resolve(root, qnodeBinary) },
         verbose,
@@ -423,7 +455,7 @@ async function main() {
       return;
 
     case 'netstack-tun-test':
-      buildQnodeOrExit();
+      buildQnode(options);
       run('sh', [path.join(root, 'tests', 'qnode', 'netstack_tun.sh')], {
         env: { ...process.env, QNODE: path.resolve(root, qnodeBinary) },
         verbose,
@@ -431,7 +463,7 @@ async function main() {
       return;
 
     case 'netstack-tap-test':
-      buildQnodeOrExit();
+      buildQnode(options);
       run('sh', [path.join(root, 'tests', 'qnode', 'netstack_tap.sh')], {
         env: { ...process.env, QNODE: path.resolve(root, qnodeBinary) },
         verbose,
@@ -440,15 +472,6 @@ async function main() {
 
     default:
       fail(`unhandled target '${target}'`);
-  }
-
-  /** Configure and build qnode, or explain why it is unavailable. */
-  function buildQnodeOrExit() {
-    if (!toolchain.qnode) {
-      fail(`qnode needs zig and vendor/prebuilt/linux-${hostArch()} on Linux`);
-    }
-    configure({ buildDir, buildType, verbose });
-    buildTarget({ buildDir, jobs, verbose }, 'qnode_exe');
   }
 }
 

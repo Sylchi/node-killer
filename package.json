@@ -9,13 +9,9 @@
   },
   "scripts": {
     "build": "node scripts/build.js",
-    "configure": "node scripts/build.js configure",
-    "qnode": "node scripts/build.js qnode",
     "qjsc": "node scripts/build.js qjsc",
     "codegen": "node scripts/build.js codegen",
-    "debug": "node scripts/build.js debug",
     "clean": "node scripts/build.js clean",
-    "distclean": "node scripts/build.js distclean",
     "test": "node scripts/build.js qnode-test",
     "net-test": "node scripts/build.js net-test",
     "net-bench": "node scripts/build.js net-bench",

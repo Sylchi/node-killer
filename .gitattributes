@@ -3,6 +3,3 @@
 gen/** -diff
 builtin-*.h -diff
 *.a binary
-vendor/zig/zig binary
-vendor/zig/zig filter=lfs diff=lfs merge=lfs -text
-vendor/zig/lib/** -text

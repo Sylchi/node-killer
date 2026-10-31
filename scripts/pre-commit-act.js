@@ -23,8 +23,6 @@
  *   ACT_PRECOMMIT_PULL=0|1            Pull the runner image before running.
  *   ACT_PRECOMMIT_SOCKET=<path>       Podman API socket path override.
  *   ACT_PRECOMMIT_DOCKER_USER=<u:g>   --user for Docker fallback (default uid:gid).
- *   ACT_PRECOMMIT_ZIG_CACHE=<dir>     Host dir mounted as zig's global cache
- *                                     (default ${XDG_CACHE_HOME:-~/.cache}/qnode-act/zig).
  *   ACT_BIN=act                       act executable to use.
  */
 
@@ -43,7 +41,6 @@ const DEFAULT_BASE_IMAGE = 'catthehacker/ubuntu:act-latest';
 const RUNNER_DOCKERFILE = 'scripts/act-runner.Dockerfile';
 const DEFAULT_BUILD_TIMEOUT_MS = 600_000;
 const SERVICE_IDLE_SECONDS = '600';
-const ZIG_CACHE_CONTAINER_PATH = '/zig-cache';
 
 /** @param {string} name @returns {string | null} */
 function which(name) {
@@ -182,34 +179,6 @@ function ensureActConfig() {
     }
   }
   return file;
-}
-
-/**
- * Prepare the host directory that act mounts as zig's global cache. zig builds
- * its bundled compiler_rt and libc support on first use; without a persistent
- * cache the container repeats that work on every commit. Failures are reported
- * as a warning because the hook still works without the cache.
- * @returns {string | null} host path of the cache directory
- */
-function ensureZigCache() {
-  const configured = process.env.ACT_PRECOMMIT_ZIG_CACHE;
-  const dir =
-    configured && configured.trim()
-      ? configured
-      : path.join(
-          process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache'),
-          'qnode-act',
-          'zig',
-        );
-  try {
-    fs.mkdirSync(dir, { recursive: true });
-    return path.resolve(dir);
-  } catch (error) {
-    process.stderr.write(
-      `[act-precommit] WARNING: could not create zig cache ${dir}: ${error && error.message ? error.message : error}\n`,
-    );
-    return null;
-  }
 }
 
 /** @returns {string} */
@@ -471,7 +440,7 @@ async function buildRunnerImage(runtime, image) {
   );
 
   // The Dockerfile has no COPY/ADD, so use its own directory as the build
-  // context instead of uploading the whole checkout (including vendor/zig).
+  // context instead of uploading the whole checkout.
   return runStreaming(
     containerCli(runtime),
     [
@@ -625,8 +594,8 @@ async function main() {
     return 1;
   }
   // The default image is built locally from scripts/act-runner.Dockerfile so
-  // cmake is available without an apt-get on every run. A custom image is only
-  // built when explicitly requested.
+  // the hook does not depend on a registry image being present. A custom image
+  // is only built when explicitly requested.
   const buildImage =
     buildSetting === '1' || (buildSetting === undefined && image === DEFAULT_IMAGE);
   const actPull = pull && !buildImage;
@@ -666,15 +635,8 @@ async function main() {
   let containerOptions =
     process.env.ACT_PRECOMMIT_CONTAINER_OPTIONS ||
     (runtime.kind === 'docker' ? `--user=${currentUid()}:${currentGid()}` : '');
-  const zigCache = ensureZigCache();
-  if (zigCache) {
-    const mount = `${zigCache}:${ZIG_CACHE_CONTAINER_PATH}`;
-    const extra = `-v "${mount}" -e ZIG_GLOBAL_CACHE_DIR=${ZIG_CACHE_CONTAINER_PATH}`;
-    containerOptions = containerOptions ? `${containerOptions} ${extra}` : extra;
-  }
-  // The bound working tree already contains the host's `build/` CMake cache,
-  // which points at host-only tools. Keep the container's build tree separate
-  // so act never reuses it.
+  // The bound working tree already contains the host's `build/` directory.
+  // Keep the container's build tree separate so act never reuses it.
   containerOptions = containerOptions
     ? `${containerOptions} -e BUILD_DIR=build-act`
     : '-e BUILD_DIR=build-act';

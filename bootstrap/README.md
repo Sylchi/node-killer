@@ -1,9 +1,9 @@
 # qnode bootstrap
 
 The Node.js compatibility layer is a single script, split into the parts in
-this directory. At build time `cmake/concat_js.cmake` concatenates the parts
-in filename order into `build/node_bootstrap.js`, which is then embedded as a
-C array and evaluated once at startup.
+this directory. At build time `scripts/build.js` concatenates the parts in
+filename order into `build/node_bootstrap.js`, which is then embedded as a C
+array and evaluated once at startup.
 
 The parts are **not** ES modules. They share one top-level scope, so:
 

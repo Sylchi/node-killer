@@ -37,8 +37,8 @@ The bootstrap is evaluated once per context, including inside workers.
 
 ## The bootstrap
 
-`node_bootstrap.js` is generated at build time by concatenating the ordered
-parts in `bootstrap/` (`cmake/concat_js.cmake`). The parts share a single
+`node_bootstrap.js` is generated at build time by `scripts/build.js`, which
+concatenates the ordered parts in `bootstrap/`. The parts share a single
 top-level scope; see `bootstrap/README.md` for the ordering rules and a
 table of contents.
 

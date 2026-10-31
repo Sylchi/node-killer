@@ -150,19 +150,42 @@ export function alignTo(n, align) {
  * @param {boolean} isUnion
  */
 export function layoutAggregate(ty, isUnion) {
-  let offset = 0;
   let align = 1;
   let size = 0;
+  // Bit cursor for struct layout; bit-fields share storage units.
+  let bitCursor = 0;
   for (const member of ty.members ?? []) {
     align = Math.max(align, member.ty.align);
     if (isUnion) {
       member.offset = 0;
+      if (member.bitWidth === undefined) member.bitOffset = 0;
+      else member.bitOffset = 0;
       size = Math.max(size, member.ty.size);
+      continue;
+    }
+    if (member.bitWidth !== undefined) {
+      const unitBits = Math.max(member.ty.size, 1) * 8;
+      if (member.bitWidth === 0) {
+        // A zero-width field rounds the cursor up to the next storage unit.
+        bitCursor = Math.ceil(bitCursor / unitBits) * unitBits;
+        continue;
+      }
+      const width = member.bitWidth;
+      if (width > unitBits) throw new Error('elf: bit-field wider than its type');
+      if (Math.floor(bitCursor / unitBits) !== Math.floor((bitCursor + width - 1) / unitBits)) {
+        bitCursor = Math.ceil(bitCursor / unitBits) * unitBits;
+      }
+      const unitStart = Math.floor(bitCursor / unitBits) * unitBits;
+      member.offset = unitStart / 8;
+      member.bitOffset = bitCursor - unitStart;
+      bitCursor += width;
+      size = Math.max(size, Math.ceil(bitCursor / 8));
     } else {
-      offset = alignTo(offset, member.ty.align);
+      const offset = alignTo(Math.ceil(bitCursor / 8), member.ty.align);
       member.offset = offset;
-      offset += member.ty.size;
-      size = offset;
+      member.bitOffset = 0;
+      bitCursor = (offset + member.ty.size) * 8;
+      size = Math.max(size, offset + member.ty.size);
     }
   }
   ty.align = align;
@@ -259,7 +282,21 @@ export function sameType(a, b) {
     for (let i = 0; i < ap.length; i += 1) if (!sameType(ap[i].ty, bp[i].ty)) return false;
     return a.isVariadic === b.isVariadic;
   }
-  if (a.kind === 'struct' || a.kind === 'union') return a === b || (a.tag !== null && a.tag === b.tag);
+  if (a.kind === 'struct' || a.kind === 'union') {
+    if (a === b) return true;
+    // Named tags are unique; distinct anonymous types declared separately are
+    // different even if they look alike, so only fall back to a structural
+    // comparison when one side is an anonymous copy (declarators copy types).
+    if (a.tag !== null || b.tag !== null) return a.tag === b.tag;
+    const am = a.members ?? [];
+    const bm = b.members ?? [];
+    if (am.length !== bm.length) return false;
+    for (let i = 0; i < am.length; i += 1) {
+      if (am[i].name !== bm[i].name) return false;
+      if (!sameType(am[i].ty, bm[i].ty)) return false;
+    }
+    return true;
+  }
   return a.isUnsigned === b.isUnsigned;
 }
 
@@ -287,6 +324,11 @@ export function typeFromHint(hint) {
       return longType;
     case 'ulong':
       return ulongType;
+    case 'float':
+      return floatType;
+    case 'double':
+    case 'long double':
+      return doubleType;
     default:
       return intType;
   }

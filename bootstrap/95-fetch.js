@@ -768,11 +768,15 @@ function responseBodyStream(res, method, statusCode, headers) {
             return;
           }
           wakePull();
-        }
-        if (!closed && controller.desiredSize !== null &&
-            controller.desiredSize <= 0) {
-          paused = true;
-          res.pause();
+          /* Stop pulling more input until the reader has consumed this
+             chunk. Only pause when something was actually enqueued: an
+             inflate call can legitimately produce no output for a while,
+             and pausing on that would never wake the pending pull. */
+          if (controller.desiredSize !== null &&
+              controller.desiredSize <= 0) {
+            paused = true;
+            res.pause();
+          }
         }
       });
       res.on("end", () => {
@@ -801,15 +805,19 @@ function responseBodyStream(res, method, statusCode, headers) {
         try { controller.close(); } catch (e) {}
         return;
       }
-      if (socket && typeof socket.ref === "function")
-        socket.ref();
-      if (paused) {
-        paused = false;
-        res.resume();
-      }
       /* Resolve once a chunk has been enqueued (or the stream ended) so the
-         ReadableStream does not spin calling pull synchronously. */
-      return new Promise((resolve) => { pullResolve = resolve; });
+         ReadableStream does not spin calling pull synchronously. The slot is
+         armed before resuming: a paused stream flushes synchronously, and the
+         data listener would otherwise wake a pull that does not exist yet. */
+      return new Promise((resolve) => {
+        pullResolve = resolve;
+        if (socket && typeof socket.ref === "function")
+          socket.ref();
+        if (paused) {
+          paused = false;
+          res.resume();
+        }
+      });
     },
     cancel(reason) {
       if (closed)
@@ -895,6 +903,8 @@ function fetchOnce(url, init, redirects) {
       method: init.method,
       headers,
     };
+    if (init.netstack !== undefined)
+      opts.netstack = init.netstack;
     if (secure) {
       if (init.rejectUnauthorized !== undefined)
         opts.rejectUnauthorized = init.rejectUnauthorized;
@@ -1018,6 +1028,7 @@ async function fetch(input, init) {
     signal: req.signal,
     redirect: req.redirect,
     maxRedirects: 20,
+    netstack: init && init.netstack,
   }, 20);
 }
 
